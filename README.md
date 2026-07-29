@@ -152,7 +152,7 @@ analysis-scripts/      # Chart/visualization generators (blog content)
   billable resources).
 - Terraform `~> 1.15` and AWS provider `~> 6.0`.
 - AWS CLI v2 (the patched-image bootstrap uses it via `local-exec`).
-- Python 3.12+ and [uv](https://github.com/astral-sh/uv) for the baseline-model
+- Python 3.13+ and [uv](https://github.com/astral-sh/uv) for the baseline-model
   and helper scripts.
 - Amazon Bedrock model access enabled for Nova (only if using hybrid inference).
 
