@@ -1,0 +1,85 @@
+# End-to-end MLOps flow for the Medical Image Classification solution.
+# Render:  d2 docs/architecture.d2 docs/images/architecture-end-to-end.png
+# Edit this file (not the PNG); re-render to update the README diagram.
+
+direction: down
+
+classes: {
+  ingest: {style: {fill: "#E8F4FD"; stroke: "#1A73E8"; font-color: "#0B3D91"; border-radius: 8}}
+  train: {style: {fill: "#E6F4EA"; stroke: "#1E8E3E"; font-color: "#0D652D"; border-radius: 8}}
+  gate: {style: {fill: "#FEF7E0"; stroke: "#F9AB00"; font-color: "#7A5900"; border-radius: 8}}
+  serve: {style: {fill: "#FCE8E6"; stroke: "#D93025"; font-color: "#8C1D18"; border-radius: 8}}
+  monitor: {style: {fill: "#F3E8FD"; stroke: "#8430CE"; font-color: "#4A148C"; border-radius: 8}}
+}
+
+title: |md
+  # Medical Image Classification - End-to-End MLOps on Amazon SageMaker
+| {near: top-center; style: {font-size: 24; bold: true}}
+
+# ---- Part 1: data pipeline ----
+ingest: "1 - Data pipeline" {
+  style: {fill: "#F6FAFE"; stroke: "#1A73E8"; stroke-dash: 3}
+  s3raw: "S3 raw images" {class: ingest}
+  eb1: "EventBridge\n(.batch_complete)" {class: ingest}
+  validate: "Validate\n(resolution / balance /\nquality cv2)" {class: ingest}
+  prep: "Preprocess\n512x512 + SMOTE\n70/15/15 split" {class: ingest}
+
+  s3raw -> eb1 -> validate -> prep
+}
+
+# ---- Part 2: training + gate ----
+train: "2 - Training + quality gate" {
+  style: {fill: "#F4FBF6"; stroke: "#1E8E3E"; stroke-dash: 3}
+  vgg: "VGG16" {class: train}
+  dense: "DenseNet121" {class: train}
+  eff: "EfficientNetV2M" {class: train}
+  note: "two-phase transfer learning\nDebugger + Experiments" {class: train; style.font-size: 11}
+  ensemble: "Weighted ensemble\n+ evaluation" {class: train}
+  gate: "Clinical quality gate\nacc>=.85 recall>=.95\nprec>=.80 auc>=.90" {class: gate}
+
+  vgg -> ensemble
+  dense -> ensemble
+  eff -> ensemble
+  ensemble -> gate
+}
+
+# ---- Governance ----
+registry: "Model Registry\n(PendingManualApproval)\n+ bias / explainability\n+ Model Card" {class: gate}
+approve: "Clinical reviewer\napproves version" {class: gate; shape: person}
+autodeploy: "Auto-deploy Lambda\n(EventBridge on approval)" {class: serve}
+
+# ---- Part 3 / serving ----
+serve: "3 - Serving" {
+  style: {fill: "#FEF6F5"; stroke: "#D93025"; stroke-dash: 3}
+  api: "API Gateway" {class: serve}
+  infer: "Inference Lambda" {class: serve}
+  endpoint: "SageMaker Endpoint\nblue/green + rollback" {class: serve}
+  bedrock: "Bedrock + Guardrail\n+ A2I review\n(low confidence)" {class: serve}
+
+  api -> infer -> endpoint
+  infer -> bedrock: "conf < threshold"
+}
+
+# ---- Part 4 / monitoring loop ----
+monitor: "4 - Monitor + retrain" {
+  style: {fill: "#FAF4FE"; stroke: "#8430CE"; stroke-dash: 3}
+  capture: "Data capture (S3)" {class: monitor}
+  mm: "Model Monitor\n(hourly)" {class: monitor}
+  alarm: "CloudWatch\ndrift alarm" {class: monitor}
+  eb2: "EventBridge\nretrain trigger" {class: monitor}
+
+  capture -> mm -> alarm -> eb2
+}
+
+# ---- cross-stage edges ----
+ingest.prep -> train.vgg: "training data"
+ingest.prep -> train.dense
+ingest.prep -> train.eff
+train.gate -> registry: "pass"
+registry -> approve
+approve -> autodeploy: "Approved"
+autodeploy -> serve.endpoint: "UpdateEndpoint"
+client: "Clinical app" {shape: person; class: serve}
+client -> serve.api: "POST /predict"
+serve.endpoint -> monitor.capture
+monitor.eb2 -> train.vgg: "RetrainingReason=\ndrift_detected" {style.stroke-dash: 4}

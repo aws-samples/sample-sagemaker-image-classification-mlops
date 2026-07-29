@@ -1,0 +1,88 @@
+# GitLab CI - security scanning for the Breast Cancer MLOps project.
+#
+# Mirrors the kinds of issues found in the manual security audit so they are
+# caught automatically on every push / merge request:
+#   - SAST            → Python code flaws (semgrep): zip-slip, injection, etc.
+#   - IaC scanning    → Terraform misconfig (KMS, public S3, open API GW, IAM)
+#   - Secret Detection→ committed AWS keys, tokens, private keys
+#
+# These stages run the upstream GitLab analyzers; results appear in the MR
+# "Security" widget and the project Vulnerability Report. Deployment itself
+# stays in AWS CodeBuild (see stack-cicd/codebuild/*.yml) - this pipeline is
+# scan-only and does not touch AWS.
+
+stages:
+  - test
+  - scan
+
+# ---------------------------------------------------------------------------
+# Lint - fast feedback on Python style/quality (ruff is already configured in
+# pyproject.toml). Non-blocking on the scan stages below.
+# ---------------------------------------------------------------------------
+ruff:
+  stage: test
+  image: python:3.13-slim
+  before_script:
+    - pip install --no-cache-dir uv==0.9.9
+    - uv pip install --system ruff
+  script:
+    - ruff check .
+    - ruff format --check .
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ---------------------------------------------------------------------------
+# GitLab managed security scanners. The included templates define jobs in the
+# `test` stage by default; we re-map them to `scan` via the variables below.
+# ---------------------------------------------------------------------------
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/SAST-IaC.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+variables:
+  # Run SAST analyzers relevant to this repo (Python + IaC). Pinning the list
+  # keeps the pipeline fast and avoids spinning up analyzers for languages the
+  # project doesn't use.
+  SAST_EXCLUDED_ANALYZERS: ""
+  SECRET_DETECTION_HISTORIC_SCAN: "false"
+  # Scan the whole tree but skip vendored Terraform provider/module caches and
+  # local virtualenvs - those are not our code.
+  SAST_EXCLUDED_PATHS: ".terraform, venv, env, .ruff_cache, data, models"
+
+# Re-map the included jobs into the `scan` stage so the pipeline reads
+# test → scan top to bottom.
+sast:
+  stage: scan
+
+iac-sast:
+  stage: scan
+
+secret_detection:
+  stage: scan
+
+# ---------------------------------------------------------------------------
+# ASH - AWS Automated Security Helper. Runs a bundle of scanners in one pass
+# (bandit + Semgrep for Python, Checkov + cfn-nag for IaC, git-secrets,
+# Grype/Syft) and writes an aggregated report. Complements the GitLab native
+# analyzers above with AWS-specific IaC checks. Non-blocking (allow_failure)
+# so a new finding surfaces in the report without hard-failing the pipeline.
+ash:
+  stage: scan
+  image:
+    name: public.ecr.aws/docker/library/python:3.13-slim
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
+    - pip install --no-cache-dir automated-security-helper
+  script:
+    - ash --source-dir . --output-dir ash_output || true
+  artifacts:
+    when: always
+    paths:
+      - ash_output/
+    expire_in: 1 week
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

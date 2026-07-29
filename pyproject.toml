@@ -1,0 +1,75 @@
+# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+#
+# Python project config. This repo is not a package — we don't publish to
+# PyPI — but pyproject.toml is the canonical place to configure Ruff.
+# Keep this file minimal; the actual Python code ships via SageMaker
+# pipelines, Lambda zips, and CodeBuild buildspecs, not pip.
+
+[project]
+name = "medical-image-classification"
+version = "0.1.0"
+description = "Terraform-managed SageMaker MLOps pipeline for breast cancer histopathology classification"
+requires-python = ">=3.13"
+
+###############################################################################
+# Ruff — replaces Black + isort + flake8 + pyupgrade + pylint (partial) +
+# ~30 other tools. Written in Rust, ~100x faster than the tools it replaces,
+# zero runtime dependencies. See https://docs.astral.sh/ruff/
+###############################################################################
+
+[tool.ruff]
+# Line length matches Black's default; picked because SageMaker tracebacks in
+# CloudWatch wrap aggressively at ~100 chars anyway.
+line-length = 100
+target-version = "py313"
+
+# Directories we never want Ruff to touch:
+# - .terraform / provider plugin caches (thousands of generated files)
+# - data / blog_docs / charts — binary assets and prose
+# - blueprints — untouched reference code from upstream templates
+extend-exclude = [
+    ".apex",
+    ".kiro",
+    ".terraform",
+    ".workflow-state",
+    "blog_docs",
+    "charts",
+    "data",
+    "blueprints",
+]
+
+[tool.ruff.lint]
+# Rule categories enabled. Start conservative — add more over time.
+#   E/W : pycodestyle (PEP 8 style)
+#   F   : pyflakes (logic errors: unused imports, undefined names, etc.)
+#   I   : isort (import ordering)
+#   B   : flake8-bugbear (likely bugs — mutable default args, etc.)
+#   UP  : pyupgrade (modernise syntax for the target Python version)
+#   SIM : flake8-simplify (suggest clearer code)
+#   RUF : Ruff-specific rules
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]
+
+# Explicit per-rule ignores. Keep these narrow and justified.
+ignore = [
+    "E501",    # Long lines — line-length above handles this; Ruff complains about strings and comments that are unsplittable.
+    "SIM108",  # Ternary-ifs — sometimes hurt readability in ML code with many branches
+    "B008",    # Function calls in defaults — common in boto3 clients (typer apps etc.)
+    "B905",    # zip() without strict= — Python 3.10+ only addition, not worth the churn for existing numpy-based loops
+    "RUF001",  # Ambiguous unicode in strings — our logs deliberately use emoji (✅ ❌ ⚠️) for human scanning
+    "RUF002",  # Ambiguous unicode in docstrings — same reason
+    "RUF003",  # Ambiguous unicode in comments — same reason
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Trainer scripts use `from X import *`-style Keras imports inside try/except
+# fallbacks for network isolation. Don't flag those.
+"scripts/training/*_trainer.py" = ["F401"]
+
+# Ops scripts similarly — they're interactive CLI utilities.
+"ops-scripts/*.py" = ["T201"]
+
+[tool.ruff.format]
+# Ruff format is a Black-compatible formatter. Keep the defaults; the whole
+# point is consistency, not bikeshedding over trailing commas.
+quote-style = "double"
+indent-style = "space"

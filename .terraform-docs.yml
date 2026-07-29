@@ -1,0 +1,30 @@
+# Shared terraform-docs config. Each stack/module README has an
+# injection block (BEGIN_TF_DOCS / END_TF_DOCS); run:
+#   terraform-docs -c .terraform-docs.yml <dir>
+# to refresh the Requirements / Providers / Inputs / Outputs / Resources tables
+# from the actual .tf so they never drift again.
+formatter: markdown table
+
+sections:
+  show:
+    - requirements
+    - providers
+    - inputs
+    - outputs
+    - resources
+
+output:
+  file: README.md
+  mode: inject
+  template: |-
+    <!-- BEGIN_TF_DOCS -->
+    {{ .Content }}
+    <!-- END_TF_DOCS -->
+
+sort:
+  enabled: true
+  by: required
+
+settings:
+  anchor: false
+  lockfile: false

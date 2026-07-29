@@ -1,0 +1,35 @@
+<script src="https://assets.crowd.aws/crowd-html-elements.js"></script>
+
+<crowd-form>
+  <crowd-classifier
+    name="diagnosis"
+    categories="['benign', 'malignant']"
+    header="Confirm the diagnosis for this histopathology image"
+  >
+    <classification-target>
+      <p>
+        Model prediction:
+        <strong>{{ task.input.prediction }}</strong>
+        (confidence {{ task.input.confidence }})
+      </p>
+      <img
+        style="max-width: 100%; max-height: 600px"
+        src="{{ task.input.image_s3_uri | grant_read_access }}"
+      />
+    </classification-target>
+
+    <full-instructions header="Instructions">
+      <p>
+        The model flagged this case for human review because its confidence was
+        below the configured threshold. Review the image and select the correct
+        class. Your decision is recorded as ground truth and feeds the next
+        retraining cycle. This is clinical decision support, not an autonomous
+        diagnosis.
+      </p>
+    </full-instructions>
+
+    <short-instructions>
+      Select benign or malignant for the image shown.
+    </short-instructions>
+  </crowd-classifier>
+</crowd-form>

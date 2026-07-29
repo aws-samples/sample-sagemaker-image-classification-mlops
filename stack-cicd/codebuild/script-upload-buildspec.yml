@@ -1,0 +1,54 @@
+version: 0.2
+
+# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+#
+# Uploads ML pipeline scripts to S3 + downloads pretrained ImageNet weights
+# for the three trainers (network-isolation support). Uses uv for the TF
+# install because downloading a 500MB wheel in CodeBuild is the slow part;
+# uv drops this from ~3 min to ~20 sec.
+
+env:
+  variables:
+    UV_VERSION: "0.9.9"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+    commands:
+      - dnf update -y python3-pip libtasn1 libxml2 || true
+      # Install uv (Rust-based, 10-100x faster than pip) from PyPI at a pinned
+      # version - pip resolves it through the hash-checked package index
+      # instead of piping a live remote installer script into a shell.
+      - pip3 install uv==${UV_VERSION}
+      - uv --version
+
+  pre_build:
+    commands:
+      - export PATH=$HOME/.local/bin:$PATH
+      - echo "Preparing ML scripts for upload"
+      - cd scripts
+      - export SCRIPTS_BUCKET=$(aws s3api list-buckets --query "Buckets[?contains(Name, 'scripts')].Name" --output text | grep medical-image-classification)
+      - echo "Using bucket $SCRIPTS_BUCKET"
+
+  build:
+    commands:
+      - export PATH=$HOME/.local/bin:$PATH
+      - echo "Uploading ML pipeline scripts to S3"
+      - chmod +x script_uploader.sh
+      - ./script_uploader.sh
+      - echo "Downloading and uploading pre-trained ImageNet weights (optional)"
+      # TF install is best-effort - weights download is a convenience step
+      # that enables network-isolation mode. If TF isn't available we just
+      # skip it; the pipeline still works (trainers fall back to downloading
+      # weights over the network when SM_CHANNEL_WEIGHTS isn't populated).
+      - uv pip install --system --no-cache tensorflow==2.19.0 boto3 || echo "Weight download skipped (non-critical)"
+      - python download_pretrained_weights.py $SCRIPTS_BUCKET || echo "Weights already exist or download failed (non-critical)"
+
+  post_build:
+    commands:
+      - echo "ML scripts uploaded successfully"
+
+artifacts:
+  files:
+    - "**/*"
