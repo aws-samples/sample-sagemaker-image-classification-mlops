@@ -142,10 +142,12 @@ these bill continuously.
 
 ## Dependencies
 
-- **Terraform** 1.11 or later, with the AWS provider (versions pinned per stack).
-- **Python** 3.12 or later. Training and inference containers derive from AWS
-  Deep Learning Containers; the inference image is rebuilt monthly to pick up
-  base-image patches, with an SBOM published per build.
+- **Terraform** `~> 1.15`, with the AWS provider `~> 6.0` (both pinned in each
+  stack's `versions.tf`).
+- **Python** 3.13 or later, as declared in `pyproject.toml`. Training and
+  inference containers derive from AWS Deep Learning Containers; the inference
+  image is rebuilt monthly to pick up base-image patches, with an SBOM published
+  per build.
 - Python tooling (`ruff`, `bandit`, `checkov`) is used for linting and scanning
   and is not deployed with the solution.
 
