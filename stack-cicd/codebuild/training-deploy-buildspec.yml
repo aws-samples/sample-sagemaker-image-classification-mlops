@@ -1,0 +1,35 @@
+version: 0.2
+
+env:
+  variables:
+    TERRAFORM_VERSION: "1.15.6"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+    commands:
+      - dnf update -y python3-pip libtasn1 libxml2 || true
+      - curl -fsSL https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip -o terraform.zip
+      - unzip terraform.zip
+      - mv terraform /usr/local/bin/
+      - terraform --version
+
+  pre_build:
+    commands:
+      - echo "Initializing Terraform for training infrastructure"
+      - cd stack-training
+      - terraform init
+
+  build:
+    commands:
+      - echo "Deploying SageMaker training infrastructure"
+      - terraform apply -auto-approve
+
+  post_build:
+    commands:
+      - echo "Infrastructure deployment completed"
+
+artifacts:
+  files:
+    - "**/*"

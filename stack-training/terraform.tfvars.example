@@ -1,0 +1,123 @@
+# Copy this file to terraform.tfvars and customize values
+
+project_name = "medical-image-classification"
+environment  = "dev"
+aws_region   = "us-east-1"
+
+pipeline_inference_instance_type = "ml.m5.large"
+
+# Cache configuration
+cache_config = {
+  Enabled     = true
+  ExpireAfter = "P7D"
+}
+
+# Pipeline steps configuration
+pipeline_steps = {
+  validation = {
+    instance_type  = "ml.m5.xlarge"
+    instance_count = 1
+    volume_size    = 20
+    script_name    = "data_validator.py"
+  }
+  preprocessing = {
+    instance_type  = "ml.m5.xlarge"
+    instance_count = 1
+    volume_size    = 50
+    script_name    = "data_preprocessor.py"
+  }
+  evaluation = {
+    instance_type  = "ml.m5.xlarge"
+    instance_count = 1
+    volume_size    = 30
+    script_name    = "model_evaluator.py"
+  }
+  ensemble = {
+    instance_type  = "ml.m5.xlarge"
+    instance_count = 1
+    volume_size    = 30
+    script_name    = "ensemble_creator.py"
+  }
+  registry = {
+    instance_type  = "ml.m5.xlarge"
+    instance_count = 1
+    volume_size    = 20
+    script_name    = "model_registrar.py"
+  }
+  deployment = {
+    instance_type  = "ml.m5.xlarge"
+    instance_count = 1
+    volume_size    = 20
+    script_name    = "deploy_model.py"
+  }
+}
+
+# Security
+kms_deletion_window_days = 30
+enable_kms_key_rotation  = true
+
+# Data paths
+training_data_path = "medical_image_data/"
+
+# SageMaker container images (optional — latest CVE-patched tags shown)
+# sagemaker_images = {
+#   sklearn_tag              = "1.4-2-cpu-py3"
+#   tensorflow_gpu_tag       = "2.19.0-gpu-py312-cu125-ubuntu22.04-sagemaker-v1.29"
+#   tensorflow_cpu_tag       = "2.19.0-cpu-py312-ubuntu22.04-sagemaker-v1.29"
+#   tensorflow_inference_tag = "2.19.0-cpu-py312-ubuntu22.04-sagemaker-v1.49"
+# }
+
+# Data configuration (optional)
+# data_config = {
+#   content_type     = "application/x-image"
+#   compression_type = "None"
+#   s3_data_type     = "S3Prefix"
+#   s3_input_mode    = "File"
+#   s3_upload_mode   = "EndOfJob"
+# }
+
+# Models configuration (required)
+models = {
+  vgg16 = {
+    script_name = "vgg16_trainer.py"
+    tar_file    = "vgg16_trainer.tar.gz"
+    step_name   = "TrainVGG16Model"
+    hyperparameters = {
+      TRAINING_EPOCHS        = "2"
+      TRAINING_BATCH_SIZE    = "32"
+      TRAINING_LEARNING_RATE = "0.001"
+    }
+    volume_size    = 50
+    instance_count = 1
+    max_runtime    = 3600
+    instance_type  = "ml.p3.8xlarge"
+  }
+  densenet121 = {
+    script_name = "densenet121_trainer.py"
+    tar_file    = "densenet121_trainer.tar.gz"
+    step_name   = "TrainDenseNet121Model"
+    hyperparameters = {
+      TRAINING_EPOCHS        = "2"
+      TRAINING_BATCH_SIZE    = "32"
+      TRAINING_LEARNING_RATE = "0.001"
+    }
+    volume_size    = 50
+    instance_count = 1
+    max_runtime    = 3600
+    instance_type  = "ml.p3.8xlarge"
+  }
+  efficientnet = {
+    script_name = "efficientnet_trainer.py"
+    tar_file    = "efficientnet_trainer.tar.gz"
+    step_name   = "TrainEfficientNetModel"
+    hyperparameters = {
+      TRAINING_EPOCHS        = "2"
+      TRAINING_BATCH_SIZE    = "32"
+      TRAINING_LEARNING_RATE = "0.001"
+    }
+    volume_size    = 50
+    instance_count = 1
+    max_runtime    = 3600
+    instance_type  = "ml.p3.8xlarge"
+  }
+}

@@ -1,0 +1,52 @@
+version: 0.2
+
+# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+#
+# Creates a baseline TF model and registers it "Approved" in SageMaker Model
+# Registry on first deploy (cold-start fix). Uses uv for TensorFlow install
+# because pip was timing out on the 500MB TF wheel - uv's parallel downloads
+# drop this from ~3 min to ~20 sec and eliminate the retry loop.
+
+env:
+  variables:
+    UV_VERSION: "0.9.9"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+    commands:
+      - echo "Installing dependencies for baseline model creation"
+      - dnf update -y python3-pip libtasn1 libxml2 || true
+      # Install uv (Rust-based, 10-100x faster than pip) from PyPI at a pinned
+      # version - pip resolves it through the hash-checked package index
+      # instead of piping a live remote installer script into a shell.
+      - pip3 install uv==${UV_VERSION}
+      - uv --version
+      - uv pip install --system boto3 "numpy<2.2"
+      # TF 2.19 must match the DLC the endpoint serves. uv's HTTP/2 multi-
+      # connection download makes the big TF wheel land reliably without
+      # the retry-with-backoff dance pip needs.
+      - uv pip install --system tensorflow==2.19.0
+
+  pre_build:
+    commands:
+      - export PATH=$HOME/.local/bin:$PATH
+      - echo "Verifying TensorFlow installation"
+      - python -c "import tensorflow as tf; print('TF', tf.__version__)"
+      - echo "Fetching model artifacts bucket from training infrastructure"
+      # Dynamically fetch the bucket name from training infrastructure outputs
+      - export MODEL_ARTIFACTS_BUCKET=$(aws s3api list-buckets --query "Buckets[?contains(Name, 'model-artifacts')].Name" --output text | grep medical-image-classification)
+      - echo "Using MODEL_ARTIFACTS_BUCKET=$MODEL_ARTIFACTS_BUCKET"
+      # Verify bucket exists
+      - aws s3 ls s3://$MODEL_ARTIFACTS_BUCKET/ || (echo "ERROR Model artifacts bucket not found" && exit 1)
+
+  build:
+    commands:
+      - echo "Executing baseline model creation script"
+      - python stack-cicd/scripts/create_baseline_model.py
+      - echo "Baseline model creation completed"
+
+artifacts:
+  files:
+    - "**/*"

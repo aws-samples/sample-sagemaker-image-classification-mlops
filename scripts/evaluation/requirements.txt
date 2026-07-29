@@ -1,0 +1,12 @@
+# Runs inside SageMaker TF 2.19 CPU DLC - keep TF/numpy/Pillow aligned with container.
+# Do NOT bump tensorflow here without first verifying a newer DLC tag exists in
+# 763104351884.dkr.ecr.<region>.amazonaws.com. TF 2.19 wheels require numpy<2.2,
+# which is why numpy is pinned at 2.1.3 below rather than latest (2.4.x).
+tensorflow==2.19.0
+numpy==2.1.3
+Pillow==12.3.0
+scikit-learn>=1.8.0
+pandas>=2.3.0
+matplotlib>=3.10.0
+seaborn>=0.13.2
+boto3>=1.42.0

@@ -1,0 +1,65 @@
+version: 0.2
+
+# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+#
+# Builds the Pillow+NumPy Lambda layer and applies the inference Terraform
+# root. Uses uv (https://github.com/astral-sh/uv) for package installs -
+# ~10-100x faster than pip, drop-in replacement, drastically shortens the
+# wheel-building step for Pillow on the CodeBuild container.
+
+env:
+  variables:
+    LAYER_DIR: "stack-inference/lambda-layers"
+    BUILD_DIR: "/tmp/lambda-layer-build"
+    TERRAFORM_VERSION: "1.15.6"
+    PILLOW_VERSION: "12.2.0"
+    NUMPY_VERSION: "2.4.4"
+    UV_VERSION: "0.9.9"
+    PYTHON_VERSION: "3.13"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+    commands:
+      - "echo Installing Terraform ${TERRAFORM_VERSION}..."
+      - "dnf update -y python3-pip libtasn1 libxml2 || true"
+      - "curl -fsSL https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip -o terraform.zip"
+      - "unzip terraform.zip"
+      - "mv terraform /usr/local/bin/"
+      - "terraform --version"
+      # Install uv from PyPI at a pinned version. pip resolves it through the
+      # hash-checked package index instead of piping a live remote installer
+      # script (astral.sh) straight into a shell.
+      - "pip3 install uv==${UV_VERSION}"
+      - "uv --version"
+
+  pre_build:
+    commands:
+      - "export PATH=$HOME/.local/bin:$PATH"
+      - "echo Building Lambda Layer for Pillow and NumPy (Python ${PYTHON_VERSION})"
+      - "rm -rf $BUILD_DIR"
+      - "mkdir -p $BUILD_DIR/python/lib/python${PYTHON_VERSION}/site-packages"
+      - "mkdir -p $CODEBUILD_SRC_DIR/$LAYER_DIR"
+      # uv pip is a drop-in for pip install - same flags, same resolver
+      # behavior, just faster. Installing Pillow+numpy typically drops from
+      # ~60s (pip) to <5s (uv) thanks to parallel downloads and a global cache.
+      - "uv pip install --target $BUILD_DIR/python/lib/python${PYTHON_VERSION}/site-packages --python-platform x86_64-manylinux2014 --python-version ${PYTHON_VERSION} --only-binary=:all: --upgrade Pillow==${PILLOW_VERSION} numpy==${NUMPY_VERSION}"
+      - "cd $BUILD_DIR && zip -r9 $CODEBUILD_SRC_DIR/$LAYER_DIR/pillow-numpy-layer.zip python/"
+      - "ls -lh $CODEBUILD_SRC_DIR/$LAYER_DIR/pillow-numpy-layer.zip"
+      - "rm -rf $BUILD_DIR"
+      - "echo Initializing Terraform"
+      - "cd $CODEBUILD_SRC_DIR/stack-inference && terraform init"
+
+  build:
+    commands:
+      - "cd $CODEBUILD_SRC_DIR/stack-inference"
+      - "terraform apply -auto-approve"
+
+  post_build:
+    commands:
+      - "echo Deployment completed successfully"
+
+artifacts:
+  files:
+    - "**/*"

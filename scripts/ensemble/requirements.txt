@@ -1,0 +1,7 @@
+# Runs inside SageMaker TF 2.19 inference DLC - keep TF/numpy aligned with container.
+# TF 2.19 wheels require numpy<2.2 so numpy is pinned at 2.1.3 rather than latest (2.4.x).
+# See scripts/evaluation/requirements.txt for DLC version constraint details.
+tensorflow==2.19.0
+numpy==2.1.3
+scikit-learn>=1.8.0
+boto3>=1.42.0
