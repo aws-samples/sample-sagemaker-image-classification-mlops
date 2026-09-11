@@ -1,0 +1,6 @@
+# Installed by run_fairness.sh at Processing-job start. Runs in the SageMaker
+# scikit-learn Processing image (Part 4 ongoing fairness monitoring), which
+# already carries boto3, numpy, pandas and scikit-learn - only Fairlearn is
+# actually added. Version pinned to match scripts/bias/requirements.txt so the
+# scheduled job and the in-pipeline gate compute metrics identically.
+fairlearn==0.14.0

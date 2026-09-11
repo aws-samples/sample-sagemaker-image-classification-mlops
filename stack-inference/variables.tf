@@ -2,8 +2,18 @@
 # SPDX-License-Identifier: MIT-0
 
 variable "project_name" {
-  description = "Name of the project"
+  description = "Name of the project. Prefixes every resource name."
   type        = string
+
+  # The scheduled drift and fairness jobs build a ProcessingJobName as
+  # "<project_name>-fairness-<aws.scheduler.execution-id>". SageMaker caps that
+  # name at 63 characters and the Scheduler substitutes a ~16-character id, so a
+  # long project name would only fail when the schedule fires - the apply would
+  # succeed and the job would then silently never run. Fail at plan time instead.
+  validation {
+    condition     = length(var.project_name) <= 38
+    error_message = "project_name must be 38 characters or fewer: it is prefixed onto the scheduled fairness job's ProcessingJobName, which SageMaker caps at 63 characters after EventBridge Scheduler substitutes a ~16-character execution id."
+  }
 }
 
 variable "environment" {
@@ -151,7 +161,7 @@ variable "use_serverless_inference" {
     Opt-in flag to deploy the endpoint as a SageMaker Serverless Inference
     variant instead of an always-on instance. Recommended for low-traffic
     demo/blog endpoints: scales to zero when idle and can cut the monthly
-    bill from ~$170 to ~$5-10. Not recommended when Model Monitor data
+    bill from ~$170 to ~$5-10. Not recommended when drift-detection data
     capture or strict p50 latency matter - see the sagemaker-endpoint
     module README for the full tradeoff list.
   EOT
@@ -171,55 +181,111 @@ variable "serverless_max_concurrency" {
   default     = 10
 }
 
-################################################################################
-# Model Monitor
-################################################################################
-
-variable "model_monitor_config" {
-  description = "Model Monitor configuration"
-  type = object({
-    setup_on_deploy        = bool
-    data_quality_schedule  = string
-    model_quality_schedule = string
-    instance_type          = string
-    volume_size            = number
-    max_runtime            = number
-  })
-  default = {
-    setup_on_deploy        = true
-    data_quality_schedule  = "cron(0 * * * ? *)"
-    model_quality_schedule = "cron(0 */6 * * ? *)"
-    instance_type          = "ml.m5.xlarge"
-    volume_size            = 30
-    max_runtime            = 3600
-  }
-}
 
 ################################################################################
 # Network
 ################################################################################
 
 
-################################################################################
-# Clarify Bias Monitoring
-################################################################################
 
-variable "enable_bias_monitoring" {
-  description = "Enable SageMaker Clarify bias monitoring schedule"
+variable "enable_drift_job" {
+  description = "Enable the scheduled drift Processing job (Part 3). EventBridge Scheduler starts a SageMaker Processing job that reads endpoint data-capture output from S3, computes a Population Stability Index against the training baseline, and publishes it to CloudWatch, where the drift alarm and the EventBridge retrain rule consume it. Requires data capture, so it is skipped for serverless endpoints."
   type        = bool
   default     = true
 }
 
-variable "enable_model_monitor" {
-  description = "Enable the SageMaker Model Monitor data-quality schedule (drift detection on the prediction-score distribution). Always off for serverless endpoints, which do not support data capture."
-  type        = bool
-  default     = true
-}
-
-variable "bias_schedule_expression" {
-  description = "CRON or rate expression for Clarify bias analysis (defaults to daily midnight UTC)"
+variable "drift_detector_schedule_expression" {
+  description = "Schedule on which the drift Processing job runs. Should be no more frequent than the lookback window is long."
   type        = string
-  default     = "cron(0 0 * * ? *)"
+  default     = "rate(1 hour)"
+}
+
+variable "drift_detector_lookback_hours" {
+  description = "How many hours of captured predictions the drift detector compares against the baseline on each run."
+  type        = number
+  default     = 24
+}
+
+variable "drift_detector_min_samples" {
+  description = "Minimum captured predictions required before the detector publishes a PSI. Below this it publishes nothing, so quiet periods cannot raise a false drift alarm."
+  type        = number
+  default     = 30
+}
+
+variable "drift_job_instance_type" {
+  description = "Instance type for the scheduled drift Processing job. The job is IO-bound over a few thousand small JSON records, so the smallest general-purpose type is sufficient."
+  type        = string
+  default     = "ml.t3.medium"
+}
+
+variable "drift_job_max_runtime" {
+  description = "MaxRuntimeInSeconds for the drift Processing job. Caps cost if a capture prefix grows unexpectedly large."
+  type        = number
+  default     = 900
+}
+
+variable "monitoring_job_image_tag" {
+  description = "Tag of the AWS-managed scikit-learn Processing image used to run the scheduled drift and fairness scripts."
+  type        = string
+  default     = "1.2-1"
+}
+
+################################################################################
+# Ongoing fairness monitoring (Part 4)
+################################################################################
+
+variable "enable_fairness_job" {
+  description = "Enable the scheduled fairness Processing job (Part 4). EventBridge Scheduler starts a SageMaker Processing job that joins endpoint data capture with the confirmed diagnostic outcomes clinicians upload, computes demographic parity and equalized odds per subgroup with Fairlearn, and publishes the largest disparity to CloudWatch beside the drift metric. The alarm feeds the same retrain rule. Requires data capture, so it is skipped for serverless endpoints."
+  type        = bool
+  default     = true
+}
+
+variable "fairness_job_schedule_expression" {
+  description = "Schedule on which the fairness Processing job runs. Daily by default: confirmed outcomes arrive on a clinical cadence, so a tighter schedule would mostly re-score the same records."
+  type        = string
+  default     = "rate(1 day)"
+}
+
+variable "fairness_ground_truth_prefix" {
+  description = "Prefix in the monitoring bucket where confirmed diagnostic outcomes are uploaded as JSON Lines: {\"request_id\": ..., \"label\": 0|1, \"group\": \"<subgroup>\"}. Predictions with no matching label are skipped, never guessed."
+  type        = string
+  default     = "ground-truth"
+}
+
+variable "fairness_job_lookback_hours" {
+  description = "How many hours of captured predictions and confirmed outcomes the fairness job scores on each run. Wider than the drift window (a week by default) because ground truth lags the prediction it confirms."
+  type        = number
+  default     = 168
+}
+
+variable "fairness_job_min_samples" {
+  description = "Minimum prediction/outcome pairs required before the fairness job publishes a disparity. Below this it publishes nothing, so a thin join cannot raise a false fairness alarm."
+  type        = number
+  default     = 50
+}
+
+variable "fairness_disparity_threshold" {
+  description = "Disparity above which the fairness alarm fires and retraining is triggered. Bounds the larger of demographic-parity difference and equalized-odds difference on live traffic. Mirrors var.fairness_gate.max_disparity in stack-training so the deployed model is held to the same bar it was registered under."
+  type        = number
+  default     = 0.10
+}
+
+variable "fairness_alarm_period" {
+  description = "Evaluation period (seconds) for the fairness alarm. Should be >= the fairness schedule interval (daily = 86400) so each scheduled run produces one data point."
+  type        = number
+  default     = 86400
+}
+
+variable "fairness_job_instance_type" {
+  description = "Instance type for the scheduled fairness Processing job. The job is IO-bound over a few thousand small JSON records, so the smallest general-purpose type is sufficient."
+  type        = string
+  default     = "ml.t3.medium"
+}
+
+variable "fairness_job_max_runtime" {
+  description = "MaxRuntimeInSeconds for the fairness Processing job. Caps cost if the capture or ground-truth prefix grows unexpectedly large."
+  type        = number
+  default     = 900
 }
 
 ################################################################################
@@ -249,7 +315,7 @@ variable "dlc_source_repository" {
 ################################################################################
 
 variable "drift_threshold" {
-  description = "Model Monitor baseline-drift value (on the prediction-score distribution) above which the drift alarm fires and retraining is triggered. Matches the constraints baseline emit threshold."
+  description = "Population Stability Index on the prediction-score distribution above which the drift alarm fires and retraining is triggered."
   type        = number
   default     = 0.2
 }

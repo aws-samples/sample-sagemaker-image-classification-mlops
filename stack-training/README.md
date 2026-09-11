@@ -106,7 +106,7 @@ cd ../scripts && ./script_uploader.sh
 | enable\_auto\_trigger | Enable auto-trigger of pipeline on new data upload | `bool` | `true` | no |
 | enable\_cloudtrail | Create an account-wide CloudTrail with log-file integrity validation. Required for medical ML audit trails. | `bool` | `true` | no |
 | enable\_cloudtrail\_sns | Attach an SNS delivery-notification topic to the CloudTrail. Off by default: CloudTrail cannot publish to a topic encrypted with the AWS-managed alias/aws/sns key, so enabling this requires a CMK whose policy grants the CloudTrail service principal. The trail and S3/CloudWatch delivery work without it. | `bool` | `false` | no |
-| enable\_debugger | Attach SageMaker Debugger built-in rules (Overfit, LossNotDecreasing) to the training steps (Part 2). | `bool` | `true` | no |
+| enable\_debugger | Attach SageMaker Debugger built-in rules (Overfit, LossNotDecreasing) to the training steps (Part 2). Off by default; managed MLflow plus CloudWatch covers the same need. | `bool` | `false` | no |
 | enable\_experiments | Associate each training step with a SageMaker Experiment trial component via ExperimentConfig (Part 2). | `bool` | `true` | no |
 | enable\_kms\_key\_rotation | Enable KMS key rotation | `bool` | `true` | no |
 | enable\_managed\_spot\_training | Use EC2 Spot for all training steps. Requires checkpoint support in trainers. | `bool` | `true` | no |
@@ -114,6 +114,7 @@ cd ../scripts && ./script_uploader.sh
 | enable\_network\_isolation | Enable network isolation for SageMaker training and processing jobs | `bool` | `false` | no |
 | enable\_sbom\_bucket | Create a dedicated S3 bucket to receive Syft-generated CycloneDX SBOMs from the patched-image CodeBuild. Low monthly cost; safe to leave on even if you don't wire the patched image yet. | `bool` | `true` | no |
 | enable\_training\_monitoring | Enable training monitoring | `bool` | `true` | no |
+| fairness\_gate | Fairness gate the ensemble must clear before registration (Part 4). max\_disparity bounds the larger of demographic-parity difference and equal-opportunity difference, computed by scripts/bias/compute\_bias.py with Fairlearn. Must mirror DEFAULT\_THRESHOLD in that script. sensitive\_feature is reported in the bias report; the public datasets used here carry no demographic metadata, so magnification is an honest subgroup proxy - supply a real attribute for clinical use. | <pre>object({<br/>    max_disparity     = number<br/>    sensitive_feature = string<br/>  })</pre> | <pre>{<br/>  "max_disparity": 0.1,<br/>  "sensitive_feature": "magnification"<br/>}</pre> | no |
 | kms\_deletion\_window\_days | KMS key deletion window (days) | `number` | `7` | no |
 | log\_group\_names | Log group names for metric filters | `map(string)` | `{}` | no |
 | log\_groups | Map of log groups to create | <pre>map(object({<br/>    name = string<br/>  }))</pre> | `{}` | no |
@@ -126,7 +127,6 @@ cd ../scripts && ./script_uploader.sh
 | preprocessing\_target\_size | Target square resolution (pixels) the preprocessing job resizes every image to before training. 512 preserves fine diagnostic features like microcalcifications; the trainers downsample to their own input\_size from there. | `number` | `512` | no |
 | retraining\_reason | Reason for retraining (manual, data\_upload, drift\_detected) | `string` | `"manual"` | no |
 | sagemaker\_images | SageMaker container image configurations | <pre>object({<br/>    sklearn_tag              = string<br/>    tensorflow_gpu_tag       = string<br/>    tensorflow_cpu_tag       = string<br/>    tensorflow_inference_tag = string<br/>  })</pre> | <pre>{<br/>  "sklearn_tag": "1.4-2-cpu-py3",<br/>  "tensorflow_cpu_tag": "2.19.0-cpu-py312-ubuntu22.04-sagemaker",<br/>  "tensorflow_gpu_tag": "2.19.0-gpu-py312-cu125-ubuntu22.04-sagemaker",<br/>  "tensorflow_inference_tag": "2.19.0-cpu-py312-ubuntu22.04-sagemaker"<br/>}</pre> | no |
-| sagemaker\_model\_monitor\_image\_arn | ECR repository ARN of the AWS-managed SageMaker Model Monitor analyzer image. Varies per region - see https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor-pre-built-container.html | `string` | `"arn:aws:ecr:us-east-1:156813124566:repository/sagemaker-model-monitor-analyzer"` | no |
 | sbom\_retention\_days | How long SBOM JSON files are kept before S3 expires them. | `number` | `730` | no |
 | spot\_max\_wait\_buffer\_seconds | Extra wait time (seconds) SageMaker holds for Spot capacity on top of MaxRuntime | `number` | `1800` | no |
 | training\_data\_path | Training data S3 path | `string` | `"medical_image_data/"` | no |

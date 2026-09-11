@@ -115,12 +115,12 @@ def chart_bias_confusion(out_dir: Path):
 
 
 # --------------------------------------------------------------------------- #
-# Bias disparity metrics (SageMaker Clarify style)
+# Bias disparity metrics
 # --------------------------------------------------------------------------- #
 
 
 def chart_bias_disparity(out_dir: Path):
-    """Illustrative SageMaker Clarify pre-/post-training bias metrics chart."""
+    """Illustrative pre-/post-training bias metrics chart."""
     metrics = [
         ("Class Imbalance (CI)", 0.60, 0.00),
         ("Difference in Proportions\nof Labels (DPL)", 0.40, 0.02),
@@ -142,7 +142,7 @@ def chart_bias_disparity(out_dir: Path):
     ax.set_yticklabels([m[0] for m in metrics])
     ax.invert_yaxis()
     ax.set_xlabel("Metric value  (0 = no bias, higher = more bias)")
-    ax.set_title("SageMaker Clarify - Pre- and Post-Training Bias Metrics  (illustrative)")
+    ax.set_title("Pre- and Post-Training Bias Metrics  (illustrative)")
     ax.set_xlim(0, 1)
     ax.axvline(0.1, color="gray", linestyle="--", alpha=0.6)
     ax.text(0.1, len(metrics) - 0.3, " acceptable\n threshold", fontsize=9, color="gray")
@@ -191,17 +191,7 @@ def chart_hyperparameter_comparison(out_dir: Path):
     colors = [
         "#27ae60" if c["name"].startswith(("Ideal", "Higher")) else "#3498db" for c in configs
     ]
-    bars = ax.bar(x, [c["acc"] for c in configs], color=colors, edgecolor="white", linewidth=2)
-    for bar, c in zip(bars, configs):
-        label = f"{c['acc']:.1%}\nLR={c['lr']}\nBS={c['bs']} · {c['img']}px"
-        ax.annotate(
-            label,
-            xy=(bar.get_x() + bar.get_width() / 2, c["acc"]),
-            xytext=(0, 4),
-            textcoords="offset points",
-            ha="center",
-            fontsize=9,
-        )
+    ax.bar(x, [c["acc"] for c in configs], color=colors, edgecolor="white", linewidth=2)
     ax.set_xticks(x)
     ax.set_xticklabels([c["name"] for c in configs])
     ax.set_ylabel("Validation accuracy")

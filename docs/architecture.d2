@@ -33,7 +33,7 @@ train: "2 - Training + quality gate" {
   vgg: "VGG16" {class: train}
   dense: "DenseNet121" {class: train}
   eff: "EfficientNetV2M" {class: train}
-  note: "two-phase transfer learning\nDebugger + Experiments" {class: train; style.font-size: 11}
+  note: "two-phase transfer learning\nMLflow + Experiments" {class: train; style.font-size: 11}
   ensemble: "Weighted ensemble\n+ evaluation" {class: train}
   gate: "Clinical quality gate\nacc>=.85 recall>=.95\nprec>=.80 auc>=.90" {class: gate}
 
@@ -54,7 +54,7 @@ serve: "3 - Serving" {
   api: "API Gateway" {class: serve}
   infer: "Inference Lambda" {class: serve}
   endpoint: "SageMaker Endpoint\nblue/green + rollback" {class: serve}
-  bedrock: "Bedrock + Guardrail\n+ A2I review\n(low confidence)" {class: serve}
+  bedrock: "Bedrock + Guardrail\n+ human review\n(low confidence)" {class: serve}
 
   api -> infer -> endpoint
   infer -> bedrock: "conf < threshold"
@@ -64,7 +64,7 @@ serve: "3 - Serving" {
 monitor: "4 - Monitor + retrain" {
   style: {fill: "#FAF4FE"; stroke: "#8430CE"; stroke-dash: 3}
   capture: "Data capture (S3)" {class: monitor}
-  mm: "Model Monitor\n(hourly)" {class: monitor}
+  mm: "Scheduled Processing Job\nPSI (hourly)" {class: monitor}
   alarm: "CloudWatch\ndrift alarm" {class: monitor}
   eb2: "EventBridge\nretrain trigger" {class: monitor}
 

@@ -27,7 +27,7 @@ variable "endpoint_instance_type" {
 }
 
 variable "data_capture_sampling_percentage" {
-  description = "Percentage of endpoint invocations captured for Model Monitor"
+  description = "Percentage of endpoint invocations captured for drift detection"
   type        = number
   default     = 100
 }

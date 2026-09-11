@@ -188,6 +188,20 @@ module "inference_lambda_role" {
           ]
         },
         {
+          # Read-only on the monitoring bucket for the drift detector: it lists
+          # the data-capture prefix and reads the baseline statistics. No write
+          # access - the detector only publishes to CloudWatch.
+          Effect = "Allow"
+          Action = [
+            "s3:GetObject",
+            "s3:ListBucket"
+          ]
+          Resource = [
+            "arn:aws:s3:::${local.training_outputs.monitoring_bucket}",
+            "arn:aws:s3:::${local.training_outputs.monitoring_bucket}/*"
+          ]
+        },
+        {
           Effect = "Allow"
           Action = [
             "kms:Decrypt",
@@ -294,7 +308,7 @@ module "inference_lambda_role" {
 # Lambda log groups are now created by the lambda module itself with
 # retention + KMS. Keeping this file intentionally terse - module owns it.
 
-# EventBridge triggers for monitoring removed - replaced by native SageMaker Model Monitor
+# EventBridge triggers for monitoring removed - the scheduled drift job covers this
 # See monitoring.tf for the native monitoring schedule
 
 ################################################################################
@@ -377,7 +391,7 @@ module "patched_inference_image" {
 resource "random_id" "frontend_suffix" {
   byte_length = 4
 }
-# S3 trigger for data converter removed - native Model Monitor reads JSONL directly
+# S3 trigger for data converter removed - the drift job reads captured JSONL directly
 
 # Auto-deployment module
 module "auto_deployment" {

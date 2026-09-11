@@ -75,7 +75,7 @@ resource "aws_sagemaker_model" "this" {
 # and serverless production variants. Serverless is gated behind
 # var.use_serverless_inference because it has several architectural
 # constraints not present in real-time mode (see module README):
-#   - no DataCaptureConfig support, so Model Monitor must be fed from the
+#   - no DataCaptureConfig support, so drift detection must be fed from the
 #     inference handler itself
 #   - no auto-scaling (scales via max_concurrency on the variant)
 #   - 1-5 second cold start after idle periods
@@ -134,7 +134,7 @@ resource "aws_sagemaker_endpoint_configuration" "this" {
     }
   }
 
-  # Data Capture is only supported on real-time endpoints. Model Monitor
+  # Data Capture is only supported on real-time endpoints. Drift detection
   # jobs read the S3 data-capture prefix; if we enabled DataCaptureConfig
   # on a serverless variant SageMaker would reject the CreateEndpointConfig
   # call. For serverless deployments, capture predictions from inside the
@@ -203,7 +203,7 @@ resource "aws_sagemaker_endpoint" "this" {
     # auto_rollback policy at create/update time but does not return it on
     # Describe, so Terraform reads it back as absent and tries to re-add it on
     # every apply - which forces a full endpoint REPLACEMENT (and then fails
-    # because Model Monitor schedules are still attached). Ignoring it keeps
+    # because monitoring schedules are still attached). Ignoring it keeps
     # re-applies in-place and non-destructive.
     ignore_changes = [endpoint_config_name, deployment_config]
   }

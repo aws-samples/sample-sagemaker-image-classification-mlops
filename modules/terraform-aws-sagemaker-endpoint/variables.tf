@@ -37,7 +37,7 @@ variable "use_serverless_inference" {
     (large cost savings for low-traffic endpoints like a blog demo) but loses
     several features:
 
-      - No DataCaptureConfig on the endpoint config (Model Monitor cannot
+      - No DataCaptureConfig on the endpoint config (drift detection cannot
         read captured payloads; your inference handler must log predictions
         itself if drift detection matters).
       - No Application Auto Scaling (scales internally via max_concurrency).

@@ -2,13 +2,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-# Temporary - regenerates every previously-synthetic chart with real data
-# fetched from the live AWS account. Produces:
+# Regenerates every previously-synthetic chart with real data fetched from the
+# live AWS account. Re-run whenever the endpoint or training history changes and
+# the blog charts need refreshing. Produces:
 #
 #   bias_disparity_metrics.png       real fairness metrics across BreakHis
 #                                    magnification subgroups
 #   bias_impact_confusion.png        real confusion matrices per subgroup
-#   drift_baseline_vs_drifted.png    real KL divergence on endpoint outputs
+#   drift_baseline_vs_drifted.png    real PSI on endpoint outputs
 #   prediction_confidence_over_time  real confidence drift over in-dist vs OOD
 #   learning_rate_impact.png         real LR sweep from historical jobs
 #   batch_size_impact.png            real batch-size effect from history
@@ -16,8 +17,8 @@
 #   shap_feature_importance.png      real SHAP from extracted DenseNet
 #   amt_tuning_placeholder.png       launches a real HPO job first
 #
-# Relies on AWS credentials already loaded (AWS_PROFILE=secondary). Delete
-# after successful run.
+# Relies on AWS credentials already loaded (AWS_PROFILE=secondary). Read-only
+# against AWS apart from ops_launch_hpo, which starts a real tuning job.
 
 from __future__ import annotations
 
@@ -245,7 +246,7 @@ def chart_bias_disparity(breakhis: dict, out: Path) -> None:
     malignant-subtype axis. Uses the convention where subgroup A is the
     protected/disadvantaged group and subgroup B is the advantaged group;
     we report the max disparity across all pairs as the single number per
-    metric, which is how Clarify reports group-pairwise metrics."""
+    metric, the standard way group-pairwise fairness metrics are reported."""
 
     # Collapse to per-subgroup per-class arrays of probabilities & true labels
     by_mag = defaultdict(lambda: {"probs": [], "labels": []})
@@ -327,7 +328,7 @@ def chart_bias_disparity(breakhis: dict, out: Path) -> None:
     for i, m in enumerate(mags):
         axes[0].text(i, 1.02, f"n={rates[m]['n']}", ha="center", fontsize=8, color="#555")
 
-    # Right: aggregate fairness-metric gaps (Clarify-style bar chart)
+    # Right: aggregate fairness-metric gaps
     metrics = [
         ("Class imbalance (CI)", ci_gap),
         ("Diff. positive labels (DPL)", dpl_gap),
@@ -338,9 +339,7 @@ def chart_bias_disparity(breakhis: dict, out: Path) -> None:
     values = [m[1] for m in metrics]
     colors = ["#1565c0" if v < 0.1 else ("#f9a825" if v < 0.2 else "#c62828") for v in values]
     bars = axes[1].barh(names, values, color=colors)
-    axes[1].axvline(
-        0.1, color="#555", linestyle="--", alpha=0.6, label="0.1 threshold (Clarify default)"
-    )
+    axes[1].axvline(0.1, color="#555", linestyle="--", alpha=0.6, label="0.1 acceptable threshold")
     axes[1].set_xlim(0, max(0.3, max(values) * 1.1))
     axes[1].set_xlabel("Gap value   (0 = no disparity, higher = worse)")
     axes[1].set_title("Fairness gaps across magnification subgroups")

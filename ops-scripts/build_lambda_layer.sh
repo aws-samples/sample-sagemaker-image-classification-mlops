@@ -15,7 +15,7 @@ BUILD_DIR="/tmp/lambda-layer-build"
 
 # Versions pinned to match Lambda runtime and CodeBuild buildspec
 PYTHON_VERSION="3.13"
-PILLOW_VERSION="12.2.0"
+PILLOW_VERSION="12.3.0"
 NUMPY_VERSION="2.4.4"
 
 echo "=========================================="
@@ -45,15 +45,18 @@ if [[ "$PIP_CMD" == *"uv" ]]; then
     echo "Using uv (10-100x faster than pip)"
     INSTALL_CMD=("$PIP_CMD" pip install)
     # uv uses --python-platform instead of --platform + --implementation
-    PLATFORM_ARGS=(--python-platform x86_64-manylinux2014 --python-version "$PYTHON_VERSION" --only-binary=:all:)
+    PLATFORM_ARGS=(--python-platform x86_64-manylinux_2_28 --python-version "$PYTHON_VERSION" --only-binary=:all:)
 else
     echo "Using pip (install uv for ~10x speedup: https://astral.sh/uv)"
     INSTALL_CMD=("$PIP_CMD" install)
-    PLATFORM_ARGS=(--platform manylinux2014_x86_64 --implementation cp --python-version "$PYTHON_VERSION" --only-binary=:all:)
+    PLATFORM_ARGS=(--platform manylinux_2_28_x86_64 --implementation cp --python-version "$PYTHON_VERSION" --only-binary=:all:)
 fi
 
-# Install packages to the Lambda layer structure
-# Using manylinux2014 platform ensures compatibility with Lambda's Amazon Linux 2023
+# Install packages to the Lambda layer structure.
+# manylinux_2_28, not manylinux2014: Pillow stopped publishing manylinux2014
+# cp313 wheels, so --only-binary has nothing to resolve against on the older
+# tag. Lambda's python3.13 runtime is Amazon Linux 2023 (glibc 2.34), so glibc
+# 2.28 wheels are compatible.
 "${INSTALL_CMD[@]}" \
     --target="$BUILD_DIR/python/lib/python${PYTHON_VERSION}/site-packages" \
     "${PLATFORM_ARGS[@]}" \

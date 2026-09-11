@@ -6,7 +6,7 @@ SageMaker model, endpoint configuration, CloudWatch alarms, and auto-scaling for
 
 1. Fetches the latest approved model package from SageMaker Model Registry via an external data source
 2. Creates a SageMaker Model using the approved model's container image and model data URL
-3. Creates a SageMaker Endpoint Configuration - either real-time (with data capture enabled for Model Monitor) or serverless (scales to zero)
+3. Creates a SageMaker Endpoint Configuration - either real-time (with data capture enabled for drift detection) or serverless (scales to zero)
 4. Creates CloudWatch alarms for endpoint error rate (4XX errors) and latency monitoring, wired to the endpoint's auto-rollback configuration
 5. Creates an Application Auto Scaling target and target-tracking scaling policy (skipped in serverless mode - serverless scales via `max_concurrency`)
 
@@ -14,14 +14,14 @@ SageMaker model, endpoint configuration, CloudWatch alarms, and auto-scaling for
 
 ### Real-time (default)
 
-`use_serverless_inference = false` (default) - provisioned `ml.m5.xlarge` (or whatever `instance_type` you set) runs 24/7. Full Model Monitor + Clarify + auto-scaling support. ~$168/month baseline at 1 instance.
+`use_serverless_inference = false` (default) - provisioned `ml.m5.xlarge` (or whatever `instance_type` you set) runs 24/7. Full data-capture + drift-detection + auto-scaling support. ~$168/month baseline at 1 instance.
 
 Best for:
 
 - Production workloads with steady traffic
 - Use cases requiring strict p50 latency (< 200ms)
 - Regulated / clinical deployments where data-capture audit is required
-- Any case where Model Monitor or Clarify bias checks matter
+- Any case where data capture or drift detection matters
 
 ### Serverless (opt-in)
 
@@ -29,8 +29,7 @@ Set `use_serverless_inference = true` - SageMaker provisions workers per request
 
 **You lose**:
 
-- **Data Capture / Model Monitor**: serverless variants do not support `DataCaptureConfig`. This module automatically skips `aws_sagemaker_data_quality_job_definition` and `aws_sagemaker_monitoring_schedule` when serverless is enabled (see `stack-inference/monitoring.tf`). If you need drift detection, log predictions from your inference handler into S3 yourself and run a scheduled custom monitor.
-- **Clarify bias monitoring**: same reason - disabled automatically when serverless is on.
+- **Data capture**: serverless variants do not support `DataCaptureConfig`, so the scheduled drift job is skipped when serverless is enabled (see `stack-inference/monitoring.tf`). If you need drift detection in serverless mode, log predictions from your inference handler into S3 yourself.
 - **Weekly endpoint OS refresh**: no long-lived host to refresh; serverless workers are short-lived by design.
 - **Application Auto Scaling**: not supported on serverless variants. Tuning happens via `serverless_max_concurrency`.
 - **p50 latency guarantees**: cold starts are 1-5 seconds after idle periods. The first request after an idle window pays this tax; subsequent requests in the same window are fast.
@@ -104,7 +103,7 @@ When opting in, the auto-deploy Lambda also switches its endpoint-config creatio
 | target\_concurrent\_requests\_per\_model | Target concurrent in-flight requests per model container. Uses the SageMaker high-resolution metric (10s granularity) for sub-minute scale-out detection. | `number` | `5` | no |
 | termination\_wait\_seconds | Seconds to wait after deployment before terminating old fleet | `number` | `120` | no |
 | traffic\_shift\_wait\_interval | Wait interval in seconds between each linear traffic shift step | `number` | `60` | no |
-| use\_serverless\_inference | When true, provision a SageMaker Serverless Inference variant instead of<br/>an instance-based real-time variant. Serverless scales to zero when idle<br/>(large cost savings for low-traffic endpoints like a blog demo) but loses<br/>several features:<br/><br/>  - No DataCaptureConfig on the endpoint config (Model Monitor cannot<br/>    read captured payloads; your inference handler must log predictions<br/>    itself if drift detection matters).<br/>  - No Application Auto Scaling (scales internally via max\_concurrency).<br/>  - Cold starts of 1-5 seconds after idle periods.<br/>  - Max memory = 6 GB, max concurrent requests per variant = 200.<br/><br/>Default is false to preserve the project's compliance/monitoring story.<br/>Opt in only when the cost win outweighs these tradeoffs. | `bool` | `false` | no |
+| use\_serverless\_inference | When true, provision a SageMaker Serverless Inference variant instead of<br/>an instance-based real-time variant. Serverless scales to zero when idle<br/>(large cost savings for low-traffic endpoints like a blog demo) but loses<br/>several features:<br/><br/>  - No DataCaptureConfig on the endpoint config (drift detection cannot<br/>    read captured payloads; your inference handler must log predictions<br/>    itself if drift detection matters).<br/>  - No Application Auto Scaling (scales internally via max\_concurrency).<br/>  - Cold starts of 1-5 seconds after idle periods.<br/>  - Max memory = 6 GB, max concurrent requests per variant = 200.<br/><br/>Default is false to preserve the project's compliance/monitoring story.<br/>Opt in only when the cost win outweighs these tradeoffs. | `bool` | `false` | no |
 | volume\_kms\_key\_arn | KMS key ARN used to encrypt the ML storage volume attached to real-time (instance-based) inference variants. The volume buffers the model artifact and in-flight inference data (potential PHI for a medical model), so it should use the project CMK rather than the AWS-managed default key. Ignored for serverless variants, which do not attach a volume. Null falls back to the default key. | `string` | `null` | no |
 
 ## Outputs
