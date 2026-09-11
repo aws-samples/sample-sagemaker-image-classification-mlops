@@ -24,7 +24,7 @@ def save(fig, path: Path):
 
 
 # --------------------------------------------------------------------------- #
-# 3a. Drift - baseline vs drifted distribution (histogram overlay)
+# 3a. Drift - baseline vs drifted distribution (histogram overlay, PSI callout)
 # --------------------------------------------------------------------------- #
 
 
@@ -63,12 +63,14 @@ def chart_drift_distribution(out_dir: Path):
     ax.text(0.5, ax.get_ylim()[1] * 0.95, " decision boundary", fontsize=10, color="gray", va="top")
     ax.set_xlabel("Prediction score  (0 = benign, 1 = malignant)")
     ax.set_ylabel("Density")
-    ax.set_title("Prediction Distribution Drift  ·  Model Monitor histogram overlay")
+    ax.set_title("Prediction Distribution Drift  ·  histogram overlay")
     ax.legend(loc="upper center", framealpha=0.9)
 
-    # KL divergence callout (synthetic illustrative value)
+    # PSI callout (synthetic illustrative value). PSI, not KL divergence: the
+    # drift gate standardised on Population Stability Index, which is what the
+    # scheduled processing job publishes to CloudWatch.
     ax.annotate(
-        "KL divergence = 0.42\n(alert threshold = 0.25)",
+        "PSI = 0.42\n(alert threshold = 0.25)",
         xy=(0.75, 1.8),
         xytext=(0.25, 2.8),
         fontsize=11,

@@ -14,10 +14,13 @@ data "terraform_remote_state" "training" {
 # Current account for IAM resource scoping
 data "aws_caller_identity" "current" {}
 
-# SageMaker Model Monitor prebuilt image
-data "aws_sagemaker_prebuilt_ecr_image" "model_monitor" {
-  repository_name = "sagemaker-model-monitor-analyzer"
-  image_tag       = "latest"
+# Image for the scheduled monitoring Processing jobs (drift, fairness). Neither
+# script needs TensorFlow - drift is boto3 plus the standard library, and
+# fairness adds only Fairlearn on top of the scikit-learn stack - so the small
+# scikit-learn DLC is enough.
+data "aws_sagemaker_prebuilt_ecr_image" "monitoring_jobs" {
+  repository_name = "sagemaker-scikit-learn"
+  image_tag       = var.monitoring_job_image_tag
 }
 
 # Pre-built Lambda layer with Pillow and numpy for image preprocessing
@@ -66,7 +69,7 @@ locals {
   # Define endpoint name in inference pipeline
   endpoint_name = "${var.project_name}-endpoint"
 
-  # Lambda configurations - monitoring Lambdas removed in favor of native SageMaker Model Monitor
+  # Lambda configurations
   lambda_configs = {
     inference_api = {
       filename    = "lambda/inference_api.zip"
@@ -277,8 +280,3 @@ locals {
 }
 
 
-# SageMaker Clarify prebuilt image
-data "aws_sagemaker_prebuilt_ecr_image" "clarify" {
-  repository_name = "sagemaker-clarify-processing"
-  image_tag       = "latest"
-}

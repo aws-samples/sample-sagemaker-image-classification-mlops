@@ -29,18 +29,24 @@ request describing the vulnerability.
   PII. No dataset is committed to this repository; `data/` is gitignored.
 - Dataset licensing is the user's responsibility. Confirm the terms of any
   dataset you supply, and do not commit PHI or PII.
-- The datasets used carry no demographic metadata, so demographic-facet bias
-  monitoring is provided as opt-in scaffolding using subgroup proxies rather
-  than an always-on feature.
+- The datasets used carry no demographic metadata, so both the in-pipeline
+  fairness gate and the scheduled fairness monitor operate on subgroup proxies
+  (image magnification) rather than real demographic facets. Supply a real
+  sensitive attribute before drawing any fairness conclusion.
+- The scheduled fairness monitor needs confirmed diagnostic outcomes, which only
+  a clinician can provide. It reads them from a `ground-truth` prefix that this
+  project does not populate; until that feed exists the job finds nothing to
+  score and publishes no metric. Predictions without a confirmed label are
+  skipped, never inferred.
 
 ## AWS services used
 
 | Area | Services |
 | --- | --- |
-| Training and ML | SageMaker Pipelines, Training Jobs, Processing Jobs, Model Registry, Model Cards, Experiments, Debugger, Clarify, Model Monitor, MLflow tracking server |
+| Training and ML | SageMaker Pipelines, Training Jobs, Processing Jobs, Model Registry, Model Cards, Experiments, MLflow tracking server |
 | Inference | SageMaker real-time Endpoint, Lambda, API Gateway, CloudFront, S3 (static UI) |
-| Responsible AI | SageMaker Clarify, Amazon Bedrock (Nova) + Bedrock Guardrails, Amazon A2I |
-| Events and orchestration | EventBridge, Lambda |
+| Responsible AI | Fairlearn bias metrics (in-pipeline gate and a scheduled fairness monitor), Grad-CAM / SHAP explainability, Amazon Bedrock (Nova) + Bedrock Guardrails |
+| Events and orchestration | EventBridge, EventBridge Scheduler, Lambda |
 | CI/CD | CodePipeline, CodeBuild, CodeStar connection |
 | Storage and data | S3, ECR |
 | Security and governance | KMS, IAM, CloudTrail, AWS Budgets |
@@ -121,8 +127,7 @@ Before adapting this project for production, at minimum:
 
 ## Resource cleanup
 
-Destroy in reverse dependency order. Model Monitor schedules must be removed
-before the endpoint, and buckets emptied before deletion.
+Destroy in reverse dependency order. Buckets must be emptied before deletion.
 
 ```bash
 # 1. Remove non-Terraform-managed data and resources
@@ -135,10 +140,9 @@ cd ../stack-cicd && terraform destroy
 cd ../stack-backend-setup && terraform destroy   # last - holds remote state
 ```
 
-If `terraform destroy` on the endpoint reports attached MonitoringSchedules,
-re-run `cleanup_all.sh` and retry. Confirm in the console that the SageMaker
-endpoint, Model Monitor schedules, and MLflow tracking server are gone, since
-these bill continuously.
+Confirm in the console that the SageMaker endpoint and the MLflow tracking server
+are gone, since these bill continuously. The drift and fairness schedules are
+Terraform-managed and go with `stack-inference`.
 
 ## Dependencies
 

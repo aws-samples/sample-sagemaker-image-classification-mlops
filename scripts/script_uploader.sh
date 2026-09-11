@@ -89,10 +89,24 @@ aws s3 cp ensemble/requirements.txt s3://$SCRIPTS_BUCKET/ensemble/
 aws s3 cp ensemble/inference.py s3://$SCRIPTS_BUCKET/ensemble/
 echo -e "${GREEN}✅ Uploaded ensemble scripts (including inference.py)${NC}"
 
+# Upload drift scripts (Part 3 scheduled drift Processing job)
+echo -e "${BLUE}📤 Uploading drift scripts...${NC}"
+aws s3 cp drift/compute_drift.py s3://$SCRIPTS_BUCKET/drift/
+echo -e "${GREEN}✅ Uploaded drift scripts${NC}"
 
+# Upload bias scripts (Part 4 in-pipeline fairness gate - Fairlearn)
+echo -e "${BLUE}📤 Uploading bias scripts...${NC}"
+aws s3 cp bias/compute_bias.py s3://$SCRIPTS_BUCKET/bias/
+aws s3 cp bias/run_bias_check.sh s3://$SCRIPTS_BUCKET/bias/
+aws s3 cp bias/requirements.txt s3://$SCRIPTS_BUCKET/bias/
+echo -e "${GREEN}✅ Uploaded bias scripts${NC}"
 
-
-
+# Upload fairness scripts (Part 4 scheduled fairness monitoring job)
+echo -e "${BLUE}📤 Uploading fairness scripts...${NC}"
+aws s3 cp fairness/compute_fairness.py s3://$SCRIPTS_BUCKET/fairness/
+aws s3 cp fairness/run_fairness.sh s3://$SCRIPTS_BUCKET/fairness/
+aws s3 cp fairness/requirements.txt s3://$SCRIPTS_BUCKET/fairness/
+echo -e "${GREEN}✅ Uploaded fairness scripts${NC}"
 
 # Verify uploads
 echo -e "${BLUE}🔍 Verifying uploads...${NC}"
@@ -107,6 +121,13 @@ REQUIRED_SCRIPTS=(
     "ensemble/ensemble_creator.py"
     "ensemble/inference.py"
     "ensemble/requirements.txt"
+    "drift/compute_drift.py"
+    "bias/compute_bias.py"
+    "bias/run_bias_check.sh"
+    "bias/requirements.txt"
+    "fairness/compute_fairness.py"
+    "fairness/run_fairness.sh"
+    "fairness/requirements.txt"
 )
 
 MISSING_SCRIPTS=()

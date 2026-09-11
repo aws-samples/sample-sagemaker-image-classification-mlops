@@ -18,7 +18,7 @@ infrastructure.
 
 > [!WARNING]
 > This solution deploys real, billable AWS resources (a SageMaker real-time
-> endpoint, GPU/CPU training jobs, Model Monitor schedules, CloudTrail, and
+> endpoint, GPU/CPU training jobs, scheduled Processing jobs, CloudTrail, and
 > more). Running it incurs cost for as long as it is deployed. It is a reference
 > implementation / demo, not a cleared clinical product - the `/predict` API is
 > intentionally public and unauthenticated. See [Cost](#cost) and
@@ -64,16 +64,27 @@ and retrained.
 
 ![Monitoring and retraining architecture](docs/images/architecture-part3-monitoring-retraining.png)
 
-The endpoint captures data; Model Monitor analyzes it; a CloudWatch drift alarm
-triggers EventBridge, which restarts the training pipeline. Human approval is
-still required before a retrained model redeploys.
+The endpoint captures data; a scheduled SageMaker Processing job computes a
+Population Stability Index from it; a CloudWatch drift alarm triggers
+EventBridge, which restarts the training pipeline. Human approval is still
+required before a retrained model redeploys.
 
 ### Part 4 - Responsible AI (bias and explainability)
 
 ![Responsible AI architecture](docs/images/architecture-part4-responsible-ai.png)
 
-SageMaker Clarify runs pre- and post-training bias analysis and produces a bias
-report that is attached to the registered model.
+A bias Processing step computes fairness metrics with Fairlearn, and a condition
+step gates registration on them - so a model registers only when it clears both
+the accuracy and the fairness thresholds. A failing check writes a bias report to
+S3 instead.
+
+Fairness is then re-measured on live traffic. A second scheduled Processing job
+joins endpoint data capture with the confirmed diagnostic outcomes clinicians
+upload, recomputes demographic parity and equalized odds per subgroup, and
+publishes the largest disparity to CloudWatch beside the drift metric - held to
+the same threshold the model registered under, and wired into the same
+retrain rule. The in-pipeline gate proves a model was fair on the test split; it
+cannot see a population shift after deployment.
 
 ### End-to-end flow
 
@@ -102,8 +113,8 @@ deploys `stack-training` and `stack-inference`.
 3. **Train three architectures.** VGG16, DenseNet121, and EfficientNetV2M train
    in parallel using two-phase transfer learning (freeze the backbone and train
    the head, then unfreeze the top layers at a 100x-lower learning rate), with
-   early stopping, ReduceLROnPlateau, SageMaker Debugger rules (Overfit,
-   LossNotDecreasing), and SageMaker Experiments tracking.
+   early stopping, ReduceLROnPlateau, and SageMaker Experiments plus MLflow
+   tracking.
 4. **Evaluate and ensemble.** A weighted-average ensemble is built and scored;
    bias and explainability reports are written and attached to the model.
 5. **Clinical quality gate.** The pipeline registers the model only if it clears
@@ -115,7 +126,9 @@ deploys `stack-training` and `stack-inference`.
 7. **Serve.** API Gateway -> Lambda -> SageMaker endpoint returns a prediction,
    confidence, a per-request id, and (optionally) Bedrock reasoning plus an
    explainability pointer.
-8. **Monitor and retrain.** Model Monitor runs hourly; a CloudWatch drift alarm
+8. **Monitor and retrain.** Two scheduled Processing jobs watch the live
+   endpoint: one computes prediction drift (PSI) hourly, the other recomputes
+   subgroup fairness daily against clinician-confirmed outcomes. Either alarm
    triggers EventBridge, which restarts the training pipeline with
    `RetrainingReason=drift_detected`. Human approval is still required before the
    retrained model redeploys.
@@ -124,10 +137,10 @@ deploys `stack-training` and `stack-inference`.
 
 | Area | Services |
 | --- | --- |
-| Training and ML | SageMaker Pipelines, Training Jobs, Processing Jobs, Model Registry, Model Cards, Experiments, Debugger, Clarify, Model Monitor, MLflow tracking server |
+| Training and ML | SageMaker Pipelines, Training Jobs, Processing Jobs, Model Registry, Model Cards, Experiments, MLflow tracking server |
 | Inference | SageMaker real-time Endpoint (KMS-encrypted volume, data capture, blue/green + auto-rollback), Lambda, API Gateway, CloudFront + S3 (static UI) |
-| Responsible AI | SageMaker Clarify (bias/explainability reports), Amazon Bedrock (Nova hybrid reasoning) + Bedrock Guardrails, Amazon A2I (human review) |
-| Events and orchestration | EventBridge (data-upload trigger, model-approval auto-deploy, drift-to-retrain), Lambda |
+| Responsible AI | Fairlearn bias metrics in a Processing step (in-pipeline gate) and a scheduled fairness monitor on live traffic, Grad-CAM / SHAP explainability, Amazon Bedrock (Nova hybrid reasoning) + Bedrock Guardrails |
+| Events and orchestration | EventBridge (data-upload trigger, model-approval auto-deploy, drift-to-retrain), EventBridge Scheduler (drift and fairness Processing jobs), Lambda |
 | CI/CD | CodePipeline, CodeBuild (training deploy, baseline model, script upload, inference deploy, monthly image patching), CodeStar connection |
 | Storage and data | S3 (raw, processed, scripts, model artifacts, inference results, monitoring, SBOM, CloudTrail, state), ECR (patched inference image) |
 | Security and governance | KMS (CMK on all data at rest), IAM (least-privilege, PassRole-scoped), CloudTrail (log-file validation), AWS Budgets |
@@ -139,7 +152,7 @@ deploys `stack-training` and `stack-inference`.
 stack-backend-setup/   # S3 state bucket + KMS key (bootstrap, local state)
 stack-cicd/            # CodePipeline + CodeBuild (the control plane)
 stack-training/        # SageMaker pipeline, registry, Model Card, MLflow, CloudTrail, budgets
-stack-inference/       # Endpoint, Lambda, API Gateway, CloudFront, Model Monitor, drift loop, A2I, Bedrock guardrail
+stack-inference/       # Endpoint, Lambda, API Gateway, CloudFront, drift + fairness loop, Bedrock guardrail
 modules/               # Reusable Terraform modules (terraform-aws-*)
 scripts/               # Production ML scripts the SageMaker pipeline runs
 ops-scripts/           # Local operational helpers (cleanup, monitoring checks)
@@ -245,7 +258,8 @@ Approximate, on-demand, `us-east-1` (verify with the AWS Pricing Calculator):
 | Resource | Driver | Rough cost |
 | --- | --- | --- |
 | SageMaker real-time endpoint (`ml.m5.xlarge`) | runs 24/7 until deleted | ~$0.23/hr (~$165/mo) |
-| Model Monitor + Clarify schedules | hourly/daily processing jobs | a few $/day |
+| Scheduled drift job | hourly processing job | a few $/day |
+| Scheduled fairness job | daily processing job | a few cents/mo |
 | Training pipeline run (3 models) | per run; GPU `ml.p3` if quota allows, else CPU `ml.c5` | ~$1 (CPU dummy) to ~$30-60 (full GPU) |
 | S3, KMS, CloudWatch, CloudTrail, Lambda, API GW | storage + low traffic | a few $/mo |
 
@@ -254,9 +268,8 @@ in use. `stack-training` provisions an AWS Budget with alert thresholds.
 
 ## Cleanup
 
-To avoid ongoing charges, destroy in reverse dependency order. SageMaker Model
-Monitor schedules must be removed before the endpoint, and buckets emptied
-before they can be deleted.
+To avoid ongoing charges, destroy in reverse dependency order. Buckets must be
+emptied before they can be deleted.
 
 ```bash
 # 1. Remove non-Terraform-managed data + resources (empties buckets, deletes
@@ -270,8 +283,9 @@ cd ../stack-cicd && terraform destroy
 cd ../stack-backend-setup && terraform destroy   # last - holds remote state
 ```
 
-If `terraform destroy` on the endpoint reports attached MonitoringSchedules,
-re-run `cleanup_all.sh` (or delete the schedules) and retry.
+The drift and fairness schedules are Terraform-managed, so `terraform destroy`
+removes them with the rest of `stack-inference`. If a bucket refuses to delete
+because it is not empty, re-run `cleanup_all.sh` and retry.
 
 ## Security
 
@@ -310,12 +324,12 @@ done
 
 - **Bias and explainability reports** are produced inside the pipeline and
   attached to each registered model version.
-- A **SageMaker Clarify** monitoring schedule and a **Model Card** document
+- A **Model Card** documents
   intended use, risk rating, and clinical caveats.
 - **Hybrid inference**: low-confidence predictions route to an Amazon Bedrock
   foundation model for natural-language reasoning, constrained by a **Bedrock
   Guardrail** (PII anonymization + content filters).
-- **Amazon A2I** routes low-confidence cases to a human review queue (opt-in;
+- **Human review** routes low-confidence cases to a clinician queue (opt-in;
   needs a private workforce).
 
 > Note on data: this project uses public medical images with no demographic

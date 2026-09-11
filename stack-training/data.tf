@@ -59,6 +59,7 @@ locals {
     preprocessing_requirements = "${local.container_paths.code}/requirements.txt"
     evaluation_script          = "${local.container_paths.code}/${var.pipeline_steps.evaluation.script_name}"
     ensemble_script            = "${local.container_paths.code}/${var.pipeline_steps.ensemble.script_name}"
+    bias_runner                = "${local.container_paths.code}/run_bias_check.sh"
     registry_script            = "${local.container_paths.code}/${var.pipeline_steps.registry.script_name}"
 
   }

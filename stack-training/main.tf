@@ -195,7 +195,6 @@ module "sagemaker_execution_role" {
             "ecr:BatchCheckLayerAvailability"
           ]
           Resource = [
-            var.sagemaker_model_monitor_image_arn,
             "arn:aws:ecr:*:*:repository/sagemaker-*"
           ]
         },
@@ -364,7 +363,7 @@ resource "aws_sagemaker_model_card" "medical_image" {
       explanations_for_risk_rating       = "Predictions influence clinical decisions; a missed malignant case (false negative) is high-consequence, hence the recall-weighted clinical quality gate."
     }
     additional_information = {
-      ethical_considerations      = "Fairness monitored via Clarify/subgroup bias reports; low-confidence cases route to human review (A2I)."
+      ethical_considerations      = "Fairness monitored via Fairlearn subgroup bias reports; low-confidence cases route to human review."
       caveats_and_recommendations = "Validate thresholds with your clinical team. Do not deploy without review-board approval (models register as PendingManualApproval)."
     }
   })
@@ -907,7 +906,82 @@ resource "aws_sagemaker_pipeline" "medical_image_pipeline" {
           }
           DependsOn = [var.pipeline_steps.evaluation.step_name]
         },
-        # Step 9 : Clinical quality gate. Register only if the ensemble clears
+        # Step 9 : Fairness check (Part 4). Runs Fairlearn over the evaluation
+        # output and writes bias_metrics.json. The clinical quality gate below
+        # reads max_disparity from this file, so accuracy and fairness must BOTH
+        # pass before the model registers.
+        {
+          Name = var.pipeline_steps.bias.step_name
+          Type = var.pipeline_steps.bias.step_type
+          Arguments = {
+            ProcessingResources = {
+              ClusterConfig = {
+                InstanceType   = var.pipeline_steps.bias.instance_type
+                InstanceCount  = var.pipeline_steps.bias.instance_count
+                VolumeSizeInGB = var.pipeline_steps.bias.volume_size
+              }
+            }
+            AppSpecification = {
+              ImageUri = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_cpu.registry_path
+              # Fairlearn is not in the DLC and a raw ProcessingJob entrypoint
+              # does not auto-install requirements.txt the way ScriptProcessor
+              # does, so a wrapper installs it before running the gate (same
+              # pattern as run_preprocessing.sh).
+              ContainerEntrypoint = ["/bin/sh", local.script_paths.bias_runner]
+              ContainerArguments = [
+                "--evaluation-path", local.processing_paths.input_eval,
+                "--output-path", local.processing_paths.output,
+                "--sensitive-feature", var.fairness_gate.sensitive_feature,
+                "--threshold", tostring(var.fairness_gate.max_disparity)
+              ]
+            }
+            ProcessingInputs = [
+              {
+                InputName = "code"
+                S3Input = {
+                  S3Uri       = "s3://${module.s3_scripts.bucket_id}/bias/"
+                  LocalPath   = "/opt/ml/processing/input/code"
+                  S3DataType  = var.data_config.s3_data_type
+                  S3InputMode = var.data_config.s3_input_mode
+                }
+              },
+              {
+                InputName = "evaluation-results"
+                S3Input = {
+                  S3Uri = {
+                    Get = "Steps.${var.pipeline_steps.evaluation.step_name}.ProcessingOutputConfig.Outputs['evaluation-results'].S3Output.S3Uri"
+                  }
+                  LocalPath   = "/opt/ml/processing/input/evaluation"
+                  S3DataType  = var.data_config.s3_data_type
+                  S3InputMode = var.data_config.s3_input_mode
+                }
+              }
+            ]
+            ProcessingOutputConfig = {
+              Outputs = [
+                {
+                  OutputName = "bias-metrics"
+                  S3Output = {
+                    S3Uri        = "s3://${module.s3_model_artifacts.bucket_id}/bias/"
+                    LocalPath    = "/opt/ml/processing/output"
+                    S3UploadMode = var.data_config.s3_upload_mode
+                  }
+                }
+              ]
+            }
+            RoleArn = module.sagemaker_execution_role.role_arn
+            Environment = {
+              PROJECT_NAME       = var.project_name
+              AWS_DEFAULT_REGION = var.aws_region
+            }
+          }
+          CacheConfig = {
+            Enabled     = var.pipeline_steps.bias.enable_cache
+            ExpireAfter = var.pipeline_steps.bias.cache_expiry
+          }
+          DependsOn = [var.pipeline_steps.ensemble.step_name]
+        },
+        # Step 10 : Clinical quality gate. Register only if the ensemble clears
         # ALL of accuracy / recall / precision / AUC. Recall is the highest bar
         # (0.95) because a missed malignant case is the costly error. The
         # condition reads each metric from ensemble_results.json, the same file
@@ -985,6 +1059,27 @@ resource "aws_sagemaker_pipeline" "medical_image_pipeline" {
                   }
                 }
                 RightValue = var.clinical_quality_gate.auc_roc
+              },
+              # Fairness gate (Part 4). max_disparity is the larger of
+              # demographic-parity and equal-opportunity difference, computed by
+              # scripts/bias/compute_bias.py. Conditions are ANDed, so a model
+              # registers only when accuracy AND fairness both clear their bars.
+              {
+                Type = "LessThanOrEqualTo"
+                LeftValue = {
+                  "Std:JsonGet" = {
+                    Path = "max_disparity"
+                    S3Uri = {
+                      "Std:Join" = {
+                        On = "",
+                        Values = [
+                          "s3://${module.s3_model_artifacts.bucket_id}/bias/bias_metrics.json"
+                        ]
+                      }
+                    }
+                  }
+                }
+                RightValue = var.fairness_gate.max_disparity
               }
             ]
             IfSteps = [{

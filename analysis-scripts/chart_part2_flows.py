@@ -55,6 +55,50 @@ def stage_box(ax, center, label, fill=BLUE, width=1.9, height=1.1, fontsize=11):
     )
 
 
+CARD_FILL = "#f2f2f2"  # light grey card interior
+
+
+def card_box(ax, center, heading, detail, colour, width=2.7, height=2.0):
+    """Outlined card: light fill, coloured border, coloured heading, dark detail."""
+    x, y = center
+    patch = FancyBboxPatch(
+        (x - width / 2, y - height / 2),
+        width,
+        height,
+        boxstyle="round,pad=0.02,rounding_size=0.12",
+        linewidth=2.0,
+        edgecolor=colour,
+        facecolor=CARD_FILL,
+        zorder=2,
+    )
+    ax.add_patch(patch)
+    # With no detail text the heading centres in the card; otherwise it sits above.
+    ax.text(
+        x,
+        y + (height * 0.22 if detail else 0),
+        heading,
+        ha="center",
+        va="center",
+        color=colour,
+        fontsize=13,
+        fontweight="bold",
+        linespacing=1.35,
+        zorder=3,
+    )
+    if detail:
+        ax.text(
+            x,
+            y - height * 0.2,
+            detail,
+            ha="center",
+            va="center",
+            color=TEXT,
+            fontsize=11,
+            linespacing=1.5,
+            zorder=3,
+        )
+
+
 def number_circle(ax, center, n, fill=ORANGE, radius=0.16):
     """Small numbered circle (step index) above a box."""
     x, y = center
@@ -232,90 +276,59 @@ def figure_1_optimization_decision_flow():
 
 
 def figure_2_two_phase_training():
-    fig, ax = plt.subplots(figsize=(18, 5.5))
-    ax.set_xlim(0, 18)
-    ax.set_ylim(0, 5.5)
+    """Outlined-card style: light fill, coloured border, heading + detail inside."""
+    fig, ax = plt.subplots(figsize=(17, 2.9))
+    ax.set_xlim(0, 17)
+    ax.set_ylim(0.85, 3.5)
     ax.axis("off")
 
-    y = 2.9
+    y = 2.5
+    box_h = 1.25
 
-    PHASE1_GREEN = "#2ecc40"
-    PHASE2_RED = "#e74c3c"
-    DARK = "#3a3a3a"
+    PHASE1_GREEN = "#2e8b3d"
+    PHASE2_RED = "#d0342c"
+    DARK = "#333f48"
 
-    # 5 boxes across
-    xs = [1.8, 5.2, 8.8, 12.4, 15.9]
-    widths = [1.9, 2.1, 2.3, 1.9, 1.9]
+    xs = [1.75, 5.05, 8.5, 11.95, 15.25]
+    widths = [2.7, 2.9, 3.0, 2.7, 2.7]
 
-    stage_box(ax, (xs[0], y), "Pre-trained\nBackbone", BLUE, width=widths[0])
-    stage_box(ax, (xs[1], y), "Phase 1\nFrozen Backbone", PHASE1_GREEN, width=widths[1])
-    stage_box(ax, (xs[2], y), "Phase 2\nUnfreeze Top Layers", PHASE2_RED, width=widths[2])
-    stage_box(ax, (xs[3], y), "Trained\nModel", DARK, width=widths[3])
-    stage_box(ax, (xs[4], y), "Model\nRegistry", ORANGE, width=widths[4])
-
-    for i, x in enumerate(xs, start=1):
-        number_circle(ax, (x, y + 0.85), i)
-
-    # Sub-labels inside / under each box
-    labels_under = [
-        (xs[0], y - 0.85, "ImageNet weights\n(edges, textures, shapes)"),
-        (xs[1], y - 0.85, "Train classification head\nLR = 0.001\nBackbone locked"),
-        (xs[2], y - 0.85, "Fine-tune backbone\nLR = 0.00001 (100× lower)\nTop 30 layers unfreeze"),
-        (xs[3], y - 0.85, "Both phases complete\nSingle training job\nFull history in CloudWatch"),
-        (xs[4], y - 0.85, "PendingManualApproval\nClinical review"),
+    cards = [
+        ("Pre-trained\nBackbone", BLUE),
+        ("Phase 1\nFrozen Backbone", PHASE1_GREEN),
+        ("Phase 2\nUnfreeze Top Layers", PHASE2_RED),
+        ("Trained\nModel", DARK),
+        ("Model\nRegistry", ORANGE),
     ]
-    for x, ly, text in labels_under:
-        ax.text(x, ly, text, ha="center", va="center", fontsize=9, color=TEXT)
 
-    # Arrows between boxes
+    for i, (x, w, (heading, colour)) in enumerate(zip(xs, widths, cards), start=1):
+        card_box(ax, (x, y), heading, None, colour, width=w, height=box_h)
+        number_circle(ax, (x - w / 2 + 0.3, y + box_h / 2 - 0.26), i, radius=0.2)
+
+    # Arrows between cards
     for i in range(len(xs) - 1):
         sx = xs[i] + widths[i] / 2
         ex = xs[i + 1] - widths[i + 1] / 2
-        arrow(ax, (sx, y), (ex, y))
+        arrow(ax, (sx, y), (ex, y), lw=2.0)
 
-    # Orange bracket under Phase 1 + Phase 2 with annotation
-    bracket_y = 1.3
+    # Bracket spanning Phase 1 + Phase 2
+    bracket_y = 1.45
     bracket_left = xs[1] - widths[1] / 2
     bracket_right = xs[2] + widths[2] / 2
     ax.plot(
         [bracket_left, bracket_left, bracket_right, bracket_right],
-        [y - 1.4, bracket_y, bracket_y, y - 1.4],
+        [y - box_h / 2, bracket_y, bracket_y, y - box_h / 2],
         color=ORANGE,
-        lw=1.8,
+        lw=2.0,
     )
     ax.text(
         (bracket_left + bracket_right) / 2,
-        bracket_y - 0.25,
-        "Single SageMaker Training Job - no intermediate session reloads",
+        bracket_y - 0.2,
+        "Single SageMaker Training Job - model never leaves memory",
         ha="center",
         va="top",
-        fontsize=9,
-        color=ORANGE,
-        fontweight="bold",
-    )
-
-    # Bottom caption
-    ax.text(
-        9.0,
-        0.4,
-        "Phase 1 weights flow directly into Phase 2 - no saving to disk, no reloading, no risk of mismatch",
-        ha="center",
-        va="center",
-        fontsize=10,
-        color=ANNOT,
-        style="italic",
-    )
-
-    # Title
-    ax.text(
-        9.0,
-        5.15,
-        "Two-phase training within a single SageMaker Training Job",
-        ha="center",
-        va="center",
-        fontsize=14,
-        fontweight="bold",
+        fontsize=12,
         color=TEXT,
+        fontweight="bold",
     )
 
     return fig
@@ -338,92 +351,66 @@ def figure_2_two_phase_training():
 
 
 def figure_9_hpo_to_registry():
-    fig, ax = plt.subplots(figsize=(18, 5))
-    ax.set_xlim(0, 18)
-    ax.set_ylim(0, 5)
+    """Outlined-card style, headings only: AMT -> Evaluation -> Gate -> Card -> Registry."""
+    fig, ax = plt.subplots(figsize=(17, 3.1))
+    ax.set_xlim(0, 17)
+    ax.set_ylim(0.55, 3.5)
     ax.axis("off")
 
-    y = 2.7
+    y = 2.5
+    box_h = 1.25
 
-    # Five main stages
-    xs = [1.6, 5.0, 8.4, 11.8, 15.2]
-    widths = [1.9, 1.9, 1.9, 1.9, 1.9]
-    colors = [BLUE, BLUE, BLUE, ORANGE, ORANGE]
-    labels = [
-        "SageMaker\nAMT",
-        "Best Trial",
-        "Evaluation",
-        "Quality Gate",
-        "Model\nRegistry",
-    ]
-    sublabels = [
-        "20+ trials\nBayesian search",
-        "Winning hyperparameter\nconfiguration",
-        "Clinical thresholds\nRecall ≥ 0.95",
-        "Pass / Fail check",
-        "PendingManualApproval",
+    GATE_ORANGE = "#f5a623"
+    CARD_GREEN = "#2e8b3d"
+    DARK = "#333f48"
+
+    xs = [1.75, 5.05, 8.4, 11.75, 15.1]
+    widths = [2.7, 2.7, 2.7, 2.7, 2.7]
+    cards = [
+        ("AMT\nBest Trial", BLUE),
+        ("Evaluation\nStep", DARK),
+        ("Quality\nGate", GATE_ORANGE),
+        ("Model\nCard", CARD_GREEN),
+        ("Model\nRegistry", DARK),
     ]
 
-    for i, (x, w, c, lab, sub) in enumerate(zip(xs, widths, colors, labels, sublabels), start=1):
-        stage_box(ax, (x, y), lab, c, width=w)
-        number_circle(ax, (x, y + 0.85), i)
-        ax.text(x, y - 0.85, sub, ha="center", va="center", fontsize=9, color=TEXT)
+    for i, (x, w, (heading, colour)) in enumerate(zip(xs, widths, cards), start=1):
+        card_box(ax, (x, y), heading, None, colour, width=w, height=box_h)
+        number_circle(ax, (x - w / 2 + 0.3, y + box_h / 2 - 0.26), i, radius=0.2)
 
-    # Arrows between stages
+    # Arrows between cards; the gate -> card hop carries the "Pass" label
     for i in range(len(xs) - 1):
         sx = xs[i] + widths[i] / 2
         ex = xs[i + 1] - widths[i + 1] / 2
-        arrow(ax, (sx, y), (ex, y))
+        arrow(
+            ax,
+            (sx, y),
+            (ex, y),
+            lw=2.0,
+            label="Pass" if i == 2 else None,
+            label_color=CARD_GREEN,
+            label_fontsize=11,
+            label_offset=(0, 0.24),
+        )
 
-    # Model Card attachment below Quality Gate
-    card_x, card_y = xs[3], 0.7
-    stage_box(ax, (card_x, card_y), "Model Card", "#7f7f7f", width=1.9, height=0.7, fontsize=10)
-    ax.text(
-        card_x,
-        card_y - 0.4,
-        "Clinical context",
-        ha="center",
-        va="center",
-        fontsize=8.5,
-        color=ANNOT,
-        style="italic",
+    # Fail branch drops out of the Quality Gate
+    gate_x = xs[2]
+    arrow(
+        ax,
+        (gate_x, y - box_h / 2),
+        (gate_x, 0.95),
+        color=RED,
+        lw=2.0,
     )
-    # Dashed arrow upward
-    attach_arrow = FancyArrowPatch(
-        (card_x, card_y + 0.35),
-        (card_x, y - 0.55),
-        arrowstyle="-|>",
-        mutation_scale=12,
-        linewidth=1.5,
-        linestyle="--",
-        color=ANNOT,
-        zorder=1,
-    )
-    ax.add_patch(attach_arrow)
-
-    # Title
     ax.text(
-        9.0,
-        4.6,
-        "HPO → Model Registry: Closing the loop",
-        ha="center",
+        gate_x + 0.18,
+        1.05,
+        "Fail: detailed report",
+        ha="left",
         va="center",
-        fontsize=14,
+        fontsize=11,
+        color=RED,
         fontweight="bold",
-        color=TEXT,
-    )
-
-    # Bottom annotation
-    ax.text(
-        9.0,
-        0.1,
-        "Each registered model carries its HPO trial ID, evaluation metrics, "
-        "Model Card reference, and Experiment lineage.",
-        ha="center",
-        va="center",
-        fontsize=10,
-        color=ANNOT,
-        style="italic",
     )
 
     return fig

@@ -62,6 +62,20 @@ pipeline_steps = {
     cache_expiry   = "P7D"
   }
 
+  # Part 4 fairness gate. Runs Fairlearn on the evaluation output and writes
+  # bias_metrics.json, which the clinical quality gate reads alongside the
+  # accuracy metrics.
+  bias = {
+    instance_type  = "ml.m5.large"
+    instance_count = 1
+    volume_size    = 30
+    script_name    = "compute_bias.py"
+    step_name      = "BiasCheck"
+    step_type      = "Processing"
+    enable_cache   = false
+    cache_expiry   = "P7D"
+  }
+
   registry = {
     instance_type  = "" # Not Required for Registry
     instance_count = 1  # Not Required for Registry

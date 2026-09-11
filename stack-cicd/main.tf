@@ -471,15 +471,6 @@ module "codebuild_role" {
             "sagemaker:CreateModelPackage",
             "sagemaker:UpdateModelPackage",
             "sagemaker:DescribeModelPackage",
-            "sagemaker:CreateMonitoringSchedule",
-            "sagemaker:UpdateMonitoringSchedule",
-            "sagemaker:DeleteMonitoringSchedule",
-            "sagemaker:DescribeMonitoringSchedule",
-            "sagemaker:StartMonitoringSchedule",
-            "sagemaker:StopMonitoringSchedule",
-            "sagemaker:CreateDataQualityJobDefinition",
-            "sagemaker:DeleteDataQualityJobDefinition",
-            "sagemaker:DescribeDataQualityJobDefinition",
             "sagemaker:CreateMlflowTrackingServer",
             "sagemaker:UpdateMlflowTrackingServer",
             "sagemaker:DeleteMlflowTrackingServer",
@@ -495,8 +486,6 @@ module "codebuild_role" {
             "arn:aws:sagemaker:*:*:endpoint-config/${var.project_name}-*",
             "arn:aws:sagemaker:*:*:model-package-group/${var.project_name}-*",
             "arn:aws:sagemaker:*:*:model-package/${var.project_name}-*/*",
-            "arn:aws:sagemaker:*:*:monitoring-schedule/${var.project_name}-*",
-            "arn:aws:sagemaker:*:*:data-quality-job-definition/${var.project_name}-*",
             "arn:aws:sagemaker:*:*:mlflow-tracking-server/${var.project_name}-*",
           ]
         },
@@ -510,9 +499,32 @@ module "codebuild_role" {
             "sagemaker:ListEndpointConfigs",
             "sagemaker:ListModelPackageGroups",
             "sagemaker:ListModelPackages",
-            "sagemaker:ListMonitoringSchedules",
             "sagemaker:ListMlflowTrackingServers",
           ]
+          Resource = "*"
+        },
+        {
+          # EventBridge Scheduler schedules for the drift and fairness
+          # Processing jobs (stack-inference/monitoring.tf). These four actions
+          # all take the `schedule` resource type, whose ARN embeds the schedule
+          # group; the schedules live in the account's default group. The
+          # iam:PassRole that CreateSchedule/UpdateSchedule also require is
+          # granted below, gated on iam:PassedToService.
+          Effect = "Allow"
+          Action = [
+            "scheduler:CreateSchedule",
+            "scheduler:UpdateSchedule",
+            "scheduler:DeleteSchedule",
+            "scheduler:GetSchedule",
+          ]
+          Resource = [
+            "arn:aws:scheduler:*:*:schedule/default/${var.project_name}-*",
+          ]
+        },
+        {
+          # ListSchedules does not support ARN-level IAM and is read-only.
+          Effect   = "Allow"
+          Action   = ["scheduler:ListSchedules"]
           Resource = "*"
         },
       ]
@@ -583,6 +595,10 @@ module "codebuild_role" {
                 "codepipeline.amazonaws.com",
                 "cloudfront.amazonaws.com",
                 "sns.amazonaws.com",
+                # CreateSchedule / UpdateSchedule require PassRole for the role
+                # the schedule's target assumes (the drift and fairness
+                # Processing job schedulers).
+                "scheduler.amazonaws.com",
               ]
             }
           }

@@ -33,24 +33,11 @@ target_concurrent_requests_per_model = 5 # concurrent in-flight requests per mod
 # demo this drops the endpoint bill from ~$170/month to ~$5-10/month.
 # Tradeoffs:
 #   - 1-5 second cold start after idle periods
-#   - Model Monitor (data capture) is disabled automatically
-#   - Clarify bias monitoring is disabled automatically
 #   - Weekly endpoint refresh (OS patching) is skipped
 # See modules/sagemaker-endpoint/README.md for the full tradeoff list.
 use_serverless_inference   = false
 serverless_memory_size_mb  = 3072 # 1024 / 2048 / 3072 / 4096 / 5120 / 6144
 serverless_max_concurrency = 10   # max concurrent requests (1-200)
-
-# Model Monitor
-enable_model_monitor = true
-model_monitor_config = {
-  setup_on_deploy        = true
-  data_quality_schedule  = "cron(0 * * * ? *)"   # Hourly
-  model_quality_schedule = "cron(0 */6 * * ? *)" # Every 6 hours
-  instance_type          = "ml.m5.xlarge"
-  volume_size            = 30
-  max_runtime            = 3600
-}
 
 # End-to-end exercise of opt-in responsible-AI features (Part 3/4).
 enable_bedrock_hybrid_inference = true

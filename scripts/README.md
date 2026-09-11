@@ -2,7 +2,8 @@
 
 Production ML pipeline scripts and CI/CD-consumed utilities. Everything here is either:
 
-- **Run inside a SageMaker step** (validation, preprocessing, training, evaluation, ensemble, inference), OR
+- **Run inside a SageMaker step** (validation, preprocessing, training, evaluation, ensemble, bias, inference), OR
+- **Run as a scheduled SageMaker Processing job** started by EventBridge Scheduler (`drift/`, `fairness/`), OR
 - **Invoked by the CodeBuild buildspecs** (`script_uploader.sh`, `download_pretrained_weights.py`), OR
 - **A human-facing production entry point** (`data_uploader.sh`)
 
@@ -28,6 +29,16 @@ scripts/
 │   └── inference.py
 ├── validation/             # Data integrity and format checks
 │   └── data_validator.py
+├── bias/                   # In-pipeline fairness gate (Fairlearn) - blocks registration
+│   ├── compute_bias.py
+│   ├── run_bias_check.sh   # Installs fairlearn, then runs the gate
+│   └── requirements.txt
+├── drift/                  # Scheduled drift job - PSI on live predictions
+│   └── compute_drift.py
+├── fairness/               # Scheduled fairness job - subgroup metrics on live traffic
+│   ├── compute_fairness.py
+│   ├── run_fairness.sh     # Installs fairlearn, then runs the monitor
+│   └── requirements.txt
 ├── utils/                  # CloudWatch metrics helper
 │   └── cloudwatch_metrics.py
 ├── data_uploader.sh        # Upload local dataset to the raw-data S3 bucket

@@ -22,8 +22,9 @@ class ModelReportGenerator:
         This includes the bias and explainability reports. The training
         pipeline's RegisterModel step points at evaluation/bias_report.json,
         evaluation/data_bias_report.json, and evaluation/explainability_report.json,
-        and this generator is the only thing that writes them - there is no
-        separate ClarifyCheck processing step in the pipeline.
+        and this generator writes them at evaluation time. The pipeline's
+        separate BiasCheck processing step (scripts/bias/compute_bias.py)
+        produces bias_metrics.json for the fairness gate.
         """
         reports = {}
 
@@ -176,7 +177,7 @@ class ModelReportGenerator:
     def generate_bias_reports(self, predictions_data, true_labels, subgroup_labels=None):
         """Write the pre-training and post-training bias reports.
 
-        Produces two files in the SageMaker Clarify analysis.json-compatible
+        Produces two files in an analysis.json-compatible
         shape: data_bias_report.json (pre-training) and bias_report.json
         (post-training). All metrics are computed from the labels and
         predictions actually available - nothing is fabricated.
@@ -420,9 +421,9 @@ class ModelReportGenerator:
         return float(np.mean(predictions[positives] == 1))
 
     def generate_explainability_report(self, feature_importances=None):
-        """Write the explainability report in a Clarify-compatible shape.
+        """Write the explainability report in a kernel_shap-style shape.
 
-        SageMaker Clarify writes a kernel_shap explanations section, so this
+        The report carries a kernel_shap explanations section, so this
         mirrors that structure. When real feature importances are supplied they
         are used directly. Otherwise this falls back to a coarse, honest channel
         -level summary: the three input channels (R, G, B) of the 224x224x3

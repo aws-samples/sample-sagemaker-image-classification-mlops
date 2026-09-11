@@ -16,11 +16,6 @@ variable "aws_region" {
   type        = string
 }
 
-variable "sagemaker_model_monitor_image_arn" {
-  description = "ECR repository ARN of the AWS-managed SageMaker Model Monitor analyzer image. Varies per region - see https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor-pre-built-container.html"
-  type        = string
-  default     = "arn:aws:ecr:us-east-1:156813124566:repository/sagemaker-model-monitor-analyzer"
-}
 
 ################################################################################
 # Pipeline Steps
@@ -273,6 +268,18 @@ variable "clinical_quality_gate" {
   }
 }
 
+variable "fairness_gate" {
+  description = "Fairness gate the ensemble must clear before registration (Part 4). max_disparity bounds the larger of demographic-parity difference and equal-opportunity difference, computed by scripts/bias/compute_bias.py with Fairlearn. Must mirror DEFAULT_THRESHOLD in that script. sensitive_feature is reported in the bias report; the public datasets used here carry no demographic metadata, so magnification is an honest subgroup proxy - supply a real attribute for clinical use."
+  type = object({
+    max_disparity     = number
+    sensitive_feature = string
+  })
+  default = {
+    max_disparity     = 0.10
+    sensitive_feature = "magnification"
+  }
+}
+
 variable "preprocessing_target_size" {
   description = "Target square resolution (pixels) the preprocessing job resizes every image to before training. 512 preserves fine diagnostic features like microcalcifications; the trainers downsample to their own input_size from there."
   type        = number
@@ -398,9 +405,9 @@ variable "model_card_risk_rating" {
 }
 
 variable "enable_debugger" {
-  description = "Attach SageMaker Debugger built-in rules (Overfit, LossNotDecreasing) to the training steps (Part 2)."
+  description = "Attach SageMaker Debugger built-in rules (Overfit, LossNotDecreasing) to the training steps (Part 2). Off by default; managed MLflow plus CloudWatch covers the same need."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "debugger_rule_image" {

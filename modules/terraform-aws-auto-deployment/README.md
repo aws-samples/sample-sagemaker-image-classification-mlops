@@ -71,7 +71,7 @@ If `patched_image_uri` is non-empty, the Lambda swaps the public DLC image for t
 | monitoring\_bucket | Name of the monitoring S3 bucket for data capture | `string` | n/a | yes |
 | project\_name | Name of the project | `string` | n/a | yes |
 | sagemaker\_role\_arn | ARN of the SageMaker execution role | `string` | n/a | yes |
-| data\_capture\_sampling\_percentage | Percentage of endpoint invocations captured for Model Monitor | `number` | `100` | no |
+| data\_capture\_sampling\_percentage | Percentage of endpoint invocations captured for drift detection | `number` | `100` | no |
 | endpoint\_instance\_type | EC2 instance type for the endpoint production variant | `string` | `"ml.m5.xlarge"` | no |
 | env\_kms\_key\_arn | KMS CMK ARN used to encrypt Lambda environment variables. Null = AWS-managed key (still encrypted). | `string` | `null` | no |
 | log\_kms\_key\_arn | KMS key ARN used to encrypt the CloudWatch log group. Null = no customer-managed encryption (logs still encrypted at rest with AWS-managed key). | `string` | `null` | no |

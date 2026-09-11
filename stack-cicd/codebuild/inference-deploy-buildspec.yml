@@ -44,7 +44,11 @@ phases:
       # uv pip is a drop-in for pip install - same flags, same resolver
       # behavior, just faster. Installing Pillow+numpy typically drops from
       # ~60s (pip) to <5s (uv) thanks to parallel downloads and a global cache.
-      - "uv pip install --target $BUILD_DIR/python/lib/python${PYTHON_VERSION}/site-packages --python-platform x86_64-manylinux2014 --python-version ${PYTHON_VERSION} --only-binary=:all: --upgrade Pillow==${PILLOW_VERSION} numpy==${NUMPY_VERSION}"
+      # manylinux_2_28, not manylinux2014: Pillow stopped publishing
+      # manylinux2014 cp313 wheels, so --only-binary has nothing to resolve
+      # against on the older tag. Lambda's python3.13 runtime is Amazon Linux
+      # 2023 (glibc 2.34), so glibc 2.28 wheels are compatible.
+      - "uv pip install --target $BUILD_DIR/python/lib/python${PYTHON_VERSION}/site-packages --python-platform x86_64-manylinux_2_28 --python-version ${PYTHON_VERSION} --only-binary=:all: --upgrade Pillow==${PILLOW_VERSION} numpy==${NUMPY_VERSION}"
       - "cd $BUILD_DIR && zip -r9 $CODEBUILD_SRC_DIR/$LAYER_DIR/pillow-numpy-layer.zip python/"
       - "ls -lh $CODEBUILD_SRC_DIR/$LAYER_DIR/pillow-numpy-layer.zip"
       - "rm -rf $BUILD_DIR"
