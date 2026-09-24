@@ -1184,7 +1184,15 @@ resource "aws_sagemaker_pipeline" "medical_image_pipeline" {
               }
             ]
           }
-          DependsOn = [var.pipeline_steps.ensemble.step_name]
+          # Must depend on BiasCheck, not just the ensemble: the fairness
+          # condition below reads max_disparity from the bias step's S3 output
+          # via Std:JsonGet. With only the ensemble edge, SageMaker schedules
+          # this step in parallel with BiasCheck and the JsonGet resolves before
+          # bias_metrics.json is uploaded, failing with "Cannot access S3 key".
+          DependsOn = [
+            var.pipeline_steps.ensemble.step_name,
+            var.pipeline_steps.bias.step_name,
+          ]
         }
       ]
     )

@@ -207,12 +207,70 @@ def save_prediction_data(s3_client, bucket, prediction_data, image_data, request
         return None
 
 
+def _cors_headers():
+    return {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    }
+
+
+def fetch_prediction_result(s3_client, bucket, request_id):
+    """Look up a stored prediction by request id for GET /results/{id}.
+
+    save_prediction_data writes to predictions/<YYYY>/<MM>/<DD>/<id>/prediction.json.
+    The caller supplies only the id, so the date is unknown - list on the id's
+    own prefix across a small window of recent days rather than scanning the
+    whole predictions/ tree.
+    """
+    from datetime import datetime, timedelta
+
+    if not bucket:
+        return None
+    today = datetime.utcnow()
+    for days_ago in range(3):
+        day = today - timedelta(days=days_ago)
+        key = f"predictions/{day.strftime('%Y/%m/%d')}/{request_id}/prediction.json"
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=key)
+            return json.loads(obj["Body"].read())
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in ("NoSuchKey", "404"):
+                raise
+    return None
+
+
 def lambda_handler(event, context):
     """
     Handle inference API requests with simplified image preprocessing
     """
     try:
         logger.info(f"Received event: {json.dumps(event)}")
+
+        # GET /results/{id} - retrieve a previously stored prediction. Routed
+        # here by the same API Gateway integration as POST /predict, so it must
+        # be dispatched before any body parsing (a GET has no body).
+        path_params = event.get("pathParameters") or {}
+        http_method = (event.get("httpMethod") or "").upper()
+        if http_method == "GET" or path_params.get("id"):
+            request_id = path_params.get("id")
+            if not request_id:
+                return {
+                    "statusCode": 400,
+                    "headers": _cors_headers(),
+                    "body": json.dumps({"error": "Missing result id"}),
+                }
+            result = fetch_prediction_result(
+                boto3.client("s3"), os.environ.get("INFERENCE_BUCKET"), request_id
+            )
+            if result is None:
+                return {
+                    "statusCode": 404,
+                    "headers": _cors_headers(),
+                    "body": json.dumps({"error": "Result not found", "request_id": request_id}),
+                }
+            return {"statusCode": 200, "headers": _cors_headers(), "body": json.dumps(result)}
 
         # Get environment variables
         endpoint_name = os.environ.get("ENDPOINT_NAME")
@@ -233,7 +291,10 @@ def lambda_handler(event, context):
         if isinstance(event.get("body"), str):
             body = json.loads(event["body"])
         else:
-            body = event.get("body", {})
+            # `or {}` not a get() default: API Gateway sends the key with an
+            # explicit null for body-less requests, so the default never fires
+            # and body.get() below would raise AttributeError on None.
+            body = event.get("body") or {}
 
         image_data = body.get("image")
         image_len = len(image_data) if image_data else 0

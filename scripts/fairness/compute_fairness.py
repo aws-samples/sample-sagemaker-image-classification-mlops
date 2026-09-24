@@ -41,10 +41,11 @@ subgroups registers as disparity even when the model is accurate on both. Read
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
@@ -122,6 +123,32 @@ def _extract_score(payload) -> float | None:
     return None
 
 
+def decode_capture_payload(section: dict):
+    """Decode one captureData section (endpointInput / endpointOutput) to JSON.
+
+    SageMaker records the payload under `data` and declares how it is stored in
+    a sibling `encoding` field. For a JSON endpoint it is "BASE64", so `data` is
+    base64-encoded JSON rather than JSON text - json.loads on it raises, and a
+    parser that swallows that error silently discards every captured record.
+    Falls back to treating `data` as raw JSON for endpoints that report
+    encoding "JSON".
+    """
+    raw = section.get("data")
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    if str(section.get("encoding", "")).upper() == "BASE64":
+        try:
+            raw = base64.b64decode(raw).decode("utf8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 def load_predictions(s3, bucket: str, prefix: str, since: datetime) -> dict[str, float]:
     """Map request_id -> predicted score from endpoint data capture."""
     scores: dict[str, float] = {}
@@ -131,12 +158,9 @@ def load_predictions(s3, bucket: str, prefix: str, since: datetime) -> dict[str,
             rid = meta.get("eventId") or rec.get("request_id")
             if not rid:
                 continue
-            raw = (rec.get("captureData") or {}).get("endpointOutput", {}).get("data")
-            if raw is None:
-                continue
-            try:
-                payload = json.loads(raw) if isinstance(raw, str) else raw
-            except json.JSONDecodeError:
+            section = (rec.get("captureData") or {}).get("endpointOutput") or {}
+            payload = decode_capture_payload(section)
+            if payload is None:
                 continue
             score = _extract_score(payload)
             if score is not None:
@@ -246,7 +270,7 @@ def run(
 
     s3 = boto3.client("s3")
     cloudwatch = boto3.client("cloudwatch")
-    since = datetime.now(UTC) - timedelta(hours=lookback_hours)
+    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
     preds = load_predictions(s3, monitoring_bucket, capture_prefix, since)
     truth = load_ground_truth(s3, monitoring_bucket, ground_truth_prefix, since)
@@ -267,7 +291,7 @@ def run(
 
     metrics = compute(y_true, y_pred, groups, threshold)
     metrics["endpoint_name"] = endpoint_name
-    metrics["computed_at"] = datetime.now(UTC).isoformat()
+    metrics["computed_at"] = datetime.now(timezone.utc).isoformat()
     logger.info(
         "max_disparity=%.4f over %d records / %d groups (threshold %.2f) passed=%s",
         metrics["max_disparity"],
@@ -285,7 +309,7 @@ def run(
                 "Dimensions": [{"Name": "EndpointName", "Value": endpoint_name}],
                 "Value": metrics["max_disparity"],
                 "Unit": "None",
-                "Timestamp": datetime.now(UTC),
+                "Timestamp": datetime.now(timezone.utc),
             }
         ],
     )

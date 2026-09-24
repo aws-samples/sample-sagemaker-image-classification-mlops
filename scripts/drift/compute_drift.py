@@ -21,11 +21,12 @@ significant. The alarm threshold is supplied by Terraform (drift_threshold).
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import math
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import boto3
 
@@ -71,12 +72,39 @@ def _iter_capture_keys(s3, bucket: str, prefix: str, since: datetime):
                 yield obj["Key"]
 
 
+def decode_capture_payload(section: dict):
+    """Decode one captureData section (endpointInput / endpointOutput) to JSON.
+
+    SageMaker records the payload under `data` and declares how it is stored in
+    a sibling `encoding` field. For a JSON endpoint it is "BASE64", so `data` is
+    base64-encoded JSON rather than JSON text - json.loads on it raises, and a
+    parser that swallows that error silently discards every captured record.
+    Falls back to treating `data` as raw JSON for endpoints that report
+    encoding "JSON".
+    """
+    raw = section.get("data")
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    if str(section.get("encoding", "")).upper() == "BASE64":
+        try:
+            raw = base64.b64decode(raw).decode("utf8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 def _scores_from_capture(body: str) -> list[float]:
     """Extract malignant probabilities from data-capture JSON Lines records.
 
     Capture format wraps the endpoint response under
-    captureData.endpointOutput.data, which itself holds the model's JSON.
-    Malformed lines are skipped rather than failing the whole run.
+    captureData.endpointOutput, whose `data` holds the model's JSON subject to
+    the section's `encoding`. Malformed lines are skipped rather than failing
+    the whole run.
     """
     scores: list[float] = []
     for line in body.splitlines():
@@ -85,11 +113,13 @@ def _scores_from_capture(body: str) -> list[float]:
             continue
         try:
             record = json.loads(line)
-            raw = record["captureData"]["endpointOutput"]["data"]
-            payload = json.loads(raw) if isinstance(raw, str) else raw
+            section = record["captureData"]["endpointOutput"]
         except (json.JSONDecodeError, KeyError, TypeError):
             continue
 
+        payload = decode_capture_payload(section)
+        if payload is None:
+            continue
         score = _extract_score(payload)
         if score is not None:
             scores.append(score)
@@ -183,7 +213,7 @@ def run(
         logger.info("no baseline available; not publishing a metric")
         return 0
 
-    since = datetime.now(UTC) - timedelta(hours=lookback_hours)
+    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     live: list[float] = []
     keys_read = 0
     for key in _iter_capture_keys(s3, monitoring_bucket, capture_prefix, since):
@@ -214,7 +244,7 @@ def run(
                 "Dimensions": [{"Name": "EndpointName", "Value": endpoint_name}],
                 "Value": psi,
                 "Unit": "None",
-                "Timestamp": datetime.now(UTC),
+                "Timestamp": datetime.now(timezone.utc),
             }
         ],
     )

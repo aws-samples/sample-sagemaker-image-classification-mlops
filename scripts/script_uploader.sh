@@ -38,10 +38,15 @@ echo -e "${BLUE}📤 Uploading validation scripts...${NC}"
 aws s3 cp validation/data_validator.py s3://$SCRIPTS_BUCKET/validation/
 echo -e "${GREEN}✅ Uploaded data_validator.py${NC}"
 
-# Upload preprocessing scripts
+# Upload preprocessing scripts. run_preprocessing.sh is the step's actual
+# entrypoint - it pip-installs requirements.txt before exec'ing the
+# preprocessor - so all three must land or PreprocessData fails with
+# "cannot open .../run_preprocessing.sh: No such file".
 echo -e "${BLUE}📤 Uploading preprocessing scripts...${NC}"
 aws s3 cp preprocessing/data_preprocessor.py s3://$SCRIPTS_BUCKET/preprocessing/
-echo -e "${GREEN}✅ Uploaded data_preprocessor.py${NC}"
+aws s3 cp preprocessing/run_preprocessing.sh s3://$SCRIPTS_BUCKET/preprocessing/
+aws s3 cp preprocessing/requirements.txt s3://$SCRIPTS_BUCKET/preprocessing/
+echo -e "${GREEN}✅ Uploaded preprocessing scripts${NC}"
 
 # Create and upload training scripts (tar.gz files)
 echo -e "${BLUE}📦 Creating training tar.gz files...${NC}"
@@ -115,6 +120,8 @@ REQUIRED_SCRIPTS=(
     "utils/cloudwatch_metrics.py"
     "validation/data_validator.py"
     "preprocessing/data_preprocessor.py"
+    "preprocessing/run_preprocessing.sh"
+    "preprocessing/requirements.txt"
     "evaluation/model_evaluator.py"
     "evaluation/report_generator.py"
     "evaluation/requirements.txt"

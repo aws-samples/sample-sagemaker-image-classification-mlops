@@ -125,6 +125,12 @@ resource "aws_scheduler_schedule" "drift_job" {
         MaxRuntimeInSeconds = var.drift_job_max_runtime
       }
 
+      # A Processing container inherits no region, so boto3 raises NoRegionError
+      # before the script does any work. SageMaker does not inject this for you.
+      Environment = {
+        AWS_DEFAULT_REGION = var.aws_region
+      }
+
       NetworkConfig = {
         EnableInterContainerTrafficEncryption = true
         EnableNetworkIsolation                = false
@@ -305,6 +311,12 @@ resource "aws_scheduler_schedule" "fairness_job" {
 
       StoppingCondition = {
         MaxRuntimeInSeconds = var.fairness_job_max_runtime
+      }
+
+      # A Processing container inherits no region, so boto3 raises NoRegionError
+      # before the script does any work. SageMaker does not inject this for you.
+      Environment = {
+        AWS_DEFAULT_REGION = var.aws_region
       }
 
       NetworkConfig = {
