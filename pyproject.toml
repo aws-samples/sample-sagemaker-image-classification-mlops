@@ -68,6 +68,14 @@ ignore = [
 # Ops scripts similarly — they're interactive CLI utilities.
 "ops-scripts/*.py" = ["T201"]
 
+# The scheduled drift and fairness jobs run in the AWS-managed scikit-learn
+# Processing image, which is Python 3.9 — not this project's 3.13. UP017 would
+# rewrite `timezone.utc` to the `datetime.UTC` alias added in 3.11, which raises
+# ImportError in that container and takes the whole job down. Keep these two
+# 3.9-compatible; the rest of the repo stays on the 3.13 target.
+"scripts/drift/*.py" = ["UP017"]
+"scripts/fairness/*.py" = ["UP017"]
+
 [tool.ruff.format]
 # Ruff format is a Black-compatible formatter. Keep the defaults; the whole
 # point is consistency, not bikeshedding over trailing commas.

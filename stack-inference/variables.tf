@@ -225,9 +225,9 @@ variable "drift_job_max_runtime" {
 }
 
 variable "monitoring_job_image_tag" {
-  description = "Tag of the AWS-managed scikit-learn Processing image used to run the scheduled drift and fairness scripts."
+  description = "Tag of the AWS-managed scikit-learn Processing image used to run the scheduled drift and fairness scripts. Must carry a numpy/pandas/scikit-learn stack that already satisfies Fairlearn, otherwise pip upgrades numpy at job start and the container's pre-compiled scikit-learn fails with a binary-incompatibility ValueError. The 1.2-1 image is too old on both counts (Python 3.9, pandas 1.1.3); this matches the tag stack-training uses for its own Processing steps."
   type        = string
-  default     = "1.2-1"
+  default     = "1.4-2-cpu-py3"
 }
 
 ################################################################################
