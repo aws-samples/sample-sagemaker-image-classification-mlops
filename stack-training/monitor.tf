@@ -28,7 +28,4 @@ module "cloudwatch_monitoring" {
 
   # KMS encryption
   kms_key_arn = module.kms.key_arn
-
-  # Tags
-  tags = local.common_tags
 }

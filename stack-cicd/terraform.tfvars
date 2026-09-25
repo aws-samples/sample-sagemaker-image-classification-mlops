@@ -1,24 +1,29 @@
-# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
-#
-# This AWS Content is provided subject to the terms of the AWS Customer Agreement
-# available at http://aws.amazon.com/agreement or other written agreement between
-# Customer and either Amazon Web Services, Inc. or Amazon Web Services EMEA SARL or both.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 
 # General
 project_name = "medical-image-classification"
 environment  = "dev"
 aws_region   = "us-east-1"
 
-# GitHub
-github_owner  = "xsagarx-aws"
-github_repo   = "Medical_Image_Classification"
+# Terraform state backend: the stack-backend-setup output state_bucket_id.
+# `make backend-config` prints it. The KMS alias and boundary name default to
+# the stack-backend-setup naming; set them only if you changed that stack.
+state_bucket_name = "your-project-tfstate-1a2b3c4d"
+# state_kms_key_alias    = "alias/<project_name>-terraform-state"
+# workload_boundary_name = "<project_name>-workload-boundary"
+
+# GitHub: your fork of this sample. After the first apply, complete the
+# CodeStar connection handshake in the console (see README).
+github_owner  = "your-github-org"
+github_repo   = "your-repo"
 github_branch = "main"
 
-# SageMaker
-# Model Package Group name - must match training infrastructure
-model_package_group_name = "medical-image-classification-model-package-group"
+# SageMaker: the Model Package Group defaults to <project_name>-model-package-group (stack-training output
+# model_package_group_name); set it only if you changed that name.
+# model_package_group_name = "medical-image-classification-model-package-group"
 
-# Manual approval — require a human to review before production inference deploy.
+# Manual approval: require a human to review before the inference deploy.
 # Strongly recommended for medical ML. Set require_manual_approval = false
 # in dev/test environments where fully auto-deploy is acceptable.
 require_manual_approval      = true

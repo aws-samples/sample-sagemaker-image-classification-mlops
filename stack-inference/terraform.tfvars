@@ -1,8 +1,5 @@
-# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
-#
-# This AWS Content is provided subject to the terms of the AWS Customer Agreement
-# available at http://aws.amazon.com/agreement or other written agreement between
-# Customer and either Amazon Web Services, Inc. or Amazon Web Services EMEA SARL or both.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 
 # General
 project_name = "medical-image-classification"
@@ -21,7 +18,7 @@ log_retention_days = 14
 alert_email        = "" # Add your email for alerts
 drift_threshold    = 0.1
 
-# Auto-scaling (real-time mode only — ignored when use_serverless_inference = true)
+# Auto-scaling (real-time mode only - ignored when use_serverless_inference = true)
 endpoint_min_capacity                = 1
 endpoint_max_capacity                = 3
 target_concurrent_requests_per_model = 5 # concurrent in-flight requests per model copy; sub-minute scale-out

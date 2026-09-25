@@ -13,20 +13,20 @@ SNS topic with email subscription, CloudWatch metric alarms, and optional compos
 ## Requirements
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | terraform | ~> 1.15 |
 | aws | ~> 6.0 |
 
 ## Providers
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | aws | ~> 6.0 |
 
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [aws_cloudwatch_composite_alarm.composite_alarm](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_composite_alarm) | resource |
 | [aws_cloudwatch_metric_alarm.alarms](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
 | [aws_sns_topic.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sns_topic) | resource |
@@ -35,7 +35,7 @@ SNS topic with email subscription, CloudWatch metric alarms, and optional compos
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
+| ---- | ----------- | ---- | ------- | :------: |
 | topic\_name | SNS topic name | `string` | n/a | yes |
 | alarms | CloudWatch alarms configuration | <pre>map(object({<br/>    alarm_name          = string<br/>    comparison_operator = string<br/>    evaluation_periods  = string<br/>    metric_name         = string<br/>    namespace           = string<br/>    period              = string<br/>    statistic           = string<br/>    threshold           = string<br/>    alarm_description   = string<br/>    treat_missing_data  = optional(string, "notBreaching")<br/>    dimensions          = optional(map(string))<br/>  }))</pre> | `{}` | no |
 | composite\_alarm | Composite alarm configuration | <pre>object({<br/>    alarm_name        = string<br/>    alarm_description = string<br/>    alarm_rule        = string<br/>  })</pre> | `null` | no |
@@ -46,7 +46,7 @@ SNS topic with email subscription, CloudWatch metric alarms, and optional compos
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ---- | ----------- |
 | alarm\_names | Created alarm names |
 | sns\_topic\_arn | SNS topic ARN |
 <!-- END_TF_DOCS -->
@@ -55,7 +55,7 @@ SNS topic with email subscription, CloudWatch metric alarms, and optional compos
 
 ```
 modules/terraform-aws-sns/
-├── main.tf          # SNS topic, email subscription, CloudWatch alarms, composite alarm
-├── outputs.tf       # SNS topic ARN, alarm names map
-└── variables.tf     # Topic name, email endpoint, alarms config, composite alarm, tags
+|-- main.tf          # SNS topic, email subscription, CloudWatch alarms, composite alarm
+|-- outputs.tf       # SNS topic ARN, alarm names map
+`-- variables.tf     # Topic name, email endpoint, alarms config, composite alarm, tags
 ```

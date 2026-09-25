@@ -20,11 +20,20 @@ Ground truth arrives on its own cadence (pathology results, follow-up reads),
 so only predictions that already have a confirmed label are scored. A prediction
 with no matching label is skipped, never guessed.
 
+Join key: the inference Lambda passes its request id as InvokeEndpoint
+InferenceId, which data capture records as eventMetadata.inferenceId, and
+returns the same request_id to the caller. Clinicians upload outcomes keyed by
+that request_id. Each prediction is scored at the decision threshold the
+endpoint reported (threshold_used), not at 0.5.
+
 Input layout in the monitoring bucket:
 
-    data-capture/**/*.jsonl        endpoint capture (request_id + score)
+    data-capture/<endpoint>/<variant>/yyyy/mm/dd/hh/*.jsonl   endpoint capture
     ground-truth/**/*.jsonl        {"request_id": ..., "label": 0|1,
                                     "group": "<subgroup>"}   (label required)
+
+With fewer than two subgroups in the joined window nothing can be compared:
+the report is written with status "not_evaluable" and no metric is published.
 
 Output: one CloudWatch metric (default ``fairness_max_disparity``) plus a JSON
 summary written to the processing output path for the audit trail.
@@ -41,26 +50,21 @@ subgroups registers as disparity even when the model is accurate on both. Read
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
 
-# Fairlearn is the metric engine. Guarded so a missing dependency fails with a
-# clear message rather than a bare ImportError inside the container.
-try:
-    from fairlearn.metrics import (
-        demographic_parity_difference,
-        equalized_odds_difference,
-    )
-
-    _FAIRLEARN_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _FAIRLEARN_AVAILABLE = False
+# The job's code directory holds mlops_common next to this file; a local
+# checkout has it one level up, in scripts/.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from mlops_common.capture import iter_capture_records
+from mlops_common.fairness import STATUS_NOT_EVALUABLE, compute_group_fairness
+from mlops_common.s3io import iter_capture_keys, iter_keys
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -69,33 +73,19 @@ _ENV = os.environ.get
 DEFAULT_THRESHOLD = 0.10
 
 
-def _clamp01(value) -> float | None:
+def _read_text(s3, bucket: str, key: str) -> str:
     try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    return min(max(f, 0.0), 1.0)
-
-
-def _iter_keys(s3, bucket: str, prefix: str, since: datetime):
-    """Yield .jsonl object keys under `prefix` modified since `since`."""
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["LastModified"] >= since and obj["Key"].endswith(".jsonl"):
-                yield obj["Key"]
-
-
-def _read_jsonl(s3, bucket: str, key: str) -> list[dict]:
-    """Read one JSON Lines object, skipping malformed lines."""
-    try:
-        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf8")
+        return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf8")
     # A single unreadable object must not abort the whole run.
     except Exception as exc:
         logger.warning("skipping %s (%s)", key, exc)
-        return []
+        return ""
+
+
+def _read_jsonl(s3, bucket: str, key: str) -> list:
+    """Read one JSON Lines object, skipping malformed lines."""
     out = []
-    for line in body.splitlines():
+    for line in _read_text(s3, bucket, key).splitlines():
         line = line.strip()
         if not line:
             continue
@@ -106,74 +96,29 @@ def _read_jsonl(s3, bucket: str, key: str) -> list[dict]:
     return out
 
 
-def _extract_score(payload) -> float | None:
-    """Pull a single malignant probability out of a model response."""
-    if isinstance(payload, dict):
-        if "predictions" in payload:
-            preds = payload["predictions"]
-            first = preds[0] if isinstance(preds, list) and preds else preds
-            if isinstance(first, list):
-                return _clamp01(first[1] if len(first) == 2 else first[0])
-            return _clamp01(first)
-        for k in ("malignant_probability", "confidence", "probability", "score"):
-            if k in payload:
-                return _clamp01(payload[k])
-    elif isinstance(payload, (int, float)):
-        return _clamp01(payload)
-    return None
+def load_predictions(
+    s3, bucket: str, prefix: str, endpoint_name: str, since: datetime
+) -> dict[str, tuple[float, float | None]]:
+    """Map inference id -> (score, threshold_used) from endpoint data capture.
 
-
-def decode_capture_payload(section: dict):
-    """Decode one captureData section (endpointInput / endpointOutput) to JSON.
-
-    SageMaker records the payload under `data` and declares how it is stored in
-    a sibling `encoding` field. For a JSON endpoint it is "BASE64", so `data` is
-    base64-encoded JSON rather than JSON text - json.loads on it raises, and a
-    parser that swallows that error silently discards every captured record.
-    Falls back to treating `data` as raw JSON for endpoints that report
-    encoding "JSON".
+    Keyed on eventMetadata.inferenceId (the Lambda request id); falls back to
+    SageMaker's eventId for callers that did not pass an InferenceId.
     """
-    raw = section.get("data")
-    if raw is None:
-        return None
-    if isinstance(raw, (dict, list)):
-        return raw
-    if str(section.get("encoding", "")).upper() == "BASE64":
-        try:
-            raw = base64.b64decode(raw).decode("utf8")
-        except (ValueError, UnicodeDecodeError):
-            return None
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-def load_predictions(s3, bucket: str, prefix: str, since: datetime) -> dict[str, float]:
-    """Map request_id -> predicted score from endpoint data capture."""
-    scores: dict[str, float] = {}
-    for key in _iter_keys(s3, bucket, prefix, since):
-        for rec in _read_jsonl(s3, bucket, key):
-            meta = rec.get("eventMetadata") or {}
-            rid = meta.get("eventId") or rec.get("request_id")
-            if not rid:
-                continue
-            section = (rec.get("captureData") or {}).get("endpointOutput") or {}
-            payload = decode_capture_payload(section)
-            if payload is None:
-                continue
-            score = _extract_score(payload)
-            if score is not None:
-                scores[str(rid)] = score
-    return scores
+    preds: dict[str, tuple[float, float | None]] = {}
+    for key in iter_capture_keys(s3, bucket, prefix, endpoint_name, since):
+        for record in iter_capture_records(_read_text(s3, bucket, key)):
+            rid = record["inference_id"] or record["event_id"]
+            if rid:
+                preds[str(rid)] = (record["score"], record["threshold"])
+    return preds
 
 
 def load_ground_truth(s3, bucket: str, prefix: str, since: datetime) -> dict[str, dict]:
     """Map request_id -> {label, group} from clinician-confirmed outcomes."""
     truth: dict[str, dict] = {}
-    for key in _iter_keys(s3, bucket, prefix, since):
+    for key in iter_keys(s3, bucket, prefix, since=since, suffix=".jsonl"):
         for rec in _read_jsonl(s3, bucket, key):
-            rid = rec.get("request_id") or rec.get("eventId")
+            rid = rec.get("request_id") or rec.get("inferenceId")
             if rid is None or "label" not in rec:
                 continue
             try:
@@ -184,72 +129,25 @@ def load_ground_truth(s3, bucket: str, prefix: str, since: datetime) -> dict[str
     return truth
 
 
-def compute(y_true, y_pred, groups, threshold: float) -> dict:
-    """Demographic parity + equalized odds across subgroups."""
-    if not _FAIRLEARN_AVAILABLE:
-        raise RuntimeError(
-            "fairlearn is not installed in this container. Add it to "
-            "scripts/fairness/requirements.txt or bake it into the image."
-        )
+def join_predictions(preds: dict, truth: dict) -> tuple[list, list, list, int]:
+    """(y_true, y_pred, groups, skipped) for predictions with a confirmed outcome.
 
-    per_group: dict[str, dict] = {}
-    for grp in sorted(set(groups)):
-        idx = [i for i, g in enumerate(groups) if g == grp]
-        n = len(idx)
-        pos = sum(1 for i in idx if y_true[i] == 1)
-        neg = n - pos
-        flagged = sum(1 for i in idx if y_pred[i] == 1)
-        tp = sum(1 for i in idx if y_true[i] == 1 and y_pred[i] == 1)
-        per_group[grp] = {
-            "n": n,
-            "n_positive": pos,
-            "selection_rate": round(flagged / n, 4) if n else None,
-            # Recall is the clinically costly metric: a missed malignant case.
-            # None when the group has no confirmed positives to measure against.
-            "true_positive_rate": round(tp / pos, 4) if pos else None,
-            # Only groups with both classes present can contribute to
-            # equalized odds; see the filter below.
-            "rates_measurable": bool(pos and neg),
-        }
-
-    # Demographic parity is a selection-rate comparison, so every group counts.
-    dp = float(demographic_parity_difference(y_true, y_pred, sensitive_features=groups))
-
-    # Equalized odds compares TPR and FPR, which need both classes present in a
-    # group. Fairlearn does not raise on a group with no positives - it inherits
-    # scikit-learn's zero_division default and reports recall 0.0, which reads
-    # as a maximal disparity for a group that simply had no malignant cases in
-    # the window. On a week of live traffic that is common, so those groups are
-    # excluded from this term rather than allowed to fire the alarm daily. They
-    # remain in per_group with rates_measurable = false so the exclusion is
-    # visible, and they still count toward demographic parity above.
-    keep = [i for i, g in enumerate(groups) if per_group[g]["rates_measurable"]]
-    eo_groups = {groups[i] for i in keep}
-    if len(eo_groups) >= 2:
-        eo = float(
-            equalized_odds_difference(
-                [y_true[i] for i in keep],
-                [y_pred[i] for i in keep],
-                sensitive_features=[groups[i] for i in keep],
-            )
-        )
-    else:
-        # Fewer than two comparable groups: nothing to compare, so this term
-        # contributes nothing. Demographic parity still carries the signal.
-        eo = 0.0
-
-    metrics = {
-        "demographic_parity_difference": round(dp, 4),
-        "equalized_odds_difference": round(eo, 4),
-        "equalized_odds_groups": sorted(eo_groups),
-        "per_group": per_group,
-        "n_scored": len(y_true),
-        "n_groups": len(per_group),
-        "threshold": threshold,
-    }
-    metrics["max_disparity"] = round(max(dp, eo), 4)
-    metrics["passed"] = bool(metrics["max_disparity"] <= threshold)
-    return metrics
+    Each prediction uses the threshold the endpoint applied. Records whose
+    capture carries no threshold are skipped and counted rather than guessed.
+    """
+    y_true, y_pred, groups = [], [], []
+    skipped = 0
+    for rid, outcome in truth.items():
+        if rid not in preds:
+            continue
+        score, decision_threshold = preds[rid]
+        if decision_threshold is None:
+            skipped += 1
+            continue
+        y_true.append(outcome["label"])
+        y_pred.append(1 if score >= decision_threshold else 0)
+        groups.append(outcome["group"])
+    return y_true, y_pred, groups, skipped
 
 
 def run(
@@ -264,43 +162,49 @@ def run(
     threshold: float,
     output_path: Path,
 ) -> int:
-    if not monitoring_bucket or not namespace:
-        logger.error("--monitoring-bucket and --metric-namespace are required")
+    if not monitoring_bucket or not namespace or not endpoint_name:
+        logger.error("--monitoring-bucket, --metric-namespace and --endpoint-name are required")
         return 1
 
     s3 = boto3.client("s3")
     cloudwatch = boto3.client("cloudwatch")
     since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
 
-    preds = load_predictions(s3, monitoring_bucket, capture_prefix, since)
+    preds = load_predictions(s3, monitoring_bucket, capture_prefix, endpoint_name, since)
     truth = load_ground_truth(s3, monitoring_bucket, ground_truth_prefix, since)
     logger.info("%d captured predictions, %d confirmed outcomes", len(preds), len(truth))
 
-    # Score only predictions that already have a confirmed clinical outcome.
-    joined = [(rid, preds[rid], truth[rid]) for rid in truth if rid in preds]
-    if len(joined) < min_samples:
+    y_true, y_pred, groups, skipped = join_predictions(preds, truth)
+    if skipped:
+        logger.warning("%d joined records had no threshold_used in capture; skipped", skipped)
+    if len(y_true) < min_samples:
         # Publishing on a thin join would swing wildly day to day and raise
         # false fairness alarms, so emit nothing and let the alarm treat the
         # gap as non-breaching.
-        logger.info("only %d joined records (< %d); not publishing", len(joined), min_samples)
+        logger.info("only %d joined records (< %d); not publishing", len(y_true), min_samples)
         return 0
 
-    y_pred = [1 if score >= 0.5 else 0 for _, score, _ in joined]
-    y_true = [t["label"] for _, _, t in joined]
-    groups = [t["group"] for _, _, t in joined]
-
-    metrics = compute(y_true, y_pred, groups, threshold)
+    metrics = compute_group_fairness(y_true, y_pred, groups, threshold)
     metrics["endpoint_name"] = endpoint_name
     metrics["computed_at"] = datetime.now(timezone.utc).isoformat()
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    out = output_path / "fairness_metrics.json"
+    out.write_text(json.dumps(metrics, indent=2))
+    logger.info("wrote %s", out)
+
+    if metrics["status"] == STATUS_NOT_EVALUABLE:
+        logger.warning("fairness not evaluable: %s; not publishing", metrics["reason"])
+        return 0
+
     logger.info(
         "max_disparity=%.4f over %d records / %d groups (threshold %.2f) passed=%s",
         metrics["max_disparity"],
-        metrics["n_scored"],
+        metrics["n_samples"],
         metrics["n_groups"],
         threshold,
         metrics["passed"],
     )
-
     cloudwatch.put_metric_data(
         Namespace=namespace,
         MetricData=[
@@ -313,11 +217,6 @@ def run(
             }
         ],
     )
-
-    output_path.mkdir(parents=True, exist_ok=True)
-    out = output_path / "fairness_metrics.json"
-    out.write_text(json.dumps(metrics, indent=2))
-    logger.info("wrote %s", out)
     return 0
 
 

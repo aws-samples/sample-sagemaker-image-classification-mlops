@@ -12,12 +12,23 @@ variable "force_destroy" {
   default     = false
 }
 
+variable "object_ownership" {
+  description = "S3 Object Ownership setting. BucketOwnerEnforced (default) disables ACLs. Use BucketOwnerPreferred only for a bucket that must accept ACL-based writes, such as CloudFront standard logs."
+  type        = string
+  default     = "BucketOwnerEnforced"
+
+  validation {
+    condition     = contains(["BucketOwnerEnforced", "BucketOwnerPreferred", "ObjectWriter"], var.object_ownership)
+    error_message = "object_ownership must be BucketOwnerEnforced, BucketOwnerPreferred or ObjectWriter."
+  }
+}
+
 ################################################################################
 # Encryption
 ################################################################################
 
 variable "kms_key_arn" {
-  description = "ARN of the KMS key for encryption (optional)"
+  description = "ARN of the KMS key for SSE-KMS encryption (optional). When set, an S3 Bucket Key is enabled. Null uses SSE-S3 (AES256)."
   type        = string
   default     = null
 }

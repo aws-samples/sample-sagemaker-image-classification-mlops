@@ -6,17 +6,30 @@
 Baseline Model Creation Script
 
 This script creates a minimal TensorFlow model to satisfy SageMaker endpoint
-creation requirements on first deployment. It implements idempotent logic to
-check for existing approved models before creating new ones.
+creation requirements on first deployment. It is idempotent: it does nothing
+when the group already holds an Approved or PendingManualApproval package.
 
-The baseline model is a simple neural network with:
-- Input: 30 features (matches medical image classification dataset)
+The baseline model is a toy network that cannot classify images:
+- Input: 30 features
 - Hidden: 16 units with ReLU activation
 - Output: 2 classes (benign, malignant) with softmax activation
 
-The model is registered in SageMaker Model Registry with "Approved" status
-and tagged as a baseline model for initial deployment.
+The model is registered as PendingManualApproval and marked as a placeholder
+in CustomerMetadataProperties (ModelRole=placeholder-baseline). It is not a
+medical model: it only lets the first stack-inference apply create an
+endpoint. A person approves it once, on purpose, before that first apply:
+
+    aws sagemaker update-model-package \
+        --model-package-arn <arn printed by this script> \
+        --model-approval-status Approved \
+        --approval-description "Placeholder for first endpoint deploy" \
+        --profile <profile>
+
+Model packages in a group inherit the group's tags and cannot take their own,
+so the marker lives in CustomerMetadataProperties.
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
@@ -24,9 +37,9 @@ import os
 import sys
 import tarfile
 import tempfile
+import uuid
 
 import boto3
-import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -38,44 +51,37 @@ logger = logging.getLogger(__name__)
 sagemaker_client = boto3.client("sagemaker")
 s3_client = boto3.client("s3")
 
+PLACEHOLDER_METADATA = {
+    "ModelRole": "placeholder-baseline",
+    "ClinicalUse": "none",
+}
 
-def check_approved_model_exists(model_package_group_name: str) -> bool:
-    """
-    Check if an approved model exists in the Model Registry.
 
-    Args:
-        model_package_group_name: Name of the model package group
+def existing_model_package(model_package_group_name: str) -> dict | None:
+    """Latest Approved or PendingManualApproval package in the group, if any.
 
-    Returns:
-        True if at least one approved model exists, False otherwise
-
-    Raises:
-        ClientError: If SageMaker API call fails
+    A pending package (the placeholder from an earlier run, or a pipeline
+    model awaiting review) also counts: creating another placeholder on every
+    run would only add registry noise.
     """
     try:
-        logger.info(f"Checking for approved models in group: {model_package_group_name}")
-
-        response = sagemaker_client.list_model_packages(
-            ModelPackageGroupName=model_package_group_name,
-            ModelApprovalStatus="Approved",
-            SortBy="CreationTime",
-            SortOrder="Descending",
-            MaxResults=1,
-        )
-
-        model_packages = response.get("ModelPackageSummaryList", [])
-
-        if model_packages:
-            logger.info(f"Found {len(model_packages)} approved model(s)")
-            logger.info(f"Latest approved model: {model_packages[0]['ModelPackageArn']}")
-            return True
-        else:
-            logger.info("No approved models found")
-            return False
+        for status in ("Approved", "PendingManualApproval"):
+            logger.info(f"Checking for {status} models in group: {model_package_group_name}")
+            response = sagemaker_client.list_model_packages(
+                ModelPackageGroupName=model_package_group_name,
+                ModelApprovalStatus=status,
+                SortBy="CreationTime",
+                SortOrder="Descending",
+                MaxResults=1,
+            )
+            packages = response.get("ModelPackageSummaryList", [])
+            if packages:
+                return packages[0]
+        return None
 
     except sagemaker_client.exceptions.ResourceNotFound:
         logger.warning(f"Model package group '{model_package_group_name}' not found")
-        return False
+        return None
     except Exception as e:
         logger.error(f"Failed to check Model Registry: {e}", exc_info=True)
         raise
@@ -184,16 +190,16 @@ def register_baseline_model(
     model_artifacts_uri: str,
     model_package_group_name: str,
     inference_image_uri: str,
-    model_approval_status: str = "Approved",
+    model_approval_status: str = "PendingManualApproval",
 ) -> str:
     """
-    Register the baseline model in SageMaker Model Registry with Approved status.
+    Register the placeholder baseline in Model Registry, pending manual approval.
 
     Args:
         model_artifacts_uri: S3 URI where model artifacts are stored
         model_package_group_name: Name of the model package group
         inference_image_uri: Docker image URI for TensorFlow serving
-        model_approval_status: Approval status (default: 'Approved')
+        model_approval_status: Approval status (default: 'PendingManualApproval')
 
     Returns:
         Model package ARN
@@ -209,8 +215,12 @@ def register_baseline_model(
         # Create model package
         response = sagemaker_client.create_model_package(
             ModelPackageGroupName=model_package_group_name,
-            ModelPackageDescription="Baseline model for initial endpoint deployment",
+            ModelPackageDescription=(
+                "PLACEHOLDER baseline (30-feature toy network, not a medical model). "
+                "Approve only to create the endpoint on first deploy."
+            ),
             ModelApprovalStatus=model_approval_status,
+            CustomerMetadataProperties=PLACEHOLDER_METADATA,
             InferenceSpecification={
                 "Containers": [
                     {
@@ -234,7 +244,6 @@ def register_baseline_model(
                     "ml.m5.xlarge",
                 ],
             },
-            # Note: Tags are not supported on model packages, only on model package groups
         )
 
         model_package_arn = response["ModelPackageArn"]
@@ -334,18 +343,21 @@ def main():
         logger.info(f"AWS Region: {args.aws_region}")
         logger.info("=" * 80)
 
-        # Step 1: Check if approved model already exists (idempotent)
-        if check_approved_model_exists(args.model_package_group_name):
-            logger.info("Approved model already exists, skipping baseline model creation")
-            logger.info("Baseline model creation completed successfully (idempotent)")
+        # Step 1: skip when the group already has an approved or pending model
+        existing = existing_model_package(args.model_package_group_name)
+        if existing:
+            logger.info(
+                f"Model package already present ({existing['ModelApprovalStatus']}): "
+                f"{existing['ModelPackageArn']}; skipping baseline creation"
+            )
             sys.exit(0)
 
         # Step 2: Create baseline model
-        logger.info("No approved model found, creating baseline model")
+        logger.info("No approved or pending model found, creating placeholder baseline")
         model_artifacts = create_baseline_model()
 
         # Step 3: Upload model to S3
-        s3_key = f"baseline-models/model-{np.random.randint(1000000, 9999999)}.tar.gz"
+        s3_key = f"baseline-models/model-{uuid.uuid4().hex}.tar.gz"
         model_s3_uri = upload_model_to_s3(
             model_artifacts["model_tar_path"], args.model_artifacts_bucket, s3_key
         )
@@ -356,9 +368,14 @@ def main():
         )
 
         logger.info("=" * 80)
-        logger.info("Baseline model creation completed successfully")
+        logger.info("Placeholder baseline registered as PendingManualApproval")
         logger.info(f"Model Package ARN: {model_package_arn}")
         logger.info(f"Model S3 URI: {model_s3_uri}")
+        logger.info("Approve it once before the first stack-inference apply:")
+        logger.info(
+            f"  aws sagemaker update-model-package --model-package-arn {model_package_arn} "
+            "--model-approval-status Approved --profile <profile>"
+        )
         logger.info("=" * 80)
 
         sys.exit(0)

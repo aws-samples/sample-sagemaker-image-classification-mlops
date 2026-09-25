@@ -38,6 +38,12 @@ variable "key_administrators" {
   default     = []
 }
 
+variable "enable_cloudtrail_sns_grant" {
+  description = "Add the key-policy statement CloudTrail needs to publish delivery notifications to an SNS topic encrypted with this CMK (kms:GenerateDataKey* and kms:Decrypt for the CloudTrail service principal)."
+  type        = bool
+  default     = false
+}
+
 variable "enable_cloudtrail_grant" {
   description = "Add a key-policy statement allowing the CloudTrail service principal to GenerateDataKey/DescribeKey. Required when this CMK encrypts a CloudTrail trail, otherwise CreateTrail fails with InsufficientEncryptionPolicyException."
   type        = bool

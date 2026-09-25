@@ -1,0 +1,873 @@
+${jsonencode({
+  # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  # SPDX-License-Identifier: MIT-0
+  #
+  # SageMaker Pipeline definition, rendered by templatefile() in main.tf.
+  # The whole template is one jsonencode() call so the output is always
+  # valid JSON; see the call site for the variables passed in.
+  Version = "2020-12-01"
+  Parameters = [
+    {
+      Name         = "ModelNames"
+      Type         = "String"
+      DefaultValue = model_names
+    },
+    # Lineage parameters recorded on the registered model package. The
+    # Terraform variables only supply defaults; a caller (EventBridge rule,
+    # drift alarm, CI) overrides them per execution.
+    {
+      Name         = "RetrainingReason"
+      Type         = "String"
+      DefaultValue = retraining_reason
+    },
+    {
+      Name         = "DatasetVersion"
+      Type         = "String"
+      DefaultValue = dataset_version
+    },
+    {
+      Name         = "CodeCommitSha"
+      Type         = "String"
+      DefaultValue = code_commit_sha
+    }
+  ]
+  Steps = concat(
+    [
+      # Step 1: Data Validation
+      {
+        Name = steps.validation.step_name
+        Type = steps.validation.step_type
+        Arguments = merge(
+          {
+            ProcessingResources = {
+              ClusterConfig = merge(
+                {
+                  InstanceType   = steps.validation.instance_type
+                  InstanceCount  = steps.validation.instance_count
+                  VolumeSizeInGB = steps.validation.volume_size
+                },
+                can(regex(local_storage_instance_regex, steps.validation.instance_type)) ? {} : { VolumeKmsKeyId = kms_key_arn }
+              )
+            }
+            AppSpecification = {
+              # Python 3.12 image, so the pinned Pillow carries current fixes.
+              # The wrapper installs requirements.txt, then runs the validator.
+              ImageUri            = images.tensorflow_cpu
+              ContainerEntrypoint = ["/bin/sh", "${container_paths.code}/run_validation.sh"]
+              ContainerArguments = [
+                "--input-path", processing_paths.input_data,
+                "--output-path", processing_paths.output
+              ]
+            }
+            ProcessingInputs = [
+              {
+                InputName = "code"
+                S3Input = {
+                  S3Uri       = "s3://${buckets.scripts}/validation/"
+                  LocalPath   = container_paths.code
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              },
+              {
+                InputName = "raw-data"
+                S3Input = {
+                  S3Uri       = "s3://${buckets.raw_data}/${training_data_path}"
+                  LocalPath   = processing_paths.input_data
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              }
+            ]
+            ProcessingOutputConfig = {
+              KmsKeyId = kms_key_arn
+              Outputs = [
+                {
+                  OutputName = "validation-report"
+                  S3Output = {
+                    S3Uri        = "s3://${buckets.processed_data}/validation-reports/"
+                    LocalPath    = processing_paths.output
+                    S3UploadMode = data_config.s3_upload_mode
+                  }
+                }
+              ]
+            }
+            RoleArn = role_arn
+            Environment = {
+              PROJECT_NAME         = project_name
+              AWS_DEFAULT_REGION   = aws_region
+              MIN_IMAGES_PER_CLASS = tostring(min_images_per_class)
+            }
+          },
+          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+        )
+        CacheConfig = {
+          Enabled     = steps.validation.enable_cache
+          ExpireAfter = steps.validation.cache_expiry
+        }
+      },
+      # Step 2: Data Preprocessing
+      {
+        Name = steps.preprocessing.step_name
+        Type = steps.preprocessing.step_type
+        Arguments = merge(
+          {
+            ProcessingResources = {
+              ClusterConfig = merge(
+                {
+                  InstanceType   = steps.preprocessing.instance_type
+                  InstanceCount  = steps.preprocessing.instance_count
+                  VolumeSizeInGB = steps.preprocessing.volume_size
+                },
+                can(regex(local_storage_instance_regex, steps.preprocessing.instance_type)) ? {} : { VolumeKmsKeyId = kms_key_arn }
+              )
+            }
+            AppSpecification = {
+              ImageUri = images.tensorflow_cpu
+              # A raw ProcessingJob entrypoint does not auto-install
+              # requirements.txt the way ScriptProcessor does, and each
+              # ContainerEntrypoint string is capped at 256 chars, so the
+              # dependency install and run are delegated to a wrapper
+              # script uploaded alongside the preprocessor.
+              ContainerEntrypoint = ["/bin/sh", "${container_paths.code}/run_preprocessing.sh"]
+              ContainerArguments = [
+                "--input-path", processing_paths.input_data,
+                "--output-path", processing_paths.output,
+                "--target-size", tostring(preprocessing_target_size)
+              ]
+            }
+            ProcessingInputs = [
+              {
+                InputName = "code"
+                S3Input = {
+                  S3Uri       = "s3://${buckets.scripts}/preprocessing/"
+                  LocalPath   = container_paths.code
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              },
+              {
+                InputName = "raw-data"
+                S3Input = {
+                  S3Uri       = "s3://${buckets.raw_data}/${training_data_path}"
+                  LocalPath   = processing_paths.input_data
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              }
+            ]
+            ProcessingOutputConfig = {
+              KmsKeyId = kms_key_arn
+              Outputs = [
+                {
+                  OutputName = "train-data"
+                  S3Output = {
+                    S3Uri        = "s3://${buckets.processed_data}/train/"
+                    LocalPath    = "${processing_paths.output}/train"
+                    S3UploadMode = data_config.s3_upload_mode
+                  }
+                },
+                {
+                  OutputName = "validation-data"
+                  S3Output = {
+                    S3Uri        = "s3://${buckets.processed_data}/validation/"
+                    LocalPath    = "${processing_paths.output}/validation"
+                    S3UploadMode = data_config.s3_upload_mode
+                  }
+                },
+                {
+                  OutputName = "test-data"
+                  S3Output = {
+                    S3Uri        = "s3://${buckets.processed_data}/test/"
+                    LocalPath    = "${processing_paths.output}/test"
+                    S3UploadMode = data_config.s3_upload_mode
+                  }
+                }
+              ]
+            }
+            RoleArn = role_arn
+            Environment = {
+              PROJECT_NAME       = project_name
+              AWS_DEFAULT_REGION = aws_region
+              # The outputs upload to fixed train/, validation/ and test/
+              # prefixes, so the preprocessor clears them first; otherwise
+              # images from an earlier run would mix into this run's splits.
+              PROCESSED_DATA_BUCKET = buckets.processed_data
+            }
+          },
+          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+        )
+        CacheConfig = {
+          Enabled     = steps.preprocessing.enable_cache
+          ExpireAfter = steps.preprocessing.cache_expiry
+        }
+        DependsOn = [steps.validation.step_name]
+      }
+    ],
+    # Steps 3-5: Model Training, one step per entry in var.models
+    [
+      for model_key in model_order : {
+        Name = models[model_key].step_name
+        Type = "Training"
+        Arguments = merge(
+          # CheckpointConfig only applies to managed-spot training; including
+          # it as a null key breaks the pipeline-definition JSON parser, so
+          # add the key only when spot is enabled. The prefix is scoped to
+          # the execution so a new run never resumes from an old run's
+          # checkpoints.
+          enable_managed_spot_training ? {
+            CheckpointConfig = {
+              S3Uri = {
+                "Std:Join" = {
+                  On     = "/"
+                  Values = ["s3://${buckets.model_artifacts}/checkpoints/${model_key}", execution_id]
+                }
+              }
+              LocalPath = "/opt/ml/checkpoints"
+            }
+          } : {},
+          # Inside a Pipeline the experiment and trial are managed from the
+          # pipeline execution, so only TrialComponentDisplayName is accepted
+          # here (passing ExperimentName is rejected by the pipeline parser).
+          enable_experiments ? {
+            ExperimentConfig = {
+              TrialComponentDisplayName = models[model_key].step_name
+            }
+          } : {},
+          # SageMaker Debugger built-in rules. Built via list-spread merge
+          # (one-element list when enabled, empty otherwise) because a
+          # `cond ? {nested-list} : {}` ternary fails Terraform's conditional
+          # type unification.
+          merge([
+            for _ in(enable_debugger ? [1] : []) : {
+              DebugHookConfig = {
+                S3OutputPath = "s3://${buckets.model_artifacts}/debug-output/${model_key}/"
+              }
+              DebugRuleConfigurations = [
+                {
+                  RuleConfigurationName = "Overfit"
+                  RuleEvaluatorImage    = debugger_rule_image
+                  RuleParameters        = { rule_to_invoke = "Overfit" }
+                },
+                {
+                  RuleConfigurationName = "LossNotDecreasing"
+                  RuleEvaluatorImage    = debugger_rule_image
+                  RuleParameters        = { rule_to_invoke = "LossNotDecreasing" }
+                }
+              ]
+          }]...),
+          vpc_config == null ? {} : { VpcConfig = vpc_config },
+          {
+            AlgorithmSpecification = {
+              # p- and g-family instance types are GPU and get the GPU
+              # training image; everything else (c5/m5) uses the CPU image.
+              TrainingImage     = can(regex("^ml\\.(p|g)", models[model_key].instance_type)) ? images.tensorflow_gpu : images.tensorflow_cpu
+              TrainingInputMode = training_input_mode
+              MetricDefinitions = [
+                {
+                  Name  = "train_loss"
+                  Regex = "Train Loss: ([0-9\\.]+)"
+                },
+                {
+                  Name  = "train_accuracy"
+                  Regex = "Train Accuracy: ([0-9\\.]+)"
+                },
+                {
+                  Name  = "validation_loss"
+                  Regex = "Validation Loss: ([0-9\\.]+)"
+                },
+                {
+                  Name  = "validation_accuracy"
+                  Regex = "Validation Accuracy: ([0-9\\.]+)"
+                }
+              ]
+            }
+            RoleArn = role_arn
+            # The "weights" channel feeds pre-downloaded ImageNet weights
+            # (scripts/download_pretrained_weights.py) for network-isolation
+            # mode. It is only added when isolation is on: otherwise the
+            # prefix may be empty and CreateTrainingJob fails with "No S3
+            # objects found", and the trainers download the weights instead.
+            InputDataConfig = concat(
+              [
+                {
+                  ChannelName = "training"
+                  DataSource = {
+                    S3DataSource = {
+                      S3DataType = data_config.s3_data_type
+                      S3Uri = {
+                        Get = "Steps.${steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['train-data'].S3Output.S3Uri"
+                      }
+                    }
+                  }
+                  ContentType     = data_config.content_type
+                  CompressionType = data_config.compression_type
+                },
+                # Patient-grouped validation split (SM_CHANNEL_VALIDATION), so
+                # early stopping never sees images of a training patient.
+                {
+                  ChannelName = "validation"
+                  DataSource = {
+                    S3DataSource = {
+                      S3DataType = data_config.s3_data_type
+                      S3Uri = {
+                        Get = "Steps.${steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['validation-data'].S3Output.S3Uri"
+                      }
+                    }
+                  }
+                  ContentType     = data_config.content_type
+                  CompressionType = data_config.compression_type
+                }
+              ],
+              enable_network_isolation ? [
+                {
+                  ChannelName = "weights"
+                  DataSource = {
+                    S3DataSource = {
+                      S3DataType = "S3Prefix"
+                      S3Uri      = "s3://${buckets.scripts}/pretrained-weights/"
+                    }
+                  }
+                }
+              ] : []
+            )
+            OutputDataConfig = {
+              S3OutputPath = "s3://${buckets.model_artifacts}/models/${model_key}/"
+              KmsKeyId     = kms_key_arn
+            }
+            ResourceConfig = merge(
+              {
+                InstanceType   = models[model_key].instance_type
+                InstanceCount  = models[model_key].instance_count
+                VolumeSizeInGB = models[model_key].volume_size
+              },
+              can(regex(local_storage_instance_regex, models[model_key].instance_type)) ? {} : { VolumeKmsKeyId = kms_key_arn },
+              # Warm pools and managed spot are mutually exclusive ("Spot
+              # training job can't retain cluster"), so only request a
+              # keep-alive period when spot is disabled.
+              (training_keep_alive_seconds > 0 && !enable_managed_spot_training) ? {
+                KeepAlivePeriodInSeconds = training_keep_alive_seconds
+              } : {},
+            )
+            StoppingCondition = merge(
+              {
+                MaxRuntimeInSeconds = models[model_key].max_runtime
+              },
+              enable_managed_spot_training ? {
+                MaxWaitTimeInSeconds = models[model_key].max_runtime + spot_max_wait_buffer_seconds
+              } : {},
+            )
+            EnableManagedSpotTraining = enable_managed_spot_training
+            HyperParameters = merge({
+              sagemaker_program          = models[model_key].script_name
+              sagemaker_submit_directory = "s3://${buckets.scripts}/training/${models[model_key].tar_file}"
+            }, models[model_key].hyperparameters)
+            EnableNetworkIsolation = enable_network_isolation
+            Environment = {
+              PROJECT_NAME       = project_name
+              AWS_DEFAULT_REGION = aws_region
+            }
+          }
+        )
+        CacheConfig = {
+          Enabled     = models[model_key].enable_cache
+          ExpireAfter = models[model_key].cache_expiry
+        }
+        DependsOn = [steps.preprocessing.step_name]
+      }
+    ],
+    [
+      # Step 6: Model Evaluation
+      {
+        Name = steps.evaluation.step_name
+        Type = steps.evaluation.step_type
+        Arguments = merge(
+          {
+            ProcessingResources = {
+              ClusterConfig = merge(
+                {
+                  InstanceType   = steps.evaluation.instance_type
+                  InstanceCount  = steps.evaluation.instance_count
+                  VolumeSizeInGB = steps.evaluation.volume_size
+                },
+                can(regex(local_storage_instance_regex, steps.evaluation.instance_type)) ? {} : { VolumeKmsKeyId = kms_key_arn }
+              )
+            }
+            AppSpecification = {
+              ImageUri = images.tensorflow_cpu
+              ContainerEntrypoint = [
+                "python3", script_paths.evaluation_script,
+                "--models-path", processing_paths.input_models,
+                "--data-path", processing_paths.input_test,
+                "--output-path", processing_paths.output
+              ]
+            }
+            ProcessingInputs = concat([
+              {
+                InputName = "code"
+                S3Input = {
+                  S3Uri       = "s3://${buckets.scripts}/evaluation/"
+                  LocalPath   = container_paths.code
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              },
+              {
+                InputName = "test-data"
+                S3Input = {
+                  S3Uri = {
+                    Get = "Steps.${steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['test-data'].S3Output.S3Uri"
+                  }
+                  LocalPath   = processing_paths.input_test
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              },
+              # Threshold tuning reads the validation split so the test split
+              # stays untouched for the clinical gate.
+              {
+                InputName = "validation-data"
+                S3Input = {
+                  S3Uri = {
+                    Get = "Steps.${steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['validation-data'].S3Output.S3Uri"
+                  }
+                  LocalPath   = processing_paths.input_validation
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              }
+              ], [
+              for model_key in model_order : {
+                InputName = "${model_key}-model"
+                S3Input = {
+                  S3Uri = {
+                    Get = "Steps.${models[model_key].step_name}.ModelArtifacts.S3ModelArtifacts"
+                  }
+                  LocalPath   = "${processing_paths.input_models}/${model_key}"
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              }
+            ])
+            ProcessingOutputConfig = {
+              KmsKeyId = kms_key_arn
+              Outputs = [
+                {
+                  OutputName = "evaluation-results"
+                  S3Output = {
+                    S3Uri = {
+                      "Std:Join" = {
+                        On     = "/"
+                        Values = ["s3://${buckets.model_artifacts}/evaluation", execution_id]
+                      }
+                    }
+                    LocalPath    = processing_paths.output
+                    S3UploadMode = data_config.s3_upload_mode
+                  }
+                }
+              ]
+            }
+            RoleArn = role_arn
+            Environment = {
+              PROJECT_NAME       = project_name
+              AWS_DEFAULT_REGION = aws_region
+              MODEL_NAMES        = { Get = "Parameters.ModelNames" }
+            }
+          },
+          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+        )
+        CacheConfig = {
+          Enabled     = steps.evaluation.enable_cache
+          ExpireAfter = steps.evaluation.cache_expiry
+        }
+        DependsOn = [for key in model_order : models[key].step_name]
+      }
+    ],
+    [
+      # Step 7: Ensemble Creation
+      {
+        Name = steps.ensemble.step_name
+        Type = steps.ensemble.step_type
+        Arguments = merge(
+          {
+            ProcessingResources = {
+              ClusterConfig = merge(
+                {
+                  InstanceType   = steps.ensemble.instance_type
+                  InstanceCount  = steps.ensemble.instance_count
+                  VolumeSizeInGB = steps.ensemble.volume_size
+                },
+                can(regex(local_storage_instance_regex, steps.ensemble.instance_type)) ? {} : { VolumeKmsKeyId = kms_key_arn }
+              )
+            }
+            AppSpecification = {
+              ImageUri = images.tensorflow_cpu
+              ContainerEntrypoint = [
+                "python3", script_paths.ensemble_script,
+                "--models-path", processing_paths.input_models,
+                "--evaluation-path", processing_paths.input_eval,
+                "--data-path", processing_paths.input_test,
+                "--output-path", processing_paths.output
+              ]
+            }
+            ProcessingInputs = concat([
+              {
+                InputName = "code"
+                S3Input = {
+                  S3Uri       = "s3://${buckets.scripts}/ensemble/"
+                  LocalPath   = container_paths.code
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              },
+              {
+                InputName = "test-data"
+                S3Input = {
+                  S3Uri = {
+                    Get = "Steps.${steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['test-data'].S3Output.S3Uri"
+                  }
+                  LocalPath   = processing_paths.input_test
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              },
+              {
+                InputName = "validation-data"
+                S3Input = {
+                  S3Uri = {
+                    Get = "Steps.${steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['validation-data'].S3Output.S3Uri"
+                  }
+                  LocalPath   = processing_paths.input_validation
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              },
+              {
+                InputName = "evaluation-results"
+                S3Input = {
+                  S3Uri = {
+                    Get = "Steps.${steps.evaluation.step_name}.ProcessingOutputConfig.Outputs['evaluation-results'].S3Output.S3Uri"
+                  }
+                  LocalPath   = processing_paths.input_eval
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              }
+              ], [
+              for model_key in model_order : {
+                InputName = "${model_key}-model"
+                S3Input = {
+                  S3Uri = {
+                    Get = "Steps.${models[model_key].step_name}.ModelArtifacts.S3ModelArtifacts"
+                  }
+                  LocalPath   = "${processing_paths.input_models}/${model_key}"
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              }
+            ])
+            ProcessingOutputConfig = {
+              KmsKeyId = kms_key_arn
+              Outputs = [
+                {
+                  OutputName = "ensemble-artifacts"
+                  S3Output = {
+                    S3Uri = {
+                      "Std:Join" = {
+                        On     = "/"
+                        Values = ["s3://${buckets.model_artifacts}/ensemble", execution_id]
+                      }
+                    }
+                    LocalPath    = processing_paths.output
+                    S3UploadMode = data_config.s3_upload_mode
+                  }
+                }
+              ]
+            }
+            RoleArn = role_arn
+            Environment = {
+              PROJECT_NAME       = project_name
+              AWS_DEFAULT_REGION = aws_region
+              MODEL_NAMES        = { Get = "Parameters.ModelNames" }
+            }
+          },
+          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+        )
+        # The clinical quality gate reads its metrics from this file.
+        PropertyFiles = [
+          {
+            PropertyFileName = "EnsembleResults"
+            OutputName       = "ensemble-artifacts"
+            FilePath         = "ensemble_results.json"
+          }
+        ]
+        CacheConfig = {
+          Enabled     = steps.ensemble.enable_cache
+          ExpireAfter = steps.ensemble.cache_expiry
+        }
+        DependsOn = [steps.evaluation.step_name]
+      },
+      # Step 8: Fairness check. Runs Fairlearn over the ensemble's own
+      # predictions (ensemble scores and tuned threshold in predictions.json)
+      # and writes bias_metrics.json, which the gate below reads.
+      {
+        Name = steps.bias.step_name
+        Type = steps.bias.step_type
+        Arguments = merge(
+          {
+            ProcessingResources = {
+              ClusterConfig = merge(
+                {
+                  InstanceType   = steps.bias.instance_type
+                  InstanceCount  = steps.bias.instance_count
+                  VolumeSizeInGB = steps.bias.volume_size
+                },
+                can(regex(local_storage_instance_regex, steps.bias.instance_type)) ? {} : { VolumeKmsKeyId = kms_key_arn }
+              )
+            }
+            AppSpecification = {
+              ImageUri = images.tensorflow_cpu
+              # Fairlearn is not in the DLC, so a wrapper installs it before
+              # running the gate (same pattern as run_preprocessing.sh).
+              ContainerEntrypoint = ["/bin/sh", script_paths.bias_runner]
+              ContainerArguments = concat(
+                [
+                  "--ensemble-path", processing_paths.input_ensemble,
+                  "--output-path", processing_paths.output,
+                  "--sensitive-feature", fairness_gate.sensitive_feature,
+                  "--threshold", tostring(fairness_gate.max_disparity)
+                ],
+                allow_not_evaluable ? ["--allow-not-evaluable"] : []
+              )
+            }
+            ProcessingInputs = [
+              {
+                InputName = "code"
+                S3Input = {
+                  S3Uri       = "s3://${buckets.scripts}/bias/"
+                  LocalPath   = container_paths.code
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              },
+              # Only predictions.json, not the ensemble model.tar.gz.
+              {
+                InputName = "ensemble-predictions"
+                S3Input = {
+                  S3Uri = {
+                    "Std:Join" = {
+                      On = "/"
+                      Values = [
+                        { Get = "Steps.${steps.ensemble.step_name}.ProcessingOutputConfig.Outputs['ensemble-artifacts'].S3Output.S3Uri" },
+                        "predictions.json"
+                      ]
+                    }
+                  }
+                  LocalPath   = processing_paths.input_ensemble
+                  S3DataType  = data_config.s3_data_type
+                  S3InputMode = data_config.s3_input_mode
+                }
+              }
+            ]
+            ProcessingOutputConfig = {
+              KmsKeyId = kms_key_arn
+              Outputs = [
+                {
+                  OutputName = "bias-metrics"
+                  S3Output = {
+                    S3Uri = {
+                      "Std:Join" = {
+                        On     = "/"
+                        Values = ["s3://${buckets.model_artifacts}/bias", execution_id]
+                      }
+                    }
+                    LocalPath    = processing_paths.output
+                    S3UploadMode = data_config.s3_upload_mode
+                  }
+                }
+              ]
+            }
+            RoleArn = role_arn
+            Environment = {
+              PROJECT_NAME       = project_name
+              AWS_DEFAULT_REGION = aws_region
+            }
+          },
+          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+        )
+        PropertyFiles = [
+          {
+            PropertyFileName = "BiasMetrics"
+            OutputName       = "bias-metrics"
+            FilePath         = "bias_metrics.json"
+          }
+        ]
+        CacheConfig = {
+          Enabled     = steps.bias.enable_cache
+          ExpireAfter = steps.bias.cache_expiry
+        }
+        DependsOn = [steps.ensemble.step_name]
+      },
+      # Step 9: Clinical quality gate. Register only if the ensemble clears
+      # accuracy, recall, precision and AUC (read from this execution's
+      # ensemble_results.json) and the fairness bound (bias_metrics.json).
+      # Conditions are ANDed.
+      {
+        Name        = "Condition"
+        Type        = "Condition"
+        DisplayName = "Clinical Quality Gate"
+        Arguments = {
+          Conditions = concat(
+            [
+              for metric, threshold in {
+                ensemble_accuracy  = clinical_quality_gate.accuracy
+                ensemble_recall    = clinical_quality_gate.recall
+                ensemble_precision = clinical_quality_gate.precision
+                ensemble_auc       = clinical_quality_gate.auc_roc
+                } : {
+                Type = "GreaterThanOrEqualTo"
+                LeftValue = {
+                  "Std:JsonGet" = {
+                    PropertyFile = { Get = "Steps.${steps.ensemble.step_name}.PropertyFiles.EnsembleResults" }
+                    Path         = metric
+                  }
+                }
+                RightValue = threshold
+              }
+            ],
+            [
+              # max_disparity is the larger of demographic-parity and
+              # equalized-odds difference (scripts/bias/compute_bias.py).
+              {
+                Type = "LessThanOrEqualTo"
+                LeftValue = {
+                  "Std:JsonGet" = {
+                    PropertyFile = { Get = "Steps.${steps.bias.step_name}.PropertyFiles.BiasMetrics" }
+                    Path         = "max_disparity"
+                  }
+                }
+                RightValue = fairness_gate.max_disparity
+              }
+            ]
+          )
+          IfSteps = [{
+            Name = steps.registry.step_name
+            Type = steps.registry.step_type
+            Arguments = {
+              ModelPackageGroupName = model_package_group_name
+              # Register as PendingManualApproval so a clinical review board
+              # (not the pipeline) decides what reaches an endpoint. The
+              # auto-deploy Lambda fires on the Approved state change, so the
+              # human approval is the deploy trigger.
+              ModelApprovalStatus     = "PendingManualApproval"
+              ModelPackageDescription = "Medical image classification ensemble model"
+
+              # Audit metadata: why this version was trained, on which data
+              # and code, the thresholds it cleared, and the execution whose
+              # S3 prefixes hold its artifacts.
+              CustomerMetadataProperties = {
+                retraining_reason     = { Get = "Parameters.RetrainingReason" }
+                data_version          = { Get = "Parameters.DatasetVersion" }
+                code_commit           = { Get = "Parameters.CodeCommitSha" }
+                pipeline_execution_id = execution_id
+                accuracy_threshold    = tostring(clinical_quality_gate.accuracy)
+                recall_threshold      = tostring(clinical_quality_gate.recall)
+                precision_threshold   = tostring(clinical_quality_gate.precision)
+                auc_threshold         = tostring(clinical_quality_gate.auc_roc)
+                project_name          = project_name
+              }
+
+              InferenceSpecification = {
+                Containers = [
+                  {
+                    Image = images.tensorflow_inference
+                    # This execution's ensemble, so approving an older
+                    # package version deploys that version's weights.
+                    ModelDataUrl = {
+                      "Std:Join" = {
+                        On = "/"
+                        Values = [
+                          { Get = "Steps.${steps.ensemble.step_name}.ProcessingOutputConfig.Outputs['ensemble-artifacts'].S3Output.S3Uri" },
+                          "model.tar.gz"
+                        ]
+                      }
+                    }
+                    Environment = {
+                      SAGEMAKER_PROGRAM          = "inference.py"
+                      SAGEMAKER_SUBMIT_DIRECTORY = "/opt/ml/code"
+                    }
+                  }
+                ]
+                SupportedContentTypes                   = ["application/json", "image/jpeg", "image/png"]
+                SupportedResponseMIMETypes              = ["application/json"]
+                SupportedRealtimeInferenceInstanceTypes = ["ml.m5.large", "ml.m5.xlarge", "ml.m5.2xlarge"]
+                SupportedTransformInstanceTypes         = ["ml.m5.large", "ml.m5.xlarge"]
+              }
+
+              ModelMetrics = {
+                ModelQuality = {
+                  Statistics = {
+                    ContentType = "application/json"
+                    S3Uri       = { "Std:Join" = { On = "/", Values = [evaluation_output_uri, "model_quality_statistics.json"] } }
+                  }
+                  Constraints = {
+                    ContentType = "application/json"
+                    S3Uri       = { "Std:Join" = { On = "/", Values = [evaluation_output_uri, "model_quality_constraints.json"] } }
+                  }
+                }
+
+                ModelDataQuality = {
+                  Statistics = {
+                    ContentType = "application/json"
+                    S3Uri       = { "Std:Join" = { On = "/", Values = [evaluation_output_uri, "data_quality_statistics.json"] } }
+                  }
+                  Constraints = {
+                    ContentType = "application/json"
+                    S3Uri       = { "Std:Join" = { On = "/", Values = [evaluation_output_uri, "data_quality_constraints.json"] } }
+                  }
+                }
+
+                Bias = {
+                  # The report that gated this version: the fairness check
+                  # over the ensemble's predictions.
+                  Report = {
+                    ContentType = "application/json"
+                    S3Uri       = { "Std:Join" = { On = "/", Values = [bias_output_uri, "bias_metrics.json"] } }
+                  }
+                  PreTrainingReport = {
+                    ContentType = "application/json"
+                    S3Uri       = { "Std:Join" = { On = "/", Values = [evaluation_output_uri, "data_bias_report.json"] } }
+                  }
+                }
+
+                Explainability = {
+                  Report = {
+                    ContentType = "application/json"
+                    S3Uri       = { "Std:Join" = { On = "/", Values = [evaluation_output_uri, "explainability_report.json"] } }
+                  }
+                }
+              }
+            }
+            DependsOn = [steps.ensemble.step_name]
+          }]
+          ElseSteps = [
+            {
+              Name        = "Fail"
+              Type        = "Fail"
+              DisplayName = "Fail Clinical Quality Gate"
+              Arguments = {
+                ErrorMessage = "Ensemble did not meet clinical quality gate (accuracy/recall/precision/AUC). See ensemble_results.json clinical_quality_gate for the failing metric and gap."
+              }
+            }
+          ]
+        }
+        # The property-file reads already imply both edges; they are listed
+        # so the graph reads the same in the console.
+        DependsOn = [
+          steps.ensemble.step_name,
+          steps.bias.step_name,
+        ]
+      }
+    ]
+  )
+}) ~}

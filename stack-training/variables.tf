@@ -2,13 +2,29 @@
 # SPDX-License-Identifier: MIT-0
 
 variable "project_name" {
-  description = "Name of the project"
+  description = "Name of the project, used as the prefix of every resource name. Lowercase letters, digits and hyphens. Together with environment it is capped so the longest derived name (the inference-results bucket) stays within the 63-character S3 limit."
   type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$", var.project_name))
+    error_message = "project_name must be 2 to 32 characters of lowercase letters, digits and hyphens, and must start and end with a letter or digit."
+  }
+
+  validation {
+    # "<project>-<environment>-inference-results-<8 hex>" must fit in 63.
+    condition     = length(var.project_name) + length(var.environment) <= 35
+    error_message = "project_name and environment together must be at most 35 characters so derived bucket names stay within 63 characters."
+  }
 }
 
 variable "environment" {
   description = "Environment name"
   type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9-]+$", var.environment))
+    error_message = "environment must be lowercase letters, digits and hyphens (it is part of S3 bucket names)."
+  }
 }
 
 variable "aws_region" {
@@ -16,6 +32,11 @@ variable "aws_region" {
   type        = string
 }
 
+variable "permissions_boundary_arn" {
+  description = "ARN of the permissions boundary attached to every IAM role this stack creates (stack-backend-setup output workload_boundary_arn). Required when CI/CD CodeBuild applies the stack; null leaves the roles unbounded."
+  type        = string
+  default     = null
+}
 
 ################################################################################
 # Pipeline Steps
@@ -165,8 +186,9 @@ variable "models" {
 ################################################################################
 
 # Managed Spot Training and Warm Pools shared across all training steps.
-# Spot can reduce training cost by 50-90% (see docs/sagemaker-modernization-analysis.md §4.1).
-# Warm Pools keep provisioned clusters alive between back-to-back runs to skip ~3-5 min provisioning.
+# Spot can reduce training cost by up to 90%. Warm Pools keep provisioned
+# clusters alive between back-to-back runs to skip about 3-5 minutes of
+# provisioning.
 variable "enable_managed_spot_training" {
   description = "Use EC2 Spot for all training steps. Requires checkpoint support in trainers."
   type        = bool
@@ -203,8 +225,11 @@ variable "bucket_defaults" {
     enable_versioning   = bool
     block_public_access = bool
   })
+  # force_destroy stays false so terraform destroy cannot delete training
+  # data, model artifacts or audit logs. Set it to true for a throwaway
+  # environment you want to tear down in one step.
   default = {
-    force_destroy       = true
+    force_destroy       = false
     enable_versioning   = true
     block_public_access = true
   }
@@ -218,7 +243,6 @@ variable "bucket_defaults" {
 variable "sagemaker_images" {
   description = "SageMaker container image configurations"
   type = object({
-    sklearn_tag              = string
     tensorflow_gpu_tag       = string
     tensorflow_cpu_tag       = string
     tensorflow_inference_tag = string
@@ -230,7 +254,6 @@ variable "sagemaker_images" {
     # modules/patched-inference-image) layers additional CVE fixes on top
     # of the inference image for endpoint hosts.
     # Catalog: https://aws.github.io/deep-learning-containers/
-    sklearn_tag              = "1.4-2-cpu-py3"
     tensorflow_gpu_tag       = "2.19.0-gpu-py312-cu125-ubuntu22.04-sagemaker"
     tensorflow_cpu_tag       = "2.19.0-cpu-py312-ubuntu22.04-sagemaker"
     tensorflow_inference_tag = "2.19.0-cpu-py312-ubuntu22.04-sagemaker"
@@ -245,6 +268,12 @@ variable "enable_auto_trigger" {
   description = "Enable auto-trigger of pipeline on new data upload"
   type        = bool
   default     = true
+}
+
+variable "auto_trigger_marker_key" {
+  description = "Object key prefix in the raw-data bucket whose creation starts the pipeline. scripts/data_uploader.sh writes this marker after a batch upload completes."
+  type        = string
+  default     = "medical_image_data/.batch_complete"
 }
 
 ################################################################################
@@ -269,7 +298,7 @@ variable "clinical_quality_gate" {
 }
 
 variable "fairness_gate" {
-  description = "Fairness gate the ensemble must clear before registration (Part 4). max_disparity bounds the larger of demographic-parity difference and equal-opportunity difference, computed by scripts/bias/compute_bias.py with Fairlearn. Must mirror DEFAULT_THRESHOLD in that script. sensitive_feature is reported in the bias report; the public datasets used here carry no demographic metadata, so magnification is an honest subgroup proxy - supply a real attribute for clinical use."
+  description = "Fairness gate the ensemble must clear before registration (Part 4). max_disparity bounds the larger of demographic-parity difference and equalized-odds difference, computed by scripts/bias/compute_bias.py with Fairlearn. Must mirror DEFAULT_THRESHOLD in that script. sensitive_feature is reported in the bias report; the public datasets used here carry no demographic metadata, so magnification is an honest subgroup proxy - supply a real attribute for clinical use."
   type = object({
     max_disparity     = number
     sensitive_feature = string
@@ -280,6 +309,12 @@ variable "fairness_gate" {
   }
 }
 
+variable "allow_not_evaluable" {
+  description = "Let the fairness gate pass when the test split has fewer than two subgroups of fairness_gate.sensitive_feature, so disparity cannot be measured (status not_evaluable). Default false fails the pipeline instead; set true only for small demo datasets."
+  type        = bool
+  default     = false
+}
+
 variable "preprocessing_target_size" {
   description = "Target square resolution (pixels) the preprocessing job resizes every image to before training. 512 preserves fine diagnostic features like microcalcifications; the trainers downsample to their own input_size from there."
   type        = number
@@ -287,7 +322,7 @@ variable "preprocessing_target_size" {
 }
 
 variable "retraining_reason" {
-  description = "Reason for retraining (manual, data_upload, drift_detected)"
+  description = "Default of the RetrainingReason pipeline parameter (manual, data_upload, drift_detected), recorded on the registered model package. The upload trigger passes data_upload and the drift alarm passes drift_detected per execution."
   type        = string
   default     = "manual"
 }
@@ -297,23 +332,40 @@ variable "retraining_reason" {
 ################################################################################
 
 variable "enable_network_isolation" {
-  description = "Enable network isolation for SageMaker training and processing jobs"
+  description = "Run the training jobs with network isolation (no outbound network access from the training container). The trainers then read ImageNet weights from s3://<scripts-bucket>/pretrained-weights/, so run scripts/download_pretrained_weights.py once before the first pipeline execution. Processing jobs are not isolated because they install Python dependencies at start-up."
   type        = bool
-  default     = false
+  default     = true
+}
+
+variable "vpc_config" {
+  description = "Optional VPC for the training and processing jobs. Null runs them in the SageMaker service network. The subnets need a route to Amazon S3 (gateway endpoint), SageMaker API, CloudWatch Logs and ECR (interface endpoints or NAT); processing jobs also pip install packages, which needs a route to PyPI or a mirror."
+  type = object({
+    subnet_ids         = list(string)
+    security_group_ids = list(string)
+  })
+  default = null
+
+  validation {
+    condition     = var.vpc_config == null || (length(try(var.vpc_config.subnet_ids, [])) >= 1 && length(try(var.vpc_config.subnet_ids, [])) <= 16 && length(try(var.vpc_config.security_group_ids, [])) >= 1 && length(try(var.vpc_config.security_group_ids, [])) <= 5)
+    error_message = "vpc_config needs 1 to 16 subnet_ids and 1 to 5 security_group_ids."
+  }
 }
 
 ################################################################################
 # Audit & Compliance
 ################################################################################
 
+# Off by default: most accounts are already covered by an organization trail,
+# and a second multi-region trail duplicates cost. Enable it only in an
+# account that no organization trail covers.
 variable "enable_cloudtrail" {
-  description = "Create an account-wide CloudTrail with log-file integrity validation. Required for medical ML audit trails."
+  description = "Create a multi-region CloudTrail trail with log-file integrity validation for this account. Leave false when an organization trail already records this account's API activity."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "enable_cloudtrail_sns" {
-  description = "Attach an SNS delivery-notification topic to the CloudTrail. Off by default: CloudTrail cannot publish to a topic encrypted with the AWS-managed alias/aws/sns key, so enabling this requires a CMK whose policy grants the CloudTrail service principal. The trail and S3/CloudWatch delivery work without it."
+  description = "Attach an SNS delivery-notification topic to the CloudTrail. Off by default. The topic is encrypted with the project CMK, whose key policy then grants the CloudTrail service principal (CloudTrail cannot publish to a topic on the AWS-managed alias/aws/sns key). The trail and S3/CloudWatch delivery work without it."
   type        = bool
   default     = false
 }
@@ -339,6 +391,17 @@ variable "monthly_budget_usd" {
   }
 }
 
+variable "budget_start_date" {
+  description = "Start of the AWS Budgets period, in the format YYYY-MM-DD_HH:MM (UTC)."
+  type        = string
+  default     = "2026-01-01_00:00"
+
+  validation {
+    condition     = can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}:[0-9]{2}$", var.budget_start_date))
+    error_message = "budget_start_date must look like 2026-01-01_00:00."
+  }
+}
+
 variable "budget_alert_emails" {
   description = "Email addresses that receive AWS Budgets alerts at 80% actual and 100% forecasted thresholds."
   type        = list(string)
@@ -358,7 +421,7 @@ variable "enable_sbom_bucket" {
 variable "sbom_retention_days" {
   description = "How long SBOM JSON files are kept before S3 expires them."
   type        = number
-  default     = 730 # 2 years - matches the retention most SCA tools default to
+  default     = 730
 
   validation {
     condition     = var.sbom_retention_days >= 30
@@ -377,13 +440,13 @@ variable "min_images_per_class" {
 ################################################################################
 
 variable "dataset_version" {
-  description = "Dataset version identifier (e.g. DVC hash dataset-v2.3-sha256:...) recorded on the registered model package for audit lineage. Pass from CI; defaults to 'unversioned'."
+  description = "Default of the DatasetVersion pipeline parameter (for example a DVC hash such as dataset-v2.3-sha256:...), recorded on the registered model package for audit lineage. Override per execution from CI."
   type        = string
   default     = "unversioned"
 }
 
 variable "code_commit_sha" {
-  description = "Git commit SHA that produced this model, recorded on the model package for audit lineage. Pass from CI; defaults to 'local'."
+  description = "Default of the CodeCommitSha pipeline parameter: the Git commit that produced the model, recorded on the model package for audit lineage. Override per execution from CI."
   type        = string
   default     = "local"
 }
@@ -405,7 +468,7 @@ variable "model_card_risk_rating" {
 }
 
 variable "enable_debugger" {
-  description = "Attach SageMaker Debugger built-in rules (Overfit, LossNotDecreasing) to the training steps (Part 2). Off by default; managed MLflow plus CloudWatch covers the same need."
+  description = "Attach SageMaker Debugger built-in rules (Overfit, LossNotDecreasing) to the training steps (Part 2). Off by default; the CloudWatch training metrics (and MLflow when enable_mlflow = true) cover the same need."
   type        = bool
   default     = false
 }
@@ -414,6 +477,12 @@ variable "debugger_rule_image" {
   description = "Region-specific SageMaker Debugger rule-evaluator image. us-east-1 default; see https://docs.aws.amazon.com/sagemaker/latest/dg/debugger-docker-images-rules.html"
   type        = string
   default     = "503895931360.dkr.ecr.us-east-1.amazonaws.com/sagemaker-debugger-rules:latest"
+}
+
+variable "enable_mlflow" {
+  description = "Create a managed SageMaker MLflow tracking server (Small) for experiment tracking. Off by default because it is billed for every hour it runs."
+  type        = bool
+  default     = false
 }
 
 variable "enable_experiments" {

@@ -1,10 +1,13 @@
-# GitLab CI - security scanning for the Breast Cancer MLOps project.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 #
-# Mirrors the kinds of issues found in the manual security audit so they are
-# caught automatically on every push / merge request:
-#   - SAST            → Python code flaws (semgrep): zip-slip, injection, etc.
-#   - IaC scanning    → Terraform misconfig (KMS, public S3, open API GW, IAM)
-#   - Secret Detection→ committed AWS keys, tokens, private keys
+# GitLab CI for teams that mirror this sample into a GitLab project. It does
+# not run on GitHub; there, .github/workflows/ci.yml runs the same checks.
+#
+# Security scanning on every push and merge request:
+#   - SAST             - Python code flaws (semgrep): zip-slip, injection, etc.
+#   - IaC scanning     - Terraform misconfiguration (KMS, public S3, open API GW, IAM)
+#   - Secret Detection - committed AWS keys, tokens, private keys
 #
 # These stages run the upstream GitLab analyzers; results appear in the MR
 # "Security" widget and the project Vulnerability Report. Deployment itself
@@ -24,7 +27,7 @@ ruff:
   image: python:3.13-slim
   before_script:
     - pip install --no-cache-dir uv==0.9.9
-    - uv pip install --system ruff
+    - uv pip install --system ruff==0.16.9
   script:
     - ruff check .
     - ruff format --check .
@@ -46,13 +49,13 @@ variables:
   # keeps the pipeline fast and avoids spinning up analyzers for languages the
   # project doesn't use.
   SAST_EXCLUDED_ANALYZERS: ""
-  SECRET_DETECTION_HISTORIC_SCAN: "false"
+  SECRET_DETECTION_HISTORIC_SCAN: "false" # pragma: allowlist secret - a CI setting name, not a secret
   # Scan the whole tree but skip vendored Terraform provider/module caches and
   # local virtualenvs - those are not our code.
   SAST_EXCLUDED_PATHS: ".terraform, venv, env, .ruff_cache, data, models"
 
 # Re-map the included jobs into the `scan` stage so the pipeline reads
-# test → scan top to bottom.
+# test, then scan, top to bottom.
 sast:
   stage: scan
 

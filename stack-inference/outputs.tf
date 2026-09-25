@@ -6,6 +6,27 @@ output "api_gateway_url" {
   value       = module.api_gateway.invoke_url
 }
 
+output "api_key_id" {
+  description = "ID of the API key the frontend sends. Read the value with: terraform output -raw api_key_value"
+  value       = module.api_gateway.api_key_id
+}
+
+output "api_key_value" {
+  description = "Value of the API key for the x-api-key header (sensitive)"
+  value       = module.api_gateway.api_key_value
+  sensitive   = true
+}
+
+output "api_web_acl_arn" {
+  description = "ARN of the WAF web ACL on the API stage"
+  value       = module.api_gateway.web_acl_arn
+}
+
+output "serving_image_uri" {
+  description = "Patched inference image, pinned by digest, used by the endpoint and the auto-deploy Lambda"
+  value       = module.patched_inference_image.image_uri
+}
+
 ################################################################################
 # S3
 ################################################################################

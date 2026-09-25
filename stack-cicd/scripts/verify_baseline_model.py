@@ -7,7 +7,9 @@ Verification Script for Baseline Model Creation
 
 This script verifies that:
 1. The baseline model creation script runs successfully
-2. Model is registered in Model Registry with "Approved" status
+2. The group has an Approved model (the placeholder baseline counts once a
+   person has approved it); a still-pending placeholder is reported with the
+   command that approves it
 3. Model artifacts are uploaded to S3
 
 This is used for checkpoint verification in the implementation plan.
@@ -56,10 +58,24 @@ def verify_model_registry(model_package_group_name: str) -> dict | None:
         model_packages = response.get("ModelPackageSummaryList", [])
 
         if not model_packages:
-            logger.error("❌ No approved models found in Model Registry")
+            logger.error("No approved models found in Model Registry")
+            pending = sagemaker_client.list_model_packages(
+                ModelPackageGroupName=model_package_group_name,
+                ModelApprovalStatus="PendingManualApproval",
+                SortBy="CreationTime",
+                SortOrder="Descending",
+                MaxResults=1,
+            ).get("ModelPackageSummaryList", [])
+            if pending:
+                arn = pending[0]["ModelPackageArn"]
+                logger.error(f"Pending model awaiting approval: {arn}")
+                logger.error(
+                    f"Approve it with: aws sagemaker update-model-package --model-package-arn "
+                    f"{arn} --model-approval-status Approved --profile <profile>"
+                )
             return None
 
-        logger.info(f"✅ Found {len(model_packages)} approved model(s)")
+        logger.info(f"Found {len(model_packages)} approved model(s)")
 
         # Get details of the latest approved model
         latest_model = model_packages[0]
@@ -70,22 +86,19 @@ def verify_model_registry(model_package_group_name: str) -> dict | None:
         # Describe the model package to get full details
         model_details = sagemaker_client.describe_model_package(ModelPackageName=model_package_arn)
 
-        # Check if it's a baseline model
-        tags_response = sagemaker_client.list_tags(ResourceArn=model_package_arn)
-        tags = {tag["Key"]: tag["Value"] for tag in tags_response.get("Tags", [])}
-
+        # The placeholder baseline is marked in CustomerMetadataProperties
+        # (packages in a group cannot carry their own tags).
+        metadata = model_details.get("CustomerMetadataProperties", {})
         logger.info(f"Model approval status: {model_details['ModelApprovalStatus']}")
-        logger.info(f"Model tags: {tags}")
-
-        if tags.get("Type") == "Baseline":
-            logger.info("✅ Model is tagged as a baseline model")
+        if metadata.get("ModelRole") == "placeholder-baseline":
+            logger.warning("Latest approved model is the placeholder baseline, not a medical model")
         else:
-            logger.warning("⚠️  Model is not tagged as a baseline model (may be a real model)")
+            logger.info("Latest approved model is a pipeline-trained model")
 
         return {
             "arn": model_package_arn,
             "approval_status": model_details["ModelApprovalStatus"],
-            "tags": tags,
+            "model_role": metadata.get("ModelRole", "pipeline"),
             "model_data_url": model_details["InferenceSpecification"]["Containers"][0].get(
                 "ModelDataUrl"
             ),
@@ -93,10 +106,10 @@ def verify_model_registry(model_package_group_name: str) -> dict | None:
         }
 
     except sagemaker_client.exceptions.ResourceNotFound:
-        logger.error(f"❌ Model package group '{model_package_group_name}' not found")
+        logger.error(f"Model package group '{model_package_group_name}' not found")
         return None
     except Exception as e:
-        logger.error(f"❌ Failed to verify Model Registry: {e}", exc_info=True)
+        logger.error(f"Failed to verify Model Registry: {e}", exc_info=True)
         return None
 
 
@@ -115,7 +128,7 @@ def verify_s3_artifacts(model_data_url: str) -> bool:
 
         # Parse S3 URI
         if not model_data_url.startswith("s3://"):
-            logger.error(f"❌ Invalid S3 URI: {model_data_url}")
+            logger.error(f"Invalid S3 URI: {model_data_url}")
             return False
 
         s3_path = model_data_url[5:]  # Remove 's3://'
@@ -127,20 +140,20 @@ def verify_s3_artifacts(model_data_url: str) -> bool:
         # Check if object exists
         response = s3_client.head_object(Bucket=bucket, Key=key)
 
-        logger.info("✅ Model artifacts found in S3")
+        logger.info("Model artifacts found in S3")
         logger.info(f"Object size: {response['ContentLength']} bytes")
         logger.info(f"Last modified: {response['LastModified']}")
 
         return True
 
     except s3_client.exceptions.NoSuchKey:
-        logger.error(f"❌ Model artifacts not found in S3: {model_data_url}")
+        logger.error(f"Model artifacts not found in S3: {model_data_url}")
         return False
     except s3_client.exceptions.NoSuchBucket:
-        logger.error(f"❌ S3 bucket not found: {bucket}")
+        logger.error(f"S3 bucket not found: {bucket}")
         return False
     except Exception as e:
-        logger.error(f"❌ Failed to verify S3 artifacts: {e}", exc_info=True)
+        logger.error(f"Failed to verify S3 artifacts: {e}", exc_info=True)
         return False
 
 
@@ -183,29 +196,29 @@ def main():
         model_details = verify_model_registry(args.model_package_group_name)
 
         if not model_details:
-            logger.error("\n❌ VERIFICATION FAILED: No approved model in Model Registry")
+            logger.error("\nVERIFICATION FAILED: No approved model in Model Registry")
             sys.exit(1)
 
         # Verification 2: Check S3 artifacts
         logger.info("\n[2/2] Verifying S3 artifacts...")
         if not model_details.get("model_data_url"):
-            logger.error("❌ VERIFICATION FAILED: Model data URL not found")
+            logger.error("VERIFICATION FAILED: Model data URL not found")
             sys.exit(1)
 
         s3_verified = verify_s3_artifacts(model_details["model_data_url"])
 
         if not s3_verified:
-            logger.error("\n❌ VERIFICATION FAILED: Model artifacts not found in S3")
+            logger.error("\nVERIFICATION FAILED: Model artifacts not found in S3")
             sys.exit(1)
 
         # All verifications passed
         logger.info("\n" + "=" * 80)
-        logger.info("✅ ALL VERIFICATIONS PASSED")
+        logger.info("ALL VERIFICATIONS PASSED")
         logger.info("=" * 80)
         logger.info("\nSummary:")
         logger.info(f"  Model ARN: {model_details['arn']}")
         logger.info(f"  Approval Status: {model_details['approval_status']}")
-        logger.info(f"  Model Type: {model_details['tags'].get('Type', 'Unknown')}")
+        logger.info(f"  Model Role: {model_details['model_role']}")
         logger.info(f"  S3 Location: {model_details['model_data_url']}")
         logger.info(f"  Created: {model_details['creation_time']}")
         logger.info("=" * 80)
@@ -216,7 +229,7 @@ def main():
         logger.warning("\nVerification interrupted by user")
         sys.exit(1)
     except Exception as e:
-        logger.error(f"\n❌ Verification failed: {e}", exc_info=True)
+        logger.error(f"\nVerification failed: {e}", exc_info=True)
         sys.exit(1)
 
 

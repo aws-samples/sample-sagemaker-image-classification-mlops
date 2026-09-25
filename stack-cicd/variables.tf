@@ -20,19 +20,59 @@ variable "aws_region" {
 }
 
 ################################################################################
+# Terraform state backend (from stack-backend-setup outputs)
+################################################################################
+
+variable "state_bucket_name" {
+  description = "Name of the Terraform state bucket (stack-backend-setup output state_bucket_id). CodeBuild uses it to initialise the training and inference backends."
+  type        = string
+
+  validation {
+    condition     = var.state_bucket_name != "" && var.state_bucket_name != "your-project-tfstate-1a2b3c4d"
+    error_message = "Set state_bucket_name to the stack-backend-setup output state_bucket_id."
+  }
+}
+
+variable "state_bucket_region" {
+  description = "Region of the state bucket. If empty, aws_region is used."
+  type        = string
+  default     = ""
+}
+
+variable "state_kms_key_alias" {
+  description = "Alias of the state encryption KMS key, including the alias/ prefix (stack-backend-setup output kms_key_alias). If empty, alias/<project_name>-terraform-state is used."
+  type        = string
+  default     = ""
+}
+
+variable "workload_boundary_name" {
+  description = "Name of the permissions boundary policy created by stack-backend-setup. If empty, <project_name>-workload-boundary is used."
+  type        = string
+  default     = ""
+}
+
+################################################################################
 # GitHub
 ################################################################################
 
 variable "github_owner" {
-  description = "GitHub repository owner"
+  description = "GitHub organization or user that owns your copy of this repository"
   type        = string
-  default     = "xsagarx-aws"
+
+  validation {
+    condition     = var.github_owner != "" && var.github_owner != "your-github-org"
+    error_message = "Set github_owner to the GitHub organization or user that owns your fork."
+  }
 }
 
 variable "github_repo" {
-  description = "GitHub repository name"
+  description = "Name of your copy of this repository on GitHub"
   type        = string
-  default     = "Medical_Image_Classification"
+
+  validation {
+    condition     = var.github_repo != "" && var.github_repo != "your-repo"
+    error_message = "Set github_repo to the name of your fork."
+  }
 }
 
 variable "github_branch" {
@@ -46,9 +86,9 @@ variable "github_branch" {
 ################################################################################
 
 variable "model_package_group_name" {
-  description = "Name of the SageMaker Model Package Group"
+  description = "Name of the SageMaker Model Package Group (stack-training output model_package_group_name). If empty, <project_name>-model-package-group is used."
   type        = string
-  default     = "medical-image-classification-model-package-group"
+  default     = ""
 }
 
 ################################################################################

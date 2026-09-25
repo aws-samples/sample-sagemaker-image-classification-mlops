@@ -122,10 +122,10 @@ TRAINING_PARAMS = {
 
 # Data augmentation parameters. Medical-safe values from the blog: each one maps
 # to a real-world imaging variation and must preserve diagnostic features.
-#   rotation_range=15      - slight patient-positioning variation (beyond 15° is
+#   rotation_range=15      - slight patient-positioning variation (beyond 15 degrees is
 #                            clinically unrealistic)
 #   width/height_shift=0.05 - minor framing differences
-#   brightness=(0.8, 1.2)  - ±20% scanner-calibration exposure variation
+#   brightness=(0.8, 1.2)  - +/-20% scanner-calibration exposure variation
 #   horizontal_flip=True   - bilateral anatomy (left breast mirrors right)
 #   vertical_flip omitted  - vertically inverted images don't occur in practice
 AUGMENTATION_PARAMS = {

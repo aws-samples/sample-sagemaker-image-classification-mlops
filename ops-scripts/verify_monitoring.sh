@@ -7,7 +7,7 @@
 
 set -e
 
-echo "🔍 Verifying Monitoring Setup..."
+echo "Verifying monitoring setup..."
 
 # Colors for output
 RED='\033[0;31m'
@@ -17,10 +17,10 @@ NC='\033[0m' # No Color
 
 # Function to print status
 print_status() {
-    if [ $1 -eq 0 ]; then
-        echo -e "${GREEN}✅ $2${NC}"
+    if [ "$1" -eq 0 ]; then
+        echo -e "${GREEN}OK   $2${NC}"
     else
-        echo -e "${RED}❌ $2${NC}"
+        echo -e "${RED}FAIL $2${NC}"
     fi
 }
 
@@ -79,7 +79,7 @@ if [ -d "../stack-inference" ]; then
 fi
 
 echo ""
-echo -e "${YELLOW}📊 Monitoring Verification Complete${NC}"
+echo -e "${YELLOW}Monitoring verification complete${NC}"
 echo ""
 echo "To view monitoring dashboards:"
 echo "1. Go to AWS CloudWatch Console"

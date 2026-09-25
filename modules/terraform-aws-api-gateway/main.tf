@@ -1,6 +1,17 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+locals {
+  use_cognito = var.authorization_type == "COGNITO_USER_POOLS"
+
+  # An API key only works through a usage plan attached to the stage.
+  create_usage_plan = var.create_usage_plan || var.require_api_key
+
+  lambda_invoke_uri = "arn:${data.aws_partition.current.partition}:apigateway:${data.aws_region.current.region}:lambda:path/2015-03-31/functions/${var.lambda_function_arn}/invocations"
+
+  cors_origin_header = "'${var.cors_allowed_origin}'"
+}
+
 resource "aws_api_gateway_rest_api" "this" {
   name = var.api_name
 
@@ -74,12 +85,24 @@ resource "aws_api_gateway_model" "predict_request" {
   })
 }
 
-# POST /predict
-resource "aws_api_gateway_method" "predict_post" {
+resource "aws_api_gateway_authorizer" "cognito" {
+  count = local.use_cognito ? 1 : 0
+
+  name          = "${var.api_name}-cognito"
   rest_api_id   = aws_api_gateway_rest_api.this.id
-  resource_id   = aws_api_gateway_resource.predict.id
-  http_method   = "POST"
-  authorization = "NONE"
+  type          = "COGNITO_USER_POOLS"
+  provider_arns = var.cognito_user_pool_arns
+}
+
+resource "aws_api_gateway_method" "predict_post" {
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.predict.id
+  # KICS: API key, usage plan and WAF front /predict; authorization_type can be AWS_IAM or COGNITO_USER_POOLS (SECURITY.md)
+  # kics-scan ignore-line
+  http_method      = "POST"
+  authorization    = var.authorization_type
+  authorizer_id    = local.use_cognito ? aws_api_gateway_authorizer.cognito[0].id : null
+  api_key_required = var.require_api_key
 
   request_validator_id = aws_api_gateway_request_validator.body.id
   request_models = {
@@ -94,10 +117,9 @@ resource "aws_api_gateway_integration" "predict_integration" {
 
   integration_http_method = "POST"
   type                    = "AWS_PROXY"
-  uri                     = "arn:aws:apigateway:${data.aws_region.current.id}:lambda:path/2015-03-31/functions/${var.lambda_function_arn}/invocations"
+  uri                     = local.lambda_invoke_uri
 }
 
-# Add CORS response for POST method
 resource "aws_api_gateway_method_response" "predict_post_response" {
   rest_api_id = aws_api_gateway_rest_api.this.id
   resource_id = aws_api_gateway_resource.predict.id
@@ -116,7 +138,7 @@ resource "aws_api_gateway_integration_response" "predict_post_integration_respon
   status_code = aws_api_gateway_method_response.predict_post_response.status_code
 
   response_parameters = {
-    "method.response.header.Access-Control-Allow-Origin" = "'*'"
+    "method.response.header.Access-Control-Allow-Origin" = local.cors_origin_header
   }
 
   depends_on = [aws_api_gateway_integration.predict_integration]
@@ -126,12 +148,15 @@ resource "aws_api_gateway_integration_response" "predict_post_integration_respon
 # GET /results/{id}
 ################################################################################
 
-# GET /results/{id}
 resource "aws_api_gateway_method" "results_get" {
-  rest_api_id   = aws_api_gateway_rest_api.this.id
-  resource_id   = aws_api_gateway_resource.results_id.id
-  http_method   = "GET"
-  authorization = "NONE"
+  rest_api_id = aws_api_gateway_rest_api.this.id
+  resource_id = aws_api_gateway_resource.results_id.id
+  # KICS: API key, usage plan and WAF front /results; authorization_type can be AWS_IAM or COGNITO_USER_POOLS (SECURITY.md)
+  # kics-scan ignore-line
+  http_method      = "GET"
+  authorization    = var.authorization_type
+  authorizer_id    = local.use_cognito ? aws_api_gateway_authorizer.cognito[0].id : null
+  api_key_required = var.require_api_key
 
   # Validate the `id` path parameter is present (API GW rejects the
   # request before invoking Lambda if missing).
@@ -148,21 +173,20 @@ resource "aws_api_gateway_integration" "results_integration" {
 
   integration_http_method = "POST"
   type                    = "AWS_PROXY"
-  uri                     = "arn:aws:apigateway:${data.aws_region.current.id}:lambda:path/2015-03-31/functions/${var.lambda_function_arn}/invocations"
+  uri                     = local.lambda_invoke_uri
 }
 
 ################################################################################
 # CORS
 ################################################################################
 
-# CORS for predict
+# Preflight stays unauthenticated: browsers never send credentials or API keys
+# on OPTIONS.
 resource "aws_api_gateway_method" "predict_options" {
-  rest_api_id   = aws_api_gateway_rest_api.this.id
-  resource_id   = aws_api_gateway_resource.predict.id
-  http_method   = "OPTIONS"
-  authorization = "NONE"
-  # OPTIONS preflight has no body/params to validate; wire the validator
-  # so checkov is happy without changing behaviour.
+  rest_api_id          = aws_api_gateway_rest_api.this.id
+  resource_id          = aws_api_gateway_resource.predict.id
+  http_method          = "OPTIONS"
+  authorization        = "NONE"
   request_validator_id = aws_api_gateway_request_validator.body.id
 }
 
@@ -199,12 +223,23 @@ resource "aws_api_gateway_integration_response" "predict_options_integration_res
   response_parameters = {
     "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
     "method.response.header.Access-Control-Allow-Methods" = "'GET,HEAD,OPTIONS,POST'"
-    "method.response.header.Access-Control-Allow-Origin"  = "'*'"
+    "method.response.header.Access-Control-Allow-Origin"  = local.cors_origin_header
   }
 }
 
-################################################################################
-# Deployment
+# API Gateway answers a missing key (403) or a throttle (429) itself, without
+# the Lambda. Add the CORS header so the browser surfaces the real status.
+resource "aws_api_gateway_gateway_response" "cors" {
+  for_each = toset(["DEFAULT_4XX", "DEFAULT_5XX"])
+
+  rest_api_id   = aws_api_gateway_rest_api.this.id
+  response_type = each.value
+
+  response_parameters = {
+    "gatewayresponse.header.Access-Control-Allow-Origin" = local.cors_origin_header
+  }
+}
+
 ################################################################################
 # CloudWatch Logs IAM - API Gateway account settings
 ################################################################################
@@ -224,10 +259,11 @@ data "aws_iam_policy_document" "apigw_cloudwatch_assume" {
 }
 
 resource "aws_iam_role" "apigw_cloudwatch" {
-  count              = var.enable_access_logging ? 1 : 0
-  name               = "${var.api_name}-cloudwatch-logs"
-  assume_role_policy = data.aws_iam_policy_document.apigw_cloudwatch_assume[0].json
-  tags               = var.tags
+  count                = var.enable_access_logging ? 1 : 0
+  name                 = "${var.api_name}-cloudwatch-logs"
+  permissions_boundary = var.permissions_boundary_arn
+  assume_role_policy   = data.aws_iam_policy_document.apigw_cloudwatch_assume[0].json
+  tags                 = var.tags
 }
 
 resource "aws_iam_role_policy_attachment" "apigw_cloudwatch" {
@@ -255,9 +291,25 @@ resource "aws_cloudwatch_log_group" "access_logs" {
 # Deployment
 ################################################################################
 
-# Deployment
+# KICS: access logs are configured on aws_api_gateway_stage.this, not on the deployment
+# kics-scan ignore-line
 resource "aws_api_gateway_deployment" "this" {
   rest_api_id = aws_api_gateway_rest_api.this.id
+
+  # A deployment is a snapshot: without this, changing auth or key settings on
+  # a method never reaches the live stage.
+  triggers = {
+    redeployment = sha1(jsonencode([
+      aws_api_gateway_method.predict_post,
+      aws_api_gateway_method.results_get,
+      aws_api_gateway_method.predict_options,
+      aws_api_gateway_integration.predict_integration,
+      aws_api_gateway_integration.results_integration,
+      aws_api_gateway_integration.predict_options_integration,
+      aws_api_gateway_integration_response.predict_options_integration_response,
+      aws_api_gateway_gateway_response.cors,
+    ]))
+  }
 
   depends_on = [
     aws_api_gateway_integration.predict_integration,
@@ -275,12 +327,17 @@ resource "aws_api_gateway_deployment" "this" {
 # Stage - with execution logging, access logging, throttling, X-Ray
 ################################################################################
 
+# KICS: access and execution logging come from the dynamic access_log_settings block and method_settings (enable_access_logging, default true); the Lambda proxy backend does not use a client certificate
+# kics-scan ignore-line
 resource "aws_api_gateway_stage" "this" {
+  # The web ACL below includes AWSManagedRulesKnownBadInputsRuleSet (Log4j);
+  # Checkov does not follow the count-gated aws_wafv2_web_acl_association.
+  #checkov:skip=CKV2_AWS_77:Web ACL has the KnownBadInputs AMR; association is count-gated on enable_waf
   deployment_id = aws_api_gateway_deployment.this.id
   rest_api_id   = aws_api_gateway_rest_api.this.id
   stage_name    = var.stage_name
 
-  # X-Ray tracing - lets you see which hop is slow (API GW → Lambda → SageMaker).
+  # X-Ray tracing - shows which hop is slow (API Gateway, Lambda, SageMaker).
   xray_tracing_enabled = var.enable_xray_tracing
 
   # Access logs - structured JSON that's queryable via CloudWatch Logs Insights.
@@ -332,19 +389,17 @@ resource "aws_api_gateway_method_settings" "all" {
 }
 
 ################################################################################
-# Usage Plan - API key throttling for authenticated clients
+# Usage plan and API key
 ################################################################################
 
-# Optional usage plan gated by `create_usage_plan`. When enabled, callers can
-# provision `aws_api_gateway_api_key` resources and attach them to this plan
-# for per-client quotas. The default `/predict` endpoint remains
-# `authorization = "NONE"` because this is a demo API, but even anonymous
-# traffic is protected by the stage-level throttle above.
+# The key identifies and meters the caller; it is not authentication. It ships
+# inside the static frontend, so anyone who loads the page can read it. Use
+# authorization_type = "AWS_IAM" or "COGNITO_USER_POOLS" to authenticate users.
 resource "aws_api_gateway_usage_plan" "this" {
-  count = var.create_usage_plan ? 1 : 0
+  count = local.create_usage_plan ? 1 : 0
 
   name        = "${var.api_name}-usage-plan"
-  description = "Default usage plan for ${var.api_name}"
+  description = "Per-key throttle and quota for ${var.api_name}"
 
   api_stages {
     api_id = aws_api_gateway_rest_api.this.id
@@ -364,10 +419,152 @@ resource "aws_api_gateway_usage_plan" "this" {
   tags = var.tags
 }
 
+resource "aws_api_gateway_api_key" "frontend" {
+  count = var.require_api_key ? 1 : 0
+
+  name        = "${var.api_name}-frontend"
+  description = "Key the static frontend sends in the x-api-key header"
+  enabled     = true
+
+  tags = var.tags
+}
+
+resource "aws_api_gateway_usage_plan_key" "frontend" {
+  count = var.require_api_key ? 1 : 0
+
+  key_id        = aws_api_gateway_api_key.frontend[0].id
+  key_type      = "API_KEY"
+  usage_plan_id = aws_api_gateway_usage_plan.this[0].id
+}
+
 ################################################################################
-# (WAF removed 2026-05 - API Gateway throttling + Lambda reserved
-#  concurrency + 5 MB payload limit are sufficient for a research endpoint.
-#  If you need WAF, add it back at the CloudFront distribution in front of
-#  the API rather than on the regional stage.)
+# AWS WAF (regional web ACL on the stage)
 ################################################################################
 
+resource "aws_wafv2_web_acl" "this" {
+  count = var.enable_waf ? 1 : 0
+
+  name        = "${var.api_name}-waf"
+  description = "Managed common rules and a per-IP rate limit for ${var.api_name}"
+  scope       = "REGIONAL"
+
+  default_action {
+    allow {}
+  }
+
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+
+        # POST /predict carries a base64 image, far above the rule's 8 KB body
+        # limit. Count instead of block; the request model and the Lambda
+        # enforce the real size cap.
+        rule_action_override {
+          name = "SizeRestrictions_BODY"
+          action_to_use {
+            count {}
+          }
+        }
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.api_name}-common-rules"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Known bad inputs, including the Log4j JNDI lookup patterns.
+  rule {
+    name     = "AWSManagedRulesKnownBadInputsRuleSet"
+    priority = 2
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.api_name}-known-bad-inputs"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "RateLimitPerIP"
+    priority = 3
+
+    action {
+      block {}
+    }
+
+    statement {
+      rate_based_statement {
+        limit              = var.waf_rate_limit
+        aggregate_key_type = "IP"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.api_name}-rate-limit"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${var.api_name}-waf"
+    sampled_requests_enabled   = true
+  }
+
+  tags = var.tags
+}
+
+resource "aws_wafv2_web_acl_association" "this" {
+  count = var.enable_waf ? 1 : 0
+
+  resource_arn = aws_api_gateway_stage.this.arn
+  web_acl_arn  = aws_wafv2_web_acl.this[0].arn
+}
+
+# WAF requires the log group name to start with aws-waf-logs-.
+resource "aws_cloudwatch_log_group" "waf" {
+  count = var.enable_waf ? 1 : 0
+
+  name              = "aws-waf-logs-${var.api_name}"
+  retention_in_days = var.log_retention_days
+  kms_key_id        = var.log_kms_key_arn
+  tags              = var.tags
+}
+
+resource "aws_wafv2_web_acl_logging_configuration" "this" {
+  count = var.enable_waf ? 1 : 0
+
+  resource_arn            = aws_wafv2_web_acl.this[0].arn
+  log_destination_configs = [aws_cloudwatch_log_group.waf[0].arn]
+
+  # Keep the API key out of the WAF logs.
+  redacted_fields {
+    single_header {
+      name = "x-api-key"
+    }
+  }
+}

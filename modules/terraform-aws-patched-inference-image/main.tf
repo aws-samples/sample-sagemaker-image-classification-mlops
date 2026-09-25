@@ -1,9 +1,20 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+locals {
+  # Account id of the DLC registry host, e.g. 763104351884.dkr.ecr.<region>.amazonaws.com.
+  source_registry_account = split(".", var.source_registry)[0]
+  source_repository_arn   = "arn:${data.aws_partition.current.partition}:ecr:${var.aws_region}:${local.source_registry_account}:repository/${var.source_repository}"
+  build_log_group         = "/aws/codebuild/${var.project_name}-patched-image-build"
+}
+
+data "aws_partition" "current" {}
+
+# Every build pushes a new dated tag and consumers pin the digest, so tags never
+# need to move.
 resource "aws_ecr_repository" "this" {
   name                 = var.repository_name
-  image_tag_mutability = "MUTABLE" # we want `latest` to move
+  image_tag_mutability = "IMMUTABLE"
   force_delete         = true
 
   image_scanning_configuration {
@@ -43,7 +54,8 @@ resource "aws_ecr_lifecycle_policy" "this" {
 ################################################################################
 
 resource "aws_iam_role" "codebuild" {
-  name = "${var.project_name}-patched-image-build-role"
+  name                 = "${var.project_name}-patched-image-build-role"
+  permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -65,7 +77,7 @@ resource "aws_iam_role_policy" "codebuild" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Effect = "Allow"
         Action = [
@@ -73,13 +85,31 @@ resource "aws_iam_role_policy" "codebuild" {
           "logs:CreateLogStream",
           "logs:PutLogEvents",
         ]
-        Resource = "arn:aws:logs:*:*:*"
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${var.aws_account_id}:log-group:${local.build_log_group}",
+          "arn:${data.aws_partition.current.partition}:logs:${var.aws_region}:${var.aws_account_id}:log-group:${local.build_log_group}:*",
+        ]
       },
       {
-        # Public DLC pull + our private repo push
+        # GetAuthorizationToken has no resource-level scoping.
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
+        Resource = "*"
+      },
+      {
+        Sid    = "PullSourceImage"
         Effect = "Allow"
         Action = [
-          "ecr:GetAuthorizationToken",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+        ]
+        Resource = local.source_repository_arn
+      },
+      {
+        Sid    = "PushPatchedImage"
+        Effect = "Allow"
+        Action = [
           "ecr:BatchCheckLayerAvailability",
           "ecr:BatchGetImage",
           "ecr:GetDownloadUrlForLayer",
@@ -89,7 +119,7 @@ resource "aws_iam_role_policy" "codebuild" {
           "ecr:PutImage",
           "ecr:DescribeImages",
         ]
-        Resource = "*"
+        Resource = aws_ecr_repository.this.arn
       },
       {
         Effect = "Allow"
@@ -101,15 +131,13 @@ resource "aws_iam_role_policy" "codebuild" {
         ]
         Resource = var.kms_key_arn
       },
-      # SBOM upload - only granted when caller supplies an sbom_bucket_arn.
-      # We use a conditional empty list so the policy doesn't reference a
-      # wildcard resource when the feature is disabled.
+      ], var.sbom_bucket_arn != "" ? [
       {
         Effect   = "Allow"
-        Action   = var.sbom_bucket_arn != "" ? ["s3:PutObject", "s3:PutObjectAcl"] : []
-        Resource = var.sbom_bucket_arn != "" ? ["${var.sbom_bucket_arn}/sboms/*"] : []
+        Action   = ["s3:PutObject"]
+        Resource = "${var.sbom_bucket_arn}/sboms/*"
       },
-    ]
+    ] : [])
   })
 }
 
@@ -169,7 +197,7 @@ resource "aws_codebuild_project" "this" {
   logs_config {
     cloudwatch_logs {
       status      = "ENABLED"
-      group_name  = "/aws/codebuild/${var.project_name}-patched-image-build"
+      group_name  = local.build_log_group
       stream_name = "build"
     }
   }
@@ -215,7 +243,7 @@ locals {
           "aws ecr get-login-password --region $${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin $${SOURCE_REGISTRY}",
           "aws ecr get-login-password --region $${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin $${AWS_ACCOUNT_ID}.dkr.ecr.$${AWS_DEFAULT_REGION}.amazonaws.com",
           "SOURCE_IMAGE=$${SOURCE_REGISTRY}/$${SOURCE_REPO}:$${SOURCE_TAG}",
-          "DATE_TAG=$(date -u +%Y%m%d-%H%M)",
+          "DATE_TAG=$(date -u +%Y%m%d-%H%M%S)",
           "echo Source image: $${SOURCE_IMAGE}",
           "echo Target:       $${TARGET_REPO}:$${DATE_TAG}",
         ]
@@ -225,13 +253,10 @@ locals {
           # Materialise Dockerfile from a single heredoc command
           local.dockerfile_heredoc,
           "cat Dockerfile",
-          "SOURCE_IMAGE=$${SOURCE_REGISTRY}/$${SOURCE_REPO}:$${SOURCE_TAG}",
-          "DATE_TAG=$(date -u +%Y%m%d-%H%M)",
-          "docker build --build-arg SOURCE_IMAGE=$${SOURCE_IMAGE} -t $${TARGET_REPO}:$${DATE_TAG} -t $${TARGET_REPO}:latest .",
+          # The repository is IMMUTABLE: each build pushes one new dated tag.
+          "docker build --build-arg SOURCE_IMAGE=$${SOURCE_IMAGE} -t $${TARGET_REPO}:$${DATE_TAG} .",
           "docker push $${TARGET_REPO}:$${DATE_TAG}",
-          "docker push $${TARGET_REPO}:latest",
           "echo Pushed $${TARGET_REPO}:$${DATE_TAG}",
-          "echo Pushed $${TARGET_REPO}:latest",
           # SBOM generation - only runs when SBOM_BUCKET is populated.
           # Syft emits CycloneDX JSON which Security Hub / Dependency Track /
           # most SCA tools can ingest directly. The image must already be
@@ -261,7 +286,8 @@ resource "aws_cloudwatch_event_rule" "monthly_rebuild" {
 }
 
 resource "aws_iam_role" "events_codebuild" {
-  name = "${var.project_name}-events-codebuild-role"
+  name                 = "${var.project_name}-events-codebuild-role"
+  permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -302,19 +328,15 @@ resource "aws_cloudwatch_event_target" "monthly_rebuild" {
 # First-build bootstrap (no manual step)
 ################################################################################
 #
-# The auto-deploy Lambda deploys models using this patched image's `:latest`
-# tag, so the image must exist before the first model approval. The monthly
-# schedule alone would leave a fresh deployment with an empty repository. This
-# triggers ONE build at apply time and waits for it to finish, so a clean
-# `terraform apply` yields a usable image with no manual `start-build`.
-# Uses local-exec (AWS CLI) rather than CDK; gated by build_image_on_create.
+# The endpoint and the auto-deploy Lambda pin the newest image by digest, so
+# an image must exist before the first apply finishes. The monthly schedule
+# alone would leave a fresh deployment with an empty repository. This triggers
+# ONE build at apply time and waits for it (AWS CLI via local-exec); gated by
+# build_image_on_create.
 resource "null_resource" "build_on_create" {
   count = var.build_image_on_create ? 1 : 0
 
-  # Re-run the bootstrap build whenever the image recipe changes, not just on
-  # first create. Keying only on the (stable) project name would mean buildspec
-  # or Dockerfile edits never trigger a rebuild and a stale `:latest` keeps
-  # serving. source_tag is included so a new base DLC tag also rebuilds.
+  # Rebuild whenever the recipe or the base DLC tag changes.
   triggers = {
     project    = aws_codebuild_project.this.name
     buildspec  = sha1(local.buildspec)
@@ -340,4 +362,17 @@ resource "null_resource" "build_on_create" {
   }
 
   depends_on = [aws_codebuild_project.this, aws_iam_role_policy.codebuild]
+}
+
+################################################################################
+# Newest pushed image, pinned by digest
+################################################################################
+
+# Read after the bootstrap build so the first apply sees the image it just
+# built. A monthly rebuild pushes a new digest; the next apply picks it up.
+data "aws_ecr_image" "newest" {
+  repository_name = aws_ecr_repository.this.name
+  most_recent     = true
+
+  depends_on = [null_resource.build_on_create]
 }

@@ -3,32 +3,43 @@
 
 """Scheduled drift detection over endpoint data-capture output (Part 3).
 
-Runs as a scheduled Amazon SageMaker Processing job. Reads the endpoint's
-captured prediction scores from S3, compares their distribution against the
-training baseline, and publishes a Population Stability Index (PSI) to
-CloudWatch as a custom metric. The drift alarm and the EventBridge rule that
-starts retraining both read that metric, so the closed loop is unchanged - only
-the producer of the drift signal differs.
+Runs as a scheduled Amazon SageMaker Processing job. Reads the malignant
+probabilities the endpoint returned (data capture, endpointOutput) for the
+last --lookback-hours, compares their distribution with the baseline score
+distribution, and publishes a Population Stability Index (PSI) to CloudWatch.
+The drift alarm and the EventBridge retraining rule read that metric.
 
-PSI is the standard statistic for numeric feature drift:
+This is prediction (output) drift: PSI over the score distribution in equal
+bins on [0, 1]. It catches shifts that change what the model outputs; it does
+not inspect the input pixels.
 
     PSI = sum over bins of (pct_live - pct_baseline) * ln(pct_live / pct_baseline)
 
 Conventional reading: < 0.1 no meaningful shift, 0.1-0.2 moderate, > 0.2
 significant. The alarm threshold is supplied by Terraform (drift_threshold).
+Nothing is published without a baseline or with fewer than --min-samples live
+scores, so quiet periods cannot raise a false alarm.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import logging
 import math
 import os
+import sys
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 import boto3
+
+# The job's code directory holds mlops_common next to this file; a local
+# checkout has it one level up, in scripts/.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from mlops_common.capture import iter_capture_records
+from mlops_common.s3io import iter_capture_keys
+from mlops_common.scores import clamp01
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -41,121 +52,59 @@ _ENV = os.environ.get
 _EPSILON = 1e-4
 
 
+def _clean(values: Iterable) -> list[float]:
+    """Finite scores clipped to [0, 1]; NaN, inf and non-numbers are dropped."""
+    out = []
+    for v in values:
+        if isinstance(v, bool):
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f):
+            out.append(min(max(f, 0.0), 1.0))
+    return out
+
+
 def _histogram(values: list[float], bins: int) -> list[float]:
-    """Fractional counts of values across `bins` equal-width bins over [0, 1]."""
+    """Fractional counts across `bins` equal-width bins over [0, 1]."""
     counts = [0] * bins
     for v in values:
-        idx = min(int(v * bins), bins - 1)  # v == 1.0 lands in the last bin
-        counts[idx] += 1
+        counts[min(int(v * bins), bins - 1)] += 1  # v == 1.0 lands in the last bin
     total = len(values) or 1
     return [c / total for c in counts]
 
 
-def population_stability_index(live: list[float], baseline: list[float], bins: int) -> float:
-    """PSI between two score distributions. 0.0 means identical."""
-    live_pct = _histogram(live, bins)
-    base_pct = _histogram(baseline, bins)
+def population_stability_index(live, baseline, bins: int = 10) -> float | None:
+    """PSI between two score distributions; 0.0 means identical.
+
+    Non-finite values are dropped first (a NaN would otherwise crash the bin
+    index). Returns None when either side has no usable value.
+    """
+    live_clean = _clean(live)
+    base_clean = _clean(baseline)
+    if not live_clean or not base_clean:
+        return None
     psi = 0.0
-    for lp, bp in zip(live_pct, base_pct):
+    for lp, bp in zip(_histogram(live_clean, bins), _histogram(base_clean, bins)):
         lp = max(lp, _EPSILON)
         bp = max(bp, _EPSILON)
         psi += (lp - bp) * math.log(lp / bp)
     return psi
 
 
-def _iter_capture_keys(s3, bucket: str, prefix: str, since: datetime):
-    """Yield data-capture object keys modified since `since`."""
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["LastModified"] >= since and obj["Key"].endswith(".jsonl"):
-                yield obj["Key"]
-
-
-def decode_capture_payload(section: dict):
-    """Decode one captureData section (endpointInput / endpointOutput) to JSON.
-
-    SageMaker records the payload under `data` and declares how it is stored in
-    a sibling `encoding` field. For a JSON endpoint it is "BASE64", so `data` is
-    base64-encoded JSON rather than JSON text - json.loads on it raises, and a
-    parser that swallows that error silently discards every captured record.
-    Falls back to treating `data` as raw JSON for endpoints that report
-    encoding "JSON".
-    """
-    raw = section.get("data")
-    if raw is None:
-        return None
-    if isinstance(raw, (dict, list)):
-        return raw
-    if str(section.get("encoding", "")).upper() == "BASE64":
-        try:
-            raw = base64.b64decode(raw).decode("utf8")
-        except (ValueError, UnicodeDecodeError):
-            return None
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-def _scores_from_capture(body: str) -> list[float]:
-    """Extract malignant probabilities from data-capture JSON Lines records.
-
-    Capture format wraps the endpoint response under
-    captureData.endpointOutput, whose `data` holds the model's JSON subject to
-    the section's `encoding`. Malformed lines are skipped rather than failing
-    the whole run.
-    """
-    scores: list[float] = []
-    for line in body.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-            section = record["captureData"]["endpointOutput"]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            continue
-
-        payload = decode_capture_payload(section)
-        if payload is None:
-            continue
-        score = _extract_score(payload)
-        if score is not None:
-            scores.append(score)
-    return scores
-
-
-def _extract_score(payload) -> float | None:
-    """Pull a single malignant probability out of a model response."""
-    if isinstance(payload, dict):
-        if "predictions" in payload:
-            preds = payload["predictions"]
-            first = preds[0] if isinstance(preds, list) and preds else preds
-            if isinstance(first, list):
-                return _clamp(first[1] if len(first) == 2 else first[0])
-            return _clamp(first)
-        for key in ("malignant_probability", "confidence", "probability", "score"):
-            if key in payload:
-                return _clamp(payload[key])
-    elif isinstance(payload, (int, float)):
-        return _clamp(payload)
-    return None
-
-
-def _clamp(value) -> float | None:
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    return min(max(f, 0.0), 1.0)
+def scores_from_capture(body: str) -> list[float]:
+    """Malignant probabilities from one data-capture JSON Lines file."""
+    return [record["score"] for record in iter_capture_records(body)]
 
 
 def _load_baseline(s3, bucket: str, key: str) -> list[float]:
-    """Load baseline scores, or synthesise a uniform baseline if absent.
+    """Load baseline scores from S3; an empty list if absent or unusable.
 
-    Accepts either an explicit score list or a statistics.json-style
-    histogram, and reconstructs bin midpoints from the latter.
+    Accepts either an explicit score list ({"scores": [...]}) or a
+    statistics.json-style histogram, and reconstructs bin midpoints from the
+    latter. An empty result means no PSI is published this run.
     """
     if not key:
         return []
@@ -169,15 +118,15 @@ def _load_baseline(s3, bucket: str, key: str) -> list[float]:
     # Preferred: an explicit score list. Fall back to a statistics.json-style
     # histogram, reconstructing bin midpoints from the buckets.
     if isinstance(doc, dict) and isinstance(doc.get("scores"), list):
-        return [s for s in (_clamp(v) for v in doc["scores"]) if s is not None]
+        return _clean(doc["scores"])
 
     for feature in doc.get("features", []):
         dist = feature.get("numerical_statistics", {}).get("distribution", {})
         buckets = dist.get("kll", {}).get("buckets") or dist.get("buckets") or []
         rebuilt: list[float] = []
         for b in buckets:
-            lower = _clamp(b.get("lower_bound", 0.0)) or 0.0
-            upper = _clamp(b.get("upper_bound", 1.0)) or 1.0
+            lower = clamp01(b.get("lower_bound", 0.0)) or 0.0
+            upper = clamp01(b.get("upper_bound", 1.0)) or 1.0
             count = int(b.get("count", 0))
             rebuilt.extend([(lower + upper) / 2] * count)
         if rebuilt:
@@ -198,8 +147,8 @@ def run(
     min_samples: int,
     num_bins: int,
 ) -> int:
-    if not monitoring_bucket or not namespace:
-        logger.error("--monitoring-bucket and --metric-namespace are required")
+    if not monitoring_bucket or not namespace or not endpoint_name:
+        logger.error("--monitoring-bucket, --metric-namespace and --endpoint-name are required")
         return 1
 
     s3 = boto3.client("s3")
@@ -216,13 +165,13 @@ def run(
     since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     live: list[float] = []
     keys_read = 0
-    for key in _iter_capture_keys(s3, monitoring_bucket, capture_prefix, since):
+    for key in iter_capture_keys(s3, monitoring_bucket, capture_prefix, endpoint_name, since):
         try:
             body = s3.get_object(Bucket=monitoring_bucket, Key=key)["Body"].read().decode("utf8")
         except Exception as exc:
             logger.warning("skipping %s (%s)", key, exc)
             continue
-        live.extend(_scores_from_capture(body))
+        live.extend(scores_from_capture(body))
         keys_read += 1
 
     logger.info("read %d capture files, %d live scores", keys_read, len(live))
@@ -234,6 +183,9 @@ def run(
         return 0
 
     psi = population_stability_index(live, baseline, num_bins)
+    if psi is None:
+        logger.info("no finite scores to compare; not publishing")
+        return 0
     logger.info("PSI=%.4f over %d live vs %d baseline scores", psi, len(live), len(baseline))
 
     cloudwatch.put_metric_data(

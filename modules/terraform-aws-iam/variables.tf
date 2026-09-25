@@ -34,6 +34,12 @@ variable "max_session_duration" {
   }
 }
 
+variable "permissions_boundary_arn" {
+  description = "ARN of the permissions boundary policy for the role (stack-backend-setup output workload_boundary_arn). The CI/CD CodeBuild role can only create or change roles that carry it."
+  type        = string
+  default     = null
+}
+
 ################################################################################
 # IAM Policies
 ################################################################################

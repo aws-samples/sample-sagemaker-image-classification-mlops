@@ -8,9 +8,8 @@ CODE_DIR="/opt/ml/processing/input/code"
 
 # A raw ProcessingJob entrypoint does not auto-install requirements.txt the way
 # the SageMaker Python SDK's ScriptProcessor does, so install Fairlearn here.
-# Fall back to an unpinned install if the requirements file is missing.
-pip install -q -r "${CODE_DIR}/requirements.txt" 2>/dev/null \
-  || pip install -q fairlearn
+# No fallback: a failed install must fail the job, not run an unpinned version.
+pip install -q -r "${CODE_DIR}/requirements.txt"
 
 # All flags arrive as ContainerArguments and are forwarded verbatim.
 exec python3 "${CODE_DIR}/compute_fairness.py" "$@"

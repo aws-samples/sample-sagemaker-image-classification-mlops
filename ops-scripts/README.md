@@ -1,37 +1,49 @@
 # ops-scripts
 
-Operational helpers for humans - local-dev convenience scripts for building, testing, verifying, and cleaning up deployed infrastructure. **Not invoked by SageMaker, Lambda, or CI/CD** (the CI/CD buildspecs duplicate the logic inline for isolation).
+Operational helpers you run from your workstation: building the Lambda layer, fetching the dataset, testing the API, checking monitoring and cleaning up. The layer build is also called by `stack-inference` at apply time when the zip is missing; nothing else here is invoked by SageMaker, Lambda or CI/CD.
 
 ## What is in here
 
-| Script                  | Purpose                                                                          |
-| ----------------------- | -------------------------------------------------------------------------------- |
-| `build_lambda_layer.sh` | Build the Pillow + numpy Lambda layer locally for `inference/`                   |
-| `cleanup_all.sh`        | ⚠️ Destructive. Empties S3 buckets, deletes logs, model packages, endpoints      |
-| `test_api.py`           | Send a base64-encoded image to the deployed inference API and print results      |
-| `verify_monitoring.sh`  | Smoke-check that CloudWatch metrics, alarms, SNS topics, EventBridge rules exist |
+| Script | Purpose |
+| --- | --- |
+| `build_lambda_layer.sh` | Build the Pillow and NumPy layer zip for the inference Lambda (`make layer`) |
+| `data_download_breakhis.sh` | Download BreakHis (about 4 GB) into `breast_benign/` and `breast_malignant/`, keeping the file names the patient split and fairness gate read |
+| `test_api.py` | Send base64 images to `POST /predict` with the `x-api-key` header and compare predictions with the folder labels (needs `requests` and `Pillow`) |
+| `ops_generate_endpoint_traffic.py` | Send labelled images straight to the endpoint to seed data capture for the drift job |
+| `verify_monitoring.sh` | Check that the CloudWatch alarms, SNS topics and EventBridge rules exist |
+| `cleanup_all.sh` | **Destructive.** Delete the endpoint, endpoint configs, models, model packages and job log groups, and empty the project buckets (never the state bucket). With `--destroy` it then runs `terraform destroy` in stack-cicd, stack-inference and stack-training (`make destroy`) |
 
 ## Typical usage
 
 ```bash
-# Build the Lambda layer locally (usually only needed for dev iteration;
-# the inference-deploy CodeBuild job rebuilds it from scratch).
+# Build the Lambda layer
 ./ops-scripts/build_lambda_layer.sh
 
-# Hit the deployed API with a test image
-API_URL=$(cd stack-inference && terraform output -raw api_gateway_url)
-python ops-scripts/test_api.py --api-url "$API_URL" --image-path data/breast_benign/sample.png
+# Fetch BreakHis, then upload it (the marker starts the pipeline)
+./ops-scripts/data_download_breakhis.sh data/breakhis
+./scripts/data_uploader.sh data/breakhis
 
-# Verify monitoring is wired up after a fresh deploy
+# Call the deployed API (URL and key default to the terraform outputs)
+python3 ops-scripts/test_api.py \
+  --api-url "$(terraform -chdir=stack-inference output -raw api_gateway_url)" \
+  --api-key "$(terraform -chdir=stack-inference output -raw api_key_value)" \
+  --image-path data/breakhis/breast_benign/<file>.png
+
+# Seed data capture for the drift job
+python3 ops-scripts/ops_generate_endpoint_traffic.py --profile <profile> \
+  --endpoint medical-image-classification-endpoint --requests 200
+
+# Check monitoring after a deploy
 ./ops-scripts/verify_monitoring.sh
 
-# Teardown everything that Terraform doesn't manage directly
-# (review the script first - it deletes live resources)
-./ops-scripts/cleanup_all.sh
+# Clean up and destroy (asks you to type the project name)
+./ops-scripts/cleanup_all.sh --profile <profile> --destroy
 ```
+
+Run `./ops-scripts/cleanup_all.sh --help` for `--project`, `--region`, `--state-bucket` and `--yes`.
 
 ## Naming convention
 
-- Shell: `snake_case.sh` (e.g., `build_lambda_layer.sh`)
-- Python: `snake_case.py` (e.g., `test_api.py`)
+- Shell: `snake_case.sh` (for example `build_lambda_layer.sh`)
+- Python: `snake_case.py` (for example `test_api.py`)
 - Verb-first for action scripts: `build_*`, `cleanup_*`, `verify_*`, `test_*`

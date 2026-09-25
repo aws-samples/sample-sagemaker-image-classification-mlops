@@ -1,6 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+# KICS: private static-asset bucket read only through CloudFront OAC; no S3 access logging in the sample (CKV_AWS_18)
+# kics-scan ignore-line
 resource "aws_s3_bucket" "frontend" {
   bucket        = var.bucket_name
   force_destroy = var.force_destroy
@@ -114,6 +116,8 @@ resource "aws_s3_bucket_policy" "frontend" {
 }
 
 # CloudFront distribution
+# KICS: static demo UI; the API it calls has WAF. Access logs are on when access_log_bucket_domain is set
+# kics-scan ignore-line
 resource "aws_cloudfront_distribution" "frontend" {
   origin {
     domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
@@ -150,7 +154,11 @@ resource "aws_cloudfront_distribution" "frontend" {
     }
   }
 
+  # KICS: default *.cloudfront.net certificate for the demo; set acm_certificate_arn for a custom domain, then TLSv1.2_2021 applies
+  # kics-scan ignore-line
   viewer_certificate {
+    # KICS: same reason as the block above
+    # kics-scan ignore-line
     cloudfront_default_certificate = true
     # Pin to TLSv1.2_2021 so weak ciphers (TLSv1.0/1.1) are disabled for
     # viewers. Note: when using the default *.cloudfront.net cert, AWS

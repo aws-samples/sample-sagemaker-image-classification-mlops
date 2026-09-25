@@ -1,9 +1,7 @@
-# Runs inside the SageMaker TF 2.19 CPU DLC as a Processing job (Part 4 fairness
-# gate). numpy is pinned to match the container the way scripts/evaluation does;
-# TF 2.19 wheels require numpy<2.2.
-#
-# AI Fairness 360 computes the same metrics if a team prefers it.
+# Runs inside the SageMaker TF 2.19 CPU DLC (Python 3.12) as the in-pipeline
+# fairness gate. numpy is pinned to match the container the way
+# scripts/evaluation does; TF 2.19 wheels require numpy<2.2.
 fairlearn==0.14.0
 numpy==2.1.3
-pandas>=2.3.0
-scikit-learn>=1.8.0
+pandas==2.3.0
+scikit-learn==1.8.0

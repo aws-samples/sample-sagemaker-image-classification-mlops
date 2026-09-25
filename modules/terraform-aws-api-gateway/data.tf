@@ -2,3 +2,5 @@
 # SPDX-License-Identifier: MIT-0
 
 data "aws_region" "current" {}
+
+data "aws_partition" "current" {}

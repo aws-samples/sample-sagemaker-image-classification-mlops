@@ -1,20 +1,40 @@
-# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 #
-# Python project config. This repo is not a package — we don't publish to
-# PyPI — but pyproject.toml is the canonical place to configure Ruff.
-# Keep this file minimal; the actual Python code ships via SageMaker
-# pipelines, Lambda zips, and CodeBuild buildspecs, not pip.
+# Python project config. This repo is not a package (nothing is published to
+# PyPI); pyproject.toml configures Ruff and pytest. The code ships via SageMaker
+# pipelines, Lambda zips and CodeBuild buildspecs, not pip.
 
 [project]
 name = "medical-image-classification"
 version = "0.1.0"
-description = "Terraform-managed SageMaker MLOps pipeline for breast cancer histopathology classification"
+description = "Terraform-managed SageMaker MLOps pipeline for histopathology image classification"
+# Python used for local tooling (Ruff, pytest). The code itself runs in three
+# runtimes: the SageMaker TensorFlow 2.19 DLC (Python 3.12) for validation,
+# preprocessing, training, evaluation, ensemble and the bias gate; the
+# SageMaker scikit-learn image (Python 3.9) for the drift and fairness jobs;
+# and the Lambda runtime for stack-inference/lambda. Code that runs in the
+# scikit-learn image, including scripts/mlops_common, must stay 3.9-compatible
+# (see the per-file ignores below).
 requires-python = ">=3.13"
 
+[dependency-groups]
+# pip install --group dev   (pip 25.1+). TensorFlow is not needed: the tests
+# stub the model and exercise everything around it.
+dev = [
+    "boto3==1.42.0",
+    "fairlearn==0.14.0",
+    "moto==5.2.3",
+    "numpy==2.1.3",
+    "pandas==2.3.0",
+    "Pillow==12.3.0",
+    "pytest==9.1.1",
+    "ruff==0.16.9",
+    "scikit-learn==1.8.0",
+]
+
 ###############################################################################
-# Ruff — replaces Black + isort + flake8 + pyupgrade + pylint (partial) +
-# ~30 other tools. Written in Rust, ~100x faster than the tools it replaces,
-# zero runtime dependencies. See https://docs.astral.sh/ruff/
+# Ruff: linter and formatter. See https://docs.astral.sh/ruff/
 ###############################################################################
 
 [tool.ruff]
@@ -25,8 +45,8 @@ target-version = "py313"
 
 # Directories we never want Ruff to touch:
 # - .terraform / provider plugin caches (thousands of generated files)
-# - data / blog_docs / charts — binary assets and prose
-# - blueprints — untouched reference code from upstream templates
+# - data / blog_docs / charts  -  binary assets and prose
+# - blueprints  -  untouched reference code from upstream templates
 extend-exclude = [
     ".apex",
     ".kiro",
@@ -39,11 +59,11 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-# Rule categories enabled. Start conservative — add more over time.
+# Rule categories enabled. Start conservative  -  add more over time.
 #   E/W : pycodestyle (PEP 8 style)
 #   F   : pyflakes (logic errors: unused imports, undefined names, etc.)
 #   I   : isort (import ordering)
-#   B   : flake8-bugbear (likely bugs — mutable default args, etc.)
+#   B   : flake8-bugbear (likely bugs  -  mutable default args, etc.)
 #   UP  : pyupgrade (modernise syntax for the target Python version)
 #   SIM : flake8-simplify (suggest clearer code)
 #   RUF : Ruff-specific rules
@@ -51,13 +71,10 @@ select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]
 
 # Explicit per-rule ignores. Keep these narrow and justified.
 ignore = [
-    "E501",    # Long lines — line-length above handles this; Ruff complains about strings and comments that are unsplittable.
-    "SIM108",  # Ternary-ifs — sometimes hurt readability in ML code with many branches
-    "B008",    # Function calls in defaults — common in boto3 clients (typer apps etc.)
-    "B905",    # zip() without strict= — Python 3.10+ only addition, not worth the churn for existing numpy-based loops
-    "RUF001",  # Ambiguous unicode in strings — our logs deliberately use emoji (✅ ❌ ⚠️) for human scanning
-    "RUF002",  # Ambiguous unicode in docstrings — same reason
-    "RUF003",  # Ambiguous unicode in comments — same reason
+    "E501",    # Long lines  -  line-length above handles this; Ruff complains about strings and comments that are unsplittable.
+    "SIM108",  # Ternary-ifs  -  sometimes hurt readability in ML code with many branches
+    "B008",    # Function calls in defaults  -  common in boto3 clients (typer apps etc.)
+    "B905",    # zip() without strict= - strict= does not exist on Python 3.9 (scikit-learn image)
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -65,19 +82,25 @@ ignore = [
 # fallbacks for network isolation. Don't flag those.
 "scripts/training/*_trainer.py" = ["F401"]
 
-# Ops scripts similarly — they're interactive CLI utilities.
+# Ops scripts similarly  -  they're interactive CLI utilities.
 "ops-scripts/*.py" = ["T201"]
 
-# The scheduled drift and fairness jobs run in the AWS-managed scikit-learn
-# Processing image, which is Python 3.9 — not this project's 3.13. UP017 would
-# rewrite `timezone.utc` to the `datetime.UTC` alias added in 3.11, which raises
-# ImportError in that container and takes the whole job down. Keep these two
-# 3.9-compatible; the rest of the repo stays on the 3.13 target.
+# The scheduled drift and fairness jobs run in the
+# AWS-managed scikit-learn Processing image, which is Python 3.9, not this
+# project's 3.13. UP017 would rewrite `timezone.utc` to the `datetime.UTC`
+# alias added in 3.11, which raises ImportError in that container. mlops_common
+# is imported by those jobs, so it (and the Lambda's copy) follows the same rule.
 "scripts/drift/*.py" = ["UP017"]
 "scripts/fairness/*.py" = ["UP017"]
+"scripts/mlops_common/*.py" = ["UP017"]
+"stack-inference/lambda/mlops_common/*.py" = ["UP017"]
 
 [tool.ruff.format]
 # Ruff format is a Black-compatible formatter. Keep the defaults; the whole
 # point is consistency, not bikeshedding over trailing commas.
 quote-style = "double"
 indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -p no:cacheprovider"

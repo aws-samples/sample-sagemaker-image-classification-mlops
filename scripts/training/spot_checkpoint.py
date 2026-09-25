@@ -8,7 +8,7 @@ When a training job runs with `EnableManagedSpotTraining = true` SageMaker mount
 the checkpoint S3 prefix at `/opt/ml/checkpoints` (or the path in
 `SM_CHECKPOINT_CONFIG_LOCAL_PATH`) and auto-syncs both directions:
 
-- Job start: S3 prefix → local path
+- Job start: S3 prefix -> local path
 - Job in progress: local writes stream to S3 in near-real-time
 - Spot interruption: job restarts, sees existing checkpoints, resumes from the latest epoch
 

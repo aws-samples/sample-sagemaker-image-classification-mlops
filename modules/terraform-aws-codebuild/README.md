@@ -12,26 +12,26 @@ Reusable AWS CodeBuild project with configurable environment, source, and artifa
 ## Requirements
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | terraform | ~> 1.15 |
 | aws | ~> 6.0 |
 
 ## Providers
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | aws | ~> 6.0 |
 
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [aws_codebuild_project.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/codebuild_project) | resource |
 
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
+| ---- | ----------- | ---- | ------- | :------: |
 | buildspec\_path | Path to the buildspec file | `string` | n/a | yes |
 | name | Name of the CodeBuild project | `string` | n/a | yes |
 | service\_role\_arn | ARN of the IAM role for CodeBuild | `string` | n/a | yes |
@@ -53,7 +53,7 @@ Reusable AWS CodeBuild project with configurable environment, source, and artifa
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ---- | ----------- |
 | project\_arn | ARN of the CodeBuild project |
 | project\_id | ID of the CodeBuild project |
 | project\_name | Name of the CodeBuild project |
@@ -63,7 +63,7 @@ Reusable AWS CodeBuild project with configurable environment, source, and artifa
 
 ```
 modules/terraform-aws-codebuild/
-├── main.tf          # CodeBuild project resource with dynamic environment variables
-├── outputs.tf       # Project name, ARN, ID
-└── variables.tf     # Project name, IAM role, build config, environment, source, tags
+|-- main.tf          # CodeBuild project resource with dynamic environment variables
+|-- outputs.tf       # Project name, ARN, ID
+`-- variables.tf     # Project name, IAM role, build config, environment, source, tags
 ```

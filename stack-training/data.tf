@@ -1,10 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-data "aws_sagemaker_prebuilt_ecr_image" "sklearn" {
-  repository_name = "sagemaker-scikit-learn"
-  image_tag       = var.sagemaker_images.sklearn_tag
-}
+data "aws_caller_identity" "current" {}
 
 data "aws_sagemaker_prebuilt_ecr_image" "tensorflow_gpu" {
   repository_name = "tensorflow-training"
@@ -21,16 +18,9 @@ data "aws_sagemaker_prebuilt_ecr_image" "tensorflow_inference" {
   image_tag       = var.sagemaker_images.tensorflow_inference_tag
 }
 
-# Local values
+# Common tags come from default_tags in providers.tf; resources in child
+# modules inherit them too, so they are not passed again here.
 locals {
-  # Tags for module calls (modules don't inherit provider default_tags)
-  common_tags = {
-    Project     = var.project_name
-    Environment = var.environment
-    ManagedBy   = "terraform"
-    Purpose     = "training-pipeline"
-  }
-
   # Container paths
   container_paths = {
     code   = "/opt/ml/processing/input/code"
@@ -54,25 +44,23 @@ locals {
 
   # Script paths for pipeline steps
   script_paths = {
-    validation_script          = "${local.container_paths.code}/${var.pipeline_steps.validation.script_name}"
     preprocessing_script       = "${local.container_paths.code}/${var.pipeline_steps.preprocessing.script_name}"
     preprocessing_requirements = "${local.container_paths.code}/requirements.txt"
     evaluation_script          = "${local.container_paths.code}/${var.pipeline_steps.evaluation.script_name}"
     ensemble_script            = "${local.container_paths.code}/${var.pipeline_steps.ensemble.script_name}"
     bias_runner                = "${local.container_paths.code}/run_bias_check.sh"
     registry_script            = "${local.container_paths.code}/${var.pipeline_steps.registry.script_name}"
-
   }
 
   # Common processing paths
   processing_paths = {
-    input_data     = "/opt/ml/processing/input/data"
-    input_models   = "/opt/ml/processing/input/models"
-    input_test     = "/opt/ml/processing/input/data/test"
-    input_eval     = "/opt/ml/processing/input/evaluation"
-    input_ensemble = "/opt/ml/processing/input/ensemble"
-    input_registry = "/opt/ml/processing/input/registry"
-    output         = "/opt/ml/processing/output"
+    input_data       = "/opt/ml/processing/input/data"
+    input_models     = "/opt/ml/processing/input/models"
+    input_test       = "/opt/ml/processing/input/data/test"
+    input_validation = "/opt/ml/processing/input/validation"
+    input_eval       = "/opt/ml/processing/input/evaluation"
+    input_ensemble   = "/opt/ml/processing/input/ensemble"
+    input_registry   = "/opt/ml/processing/input/registry"
+    output           = "/opt/ml/processing/output"
   }
-
 }

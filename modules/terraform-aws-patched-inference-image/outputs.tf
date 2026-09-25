@@ -11,9 +11,14 @@ output "repository_arn" {
   value       = aws_ecr_repository.this.arn
 }
 
-output "latest_image_uri" {
-  description = "ECR repository URI tagged `:latest`"
-  value       = "${aws_ecr_repository.this.repository_url}:latest"
+output "image_uri" {
+  description = "Newest patched image pinned by digest (<repository_url>@sha256:...)"
+  value       = "${aws_ecr_repository.this.repository_url}@${data.aws_ecr_image.newest.image_digest}"
+}
+
+output "image_tag" {
+  description = "Dated tag of the newest patched image (YYYYMMDD-HHMMSS)"
+  value       = try(data.aws_ecr_image.newest.image_tags[0], "")
 }
 
 ################################################################################

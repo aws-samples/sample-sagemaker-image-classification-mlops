@@ -69,7 +69,7 @@ def predict_fn(input_data, model):
     serving_fns = model["serving_fns"]
     config = model["config"]
     weights = config["weights"]
-    optimal_threshold = config.get("optimal_threshold", 0.5)
+    optimal_threshold = float(config["optimal_threshold"])
 
     if len(input_data.shape) == 3:
         input_data = np.expand_dims(input_data, axis=0)
@@ -82,7 +82,8 @@ def predict_fn(input_data, model):
         predictions.append(pred * weights[i])
 
     ensemble_pred = np.sum(predictions, axis=0)
-    predicted_class = (ensemble_pred > optimal_threshold).astype(int)
+    # >= matches the threshold selection in mlops_common.gates.
+    predicted_class = (ensemble_pred >= optimal_threshold).astype(int)
 
     return {
         "predictions": ensemble_pred.tolist(),

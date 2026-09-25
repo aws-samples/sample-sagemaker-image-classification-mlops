@@ -31,34 +31,19 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from training_config import CONFIG
 from training_metrics import send_training_metrics_to_cloudwatch
 
+# The training tarball ships mlops_common next to this file; a local checkout
+# has it one level up, in scripts/.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from mlops_common.constants import CLASS_DIRS, DEFAULT_SEED, IMAGE_EXTENSIONS
+from mlops_common.preprocess import KERAS_INTERPOLATION, imagenet_normalize
+from mlops_common.seeds import set_seeds
+
 logger = logging.getLogger(__name__)
-
-# ImageNet channel statistics. Pixel normalization is `/255` then per-channel
-# `(x - mean) / std`. This EXACT transform must be applied identically at
-# training, evaluation, and inference time to avoid training-serving skew -
-# see scripts/evaluation/model_evaluator.py and
-# stack-inference/lambda/inference_handler.py, which mirror these constants.
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
-
-
-def imagenet_normalize(image):
-    """Scale a 0-255 image to 0-1 then align to ImageNet channel statistics.
-
-    Used as the Keras `preprocessing_function` so train/val see the same
-    normalization the inference handler applies in production.
-    """
-    import numpy as np
-
-    image = image.astype("float32") / 255.0
-    return (image - np.array(IMAGENET_MEAN, dtype="float32")) / np.array(
-        IMAGENET_STD, dtype="float32"
-    )
 
 
 def _camel_suffix(model_name: str) -> str:
     """Map a pipeline model key to the CamelCase suffix used in CloudWatch
-    metric names (e.g. `densenet121` → `Densenet121`)."""
+    metric names (e.g. `densenet121` -> `Densenet121`)."""
     return model_name.replace("-", "").replace("_", "").title()
 
 
@@ -77,34 +62,44 @@ def resolve_weights_path(model_name: str) -> str | None:
 
 
 def validate_training_dir(train_dir: str) -> bool:
-    """Verify the SageMaker `training` channel contains both class directories
-    with at least one image each."""
+    """Verify a channel contains both class directories with at least one image each."""
     if not train_dir or not os.path.exists(train_dir):
-        logger.error("❌ Training directory does not exist: %s", train_dir)
+        logger.error("Training directory does not exist: %s", train_dir)
         return False
 
-    for required in ("breast_benign", "breast_malignant"):
+    for required in CLASS_DIRS:
         sub = os.path.join(train_dir, required)
         if not os.path.exists(sub):
-            logger.error("❌ Required directory missing: %s", sub)
+            logger.error("Required directory missing: %s", sub)
             return False
-        count = sum(1 for f in os.listdir(sub) if f.lower().endswith((".jpg", ".jpeg", ".png")))
+        count = sum(1 for f in os.listdir(sub) if f.lower().endswith(IMAGE_EXTENSIONS))
         if count == 0:
-            logger.error("❌ No images found in %s", sub)
+            logger.error("No images found in %s", sub)
             return False
         logger.info("Found %d images in %s", count, required)
     return True
 
 
-def build_data_generators(train_dir: str, input_size: int):
-    """Return (train_generator, val_generator) using the augmentation settings
-    in CONFIG and a common validation_split."""
+def build_data_generators(train_dir: str, input_size: int, val_dir: str | None = None):
+    """Return (train_generator, val_generator).
+
+    With a `validation` channel (the patient-grouped validation split from
+    preprocessing) early stopping watches that split. Without one, Keras
+    carves validation_split out of the training images, which can put images
+    of one patient on both sides.
+
+    The loader resizes with KERAS_INTERPOLATION and normalises with the shared
+    imagenet_normalize, the same transform mlops_common.preprocess applies at
+    evaluation and serving time. preprocessing_function runs after
+    augmentation, so it replaces `rescale` rather than adding to it.
+    """
     aug = CONFIG["augmentation"]
     train_cfg = CONFIG["training"]
+    use_val_channel = bool(val_dir) and validate_training_dir(val_dir)
+    split = None if use_val_channel else train_cfg["validation_split"]
+    if not use_val_channel:
+        logger.warning("No validation channel; using validation_split=%s of the train split", split)
 
-    # preprocessing_function applies /255 + ImageNet mean/std (the same
-    # transform inference uses). It runs after augmentation, so it cannot be
-    # combined with `rescale` - rescale is omitted deliberately.
     train_datagen = ImageDataGenerator(
         preprocessing_function=imagenet_normalize,
         rotation_range=aug["rotation_range"],
@@ -114,28 +109,45 @@ def build_data_generators(train_dir: str, input_size: int):
         horizontal_flip=aug["horizontal_flip"],
         fill_mode=aug["fill_mode"],
         cval=aug.get("cval", 0),
-        validation_split=train_cfg["validation_split"],
+        validation_split=split or 0.0,
     )
     val_datagen = ImageDataGenerator(
         preprocessing_function=imagenet_normalize,
-        validation_split=train_cfg["validation_split"],
+        validation_split=split or 0.0,
     )
+    common = {
+        "target_size": (input_size, input_size),
+        "batch_size": train_cfg["batch_size"],
+        "class_mode": "binary",
+        "classes": list(CLASS_DIRS),
+        "interpolation": KERAS_INTERPOLATION,
+    }
 
     train_gen = train_datagen.flow_from_directory(
-        train_dir,
-        target_size=(input_size, input_size),
-        batch_size=train_cfg["batch_size"],
-        class_mode="binary",
-        subset="training",
+        train_dir, seed=DEFAULT_SEED, subset="training" if split else None, **common
     )
-    val_gen = val_datagen.flow_from_directory(
-        train_dir,
-        target_size=(input_size, input_size),
-        batch_size=train_cfg["batch_size"],
-        class_mode="binary",
-        subset="validation",
-    )
+    if use_val_channel:
+        val_gen = val_datagen.flow_from_directory(val_dir, shuffle=False, **common)
+    else:
+        val_gen = val_datagen.flow_from_directory(
+            train_dir, shuffle=False, subset="validation", **common
+        )
     return train_gen, val_gen
+
+
+def compute_class_weight(labels) -> dict:
+    """Balanced class weights, n / (n_classes * n_c), from the training labels.
+
+    Replaces SMOTE: interpolating raw pixels between two tissue images makes
+    implausible images, while weighting the loss corrects the imbalance
+    without inventing data.
+    """
+    import numpy as np
+
+    labels = np.asarray(labels, dtype=int)
+    counts = np.bincount(labels, minlength=2)
+    total = int(counts.sum())
+    return {c: (total / (2.0 * n) if n else 0.0) for c, n in enumerate(counts.tolist())}
 
 
 def build_callbacks() -> list:
@@ -229,6 +241,7 @@ def run_two_phase_fit(
     epochs: int,
     initial_epoch: int,
     phase2_unfreeze_layers: int,
+    class_weight: dict | None = None,
 ) -> dict:
     """Two-phase transfer learning, shared by all trainers.
 
@@ -257,7 +270,7 @@ def run_two_phase_fit(
             metrics=["accuracy", tf.keras.metrics.Precision(), tf.keras.metrics.Recall()],
         )
         logger.info(
-            "=== %s Phase 1 (frozen backbone, lr=%.2e) epochs %d→%d ===",
+            "=== %s Phase 1 (frozen backbone, lr=%.2e) epochs %d->%d ===",
             model_name,
             learning_rate,
             initial_epoch,
@@ -269,6 +282,7 @@ def run_two_phase_fit(
             epochs=phase1_epochs,
             initial_epoch=initial_epoch,
             callbacks=callbacks,
+            class_weight=class_weight,
             verbose=1,
         )
         history1 = _extract_history(h1)
@@ -282,7 +296,7 @@ def run_two_phase_fit(
         for layer in base.layers[:-phase2_unfreeze_layers]:
             layer.trainable = False
     logger.info(
-        "=== %s Phase 2 (top %d layers unfrozen, lr=%.2e) epochs %d→%d ===",
+        "=== %s Phase 2 (top %d layers unfrozen, lr=%.2e) epochs %d->%d ===",
         model_name,
         phase2_unfreeze_layers,
         phase2_lr,
@@ -300,6 +314,7 @@ def run_two_phase_fit(
         epochs=epochs,
         initial_epoch=phase2_initial_epoch,
         callbacks=callbacks,
+        class_weight=class_weight,
         verbose=1,
     )
     history2 = _extract_history(h2)
@@ -316,13 +331,13 @@ def validate_outputs(model_dir: str, model_name: str) -> bool:
     ]
     missing = [f for f in required if not os.path.exists(f)]
     if missing:
-        logger.error("❌ Missing required output files: %s", missing)
+        logger.error("Missing required output files: %s", missing)
         return False
     size = os.path.getsize(os.path.join(model_dir, "model.tar.gz"))
     if size < 1000:
-        logger.error("❌ Model tar.gz too small (%d bytes) - likely corrupt", size)
+        logger.error("Model tar.gz too small (%d bytes) - likely corrupt", size)
         return False
-    logger.info("✅ Outputs validated (model.tar.gz = %d bytes)", size)
+    logger.info("Outputs validated (model.tar.gz = %d bytes)", size)
     return True
 
 
@@ -331,20 +346,21 @@ def run_training(
     model_builder: Callable,
     model_dir: str,
     train_dir: str,
+    val_dir: str | None = None,
 ) -> bool:
     """Entire training loop, identical across all three trainer scripts.
 
-    `model_builder` takes (learning_rate, weights_path) → compiled Keras model.
+    `model_builder` takes (learning_rate, weights_path) -> (model, base_model).
     The trainer script only provides this function - everything else is
     orchestrated here.
     """
     if not model_dir:
-        logger.error("❌ model_dir is required")
+        logger.error("model_dir is required")
         return False
     try:
         os.makedirs(model_dir, exist_ok=True)
     except OSError as exc:
-        logger.error("❌ Cannot create model directory: %s", exc)
+        logger.error("Cannot create model directory: %s", exc)
         return False
 
     if not validate_training_dir(train_dir):
@@ -364,6 +380,7 @@ def run_training(
         learning_rate,
     )
 
+    set_seeds(DEFAULT_SEED)
     tf.keras.mixed_precision.set_global_policy("float32")
 
     model_cfg = CONFIG["models"][model_name]
@@ -375,7 +392,9 @@ def run_training(
     model, base = model_builder(learning_rate, weights_path)
 
     input_size = model_cfg["input_size"][0]
-    train_gen, val_gen = build_data_generators(train_dir, input_size)
+    train_gen, val_gen = build_data_generators(train_dir, input_size, val_dir)
+    class_weight = compute_class_weight(train_gen.classes)
+    logger.info("Class weights (benign=0, malignant=1): %s", class_weight)
 
     callbacks = build_callbacks()
     initial_epoch = resume_or_new(model)
@@ -391,6 +410,7 @@ def run_training(
         epochs=epochs,
         initial_epoch=initial_epoch,
         phase2_unfreeze_layers=model_cfg["phase2_unfreeze_layers"],
+        class_weight=class_weight,
     )
 
     tar_path, history_dict = save_and_package(model, model_dir, model_name, history)
@@ -417,7 +437,7 @@ def run_training(
         else 0.0
     )
     logger.info(
-        "✅ %s training complete - val_acc=%.4f, F1=%.4f, tar=%s",
+        "%s training complete - val_acc=%.4f, F1=%.4f, tar=%s",
         model_name,
         final_acc,
         f1,
@@ -427,7 +447,8 @@ def run_training(
 
 
 def parse_common_args():
-    """Shared CLI parser - SageMaker passes hyperparameters as `--KEY value`."""
+    """Paths only. SageMaker also passes hyperparameters as `--KEY value`;
+    training_config reads those, so they are left to parse_known_args here."""
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -439,11 +460,13 @@ def parse_common_args():
         "--train",
         default=os.environ.get("SM_CHANNEL_TRAINING", "/opt/ml/input/data/training"),
     )
-    parser.add_argument("--TRAINING_EPOCHS", type=int, default=20)
-    parser.add_argument("--TRAINING_BATCH_SIZE", type=int, default=32)
-    parser.add_argument("--TRAINING_LEARNING_RATE", type=float, default=0.001)
-    parser.add_argument("--PHASE1_EPOCHS", type=int, default=10)
-    return parser.parse_args()
+    parser.add_argument(
+        "--validation",
+        default=os.environ.get("SM_CHANNEL_VALIDATION"),
+        help="Optional validation channel (patient-grouped split from preprocessing)",
+    )
+    args, _ = parser.parse_known_args()
+    return args
 
 
 def trainer_main(model_name: str, model_builder: Callable) -> None:
@@ -454,8 +477,8 @@ def trainer_main(model_name: str, model_builder: Callable) -> None:
     )
     args = parse_common_args()
     try:
-        ok = run_training(model_name, model_builder, args.model_dir, args.train)
+        ok = run_training(model_name, model_builder, args.model_dir, args.train, args.validation)
         sys.exit(0 if ok else 1)
     except Exception as exc:
-        logger.error("❌ %s training script failed: %s", model_name, exc, exc_info=True)
+        logger.error("%s training script failed: %s", model_name, exc, exc_info=True)
         sys.exit(1)

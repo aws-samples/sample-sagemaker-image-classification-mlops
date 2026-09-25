@@ -1,11 +1,19 @@
-version: 0.2
-
-# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 #
-# Creates a baseline TF model and registers it "Approved" in SageMaker Model
-# Registry on first deploy (cold-start fix). Uses uv for TensorFlow install
-# because pip was timing out on the 500MB TF wheel - uv's parallel downloads
-# drop this from ~3 min to ~20 sec and eliminate the retry loop.
+# Creates a placeholder baseline TF model on first deploy (cold-start fix) and
+# registers it in SageMaker Model Registry as PendingManualApproval. Nothing is
+# auto-approved: the Inference-Deploy stage fails until a person approves one
+# package, for example:
+#
+#   aws sagemaker update-model-package \
+#     --model-package-arn arn:aws:sagemaker:<region>:111122223333:model-package/<group>/1 \
+#     --model-approval-status Approved --profile <profile>
+#
+# The build log prints the exact command with the new ARN. Uses uv for the
+# TensorFlow install because pip timed out on the 500MB TF wheel.
+
+version: 0.2
 
 env:
   variables:
@@ -36,7 +44,7 @@ phases:
       - python -c "import tensorflow as tf; print('TF', tf.__version__)"
       - echo "Fetching model artifacts bucket from training infrastructure"
       # Dynamically fetch the bucket name from training infrastructure outputs
-      - export MODEL_ARTIFACTS_BUCKET=$(aws s3api list-buckets --query "Buckets[?contains(Name, 'model-artifacts')].Name" --output text | grep medical-image-classification)
+      - export MODEL_ARTIFACTS_BUCKET=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, '${PROJECT_NAME}-') && contains(Name, 'model-artifacts')].Name" --output text)
       - echo "Using MODEL_ARTIFACTS_BUCKET=$MODEL_ARTIFACTS_BUCKET"
       # Verify bucket exists
       - aws s3 ls s3://$MODEL_ARTIFACTS_BUCKET/ || (echo "ERROR Model artifacts bucket not found" && exit 1)

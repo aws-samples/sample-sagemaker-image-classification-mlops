@@ -7,6 +7,7 @@ data "archive_file" "lambda_zip" {
   output_path = "${path.module}/lambda_function.zip"
 }
 
+# nosemgrep: terraform.aws.security.aws-lambda-x-ray-tracing-not-active.aws-lambda-x-ray-tracing-not-active - dynamic tracing_config sets mode Active; both callers pass enable_xray_tracing = true
 resource "aws_lambda_function" "this" {
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
@@ -22,6 +23,7 @@ resource "aws_lambda_function" "this" {
   # KMS key used to encrypt environment variables at rest. Null = the
   # AWS-managed Lambda key (still encrypted). Pass a CMK for tighter
   # access control.
+  # nosemgrep: terraform.aws.security.aws-lambda-environment-unencrypted.aws-lambda-environment-unencrypted - both callers pass the project CMK as env_kms_key_arn
   kms_key_arn = var.env_kms_key_arn
 
   # Reserved concurrency caps how many simultaneous executions this function
@@ -30,7 +32,7 @@ resource "aws_lambda_function" "this" {
   reserved_concurrent_executions = var.reserved_concurrent_executions
 
   # X-Ray tracing - end-to-end trace visibility for debugging latency and
-  # errors across API GW → Lambda → SageMaker.
+  # errors across API Gateway, Lambda and SageMaker.
   dynamic "tracing_config" {
     for_each = var.enable_xray_tracing ? [1] : []
     content {

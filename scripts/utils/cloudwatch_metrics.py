@@ -5,7 +5,7 @@
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 
 import boto3
 
@@ -38,7 +38,7 @@ class CloudWatchMetrics:
                             "MetricName": metric_name,
                             "Value": float(value),
                             "Unit": unit,
-                            "Timestamp": datetime.now(),
+                            "Timestamp": datetime.now(UTC),
                         }
                     ],
                 )

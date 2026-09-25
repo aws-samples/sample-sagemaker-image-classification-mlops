@@ -7,6 +7,7 @@ resource "aws_iam_role" "this" {
   description          = var.description
   path                 = var.path
   max_session_duration = var.max_session_duration
+  permissions_boundary = var.permissions_boundary_arn
   tags                 = var.tags
 }
 

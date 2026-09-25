@@ -1,5 +1,8 @@
-boto3
-numpy
-Pillow
-scikit-learn
-imbalanced-learn
+# Installed by run_preprocessing.sh. The step runs in the TensorFlow CPU
+# training image (Python 3.12), which already carries boto3; numpy stays on
+# the release TensorFlow 2.19 supports. scikit-learn provides GroupShuffleSplit
+# for the patient-grouped split. Pillow matches the Lambda and the trainers.
+Pillow==12.3.0
+boto3==1.42.0
+numpy==2.1.3
+scikit-learn==1.8.0

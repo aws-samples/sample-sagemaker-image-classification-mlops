@@ -38,11 +38,11 @@ output "codebuild_projects" {
 ################################################################################
 
 output "github_connection_arn" {
-  description = "CodeStar connection ARN for GitHub"
+  description = "ARN of the AWS CodeConnections connection to GitHub"
   value       = aws_codestarconnections_connection.github.arn
 }
 
 output "github_connection_status" {
-  description = "CodeStar connection status"
+  description = "Status of the AWS CodeConnections connection to GitHub (PENDING until the handshake is completed in the console)"
   value       = aws_codestarconnections_connection.github.connection_status
 }

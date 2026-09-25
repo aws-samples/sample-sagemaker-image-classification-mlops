@@ -37,7 +37,7 @@ EDGE_DENSITY_MIN = 0.01
 
 # Thresholds - configurable via env so operators can tune per-dataset
 # without touching code. Values picked to match the production training
-# preprocessor (resizes to 224×224).
+# preprocessor (resizes to 224x224).
 #
 # These are read at call-time inside validate_dataset() so tests (and
 # operators) can override them per-run without reimporting the module.

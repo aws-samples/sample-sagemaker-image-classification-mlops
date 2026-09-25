@@ -4,10 +4,9 @@
 data "terraform_remote_state" "training" {
   backend = "s3"
   config = {
-    # NOTE: Backend config does not support variables - bucket name must be hardcoded
-    bucket = "medical-image-classification-terraform-state-1757646452"
+    bucket = var.state_bucket_name
     key    = "training/terraform.tfstate"
-    region = "us-east-1"
+    region = var.state_bucket_region != "" ? var.state_bucket_region : var.aws_region
   }
 }
 
@@ -23,31 +22,41 @@ data "aws_sagemaker_prebuilt_ecr_image" "monitoring_jobs" {
   image_tag       = var.monitoring_job_image_tag
 }
 
-# Pre-built Lambda layer with Pillow and numpy for image preprocessing
-# Lambda Layer - Created by CodeBuild in pre_build phase
-resource "aws_lambda_layer_version" "pillow" {
-  filename         = "${path.module}/lambda-layers/pillow-numpy-layer.zip"
-  layer_name       = "${var.project_name}-pillow-numpy"
-  source_code_hash = fileexists("${path.module}/lambda-layers/pillow-numpy-layer.zip") ? filebase64sha256("${path.module}/lambda-layers/pillow-numpy-layer.zip") : ""
+# Pillow + numpy layer for the inference Lambda. The zip is not committed: it
+# is built at apply time by ops-scripts/build_lambda_layer.sh (pinned versions,
+# manylinux wheels for the Lambda runtime) unless it is already present, for
+# example from the CI/CD pre_build step. Delete the zip to force a rebuild.
+# The runner needs bash, zip and uv or pip.
+locals {
+  pillow_layer_zip    = "${path.module}/lambda-layers/pillow-numpy-layer.zip"
+  pillow_layer_script = "${path.module}/../ops-scripts/build_lambda_layer.sh"
+}
 
-  compatible_runtimes = ["python3.13"]
-  description         = "Pre-built Pillow and numpy for Lambda image preprocessing"
+resource "terraform_data" "pillow_layer_build" {
+  # A change to the build script (pinned versions) replaces the layer.
+  triggers_replace = [filesha256(local.pillow_layer_script)]
 
-  lifecycle {
-    ignore_changes = [source_code_hash]
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = "[ -f '${local.pillow_layer_zip}' ] || bash '${local.pillow_layer_script}'"
   }
 }
 
-# Local values
-locals {
-  # Tags for module calls (modules don't inherit provider default_tags)
-  common_tags = {
-    Project     = var.project_name
-    Environment = var.environment
-    ManagedBy   = "terraform"
-    Purpose     = "inference-pipeline"
-  }
+resource "aws_lambda_layer_version" "pillow" {
+  filename   = local.pillow_layer_zip
+  layer_name = "${var.project_name}-pillow-numpy"
 
+  compatible_runtimes = ["python3.13"]
+  description         = "Pillow and numpy for Lambda image preprocessing"
+
+  depends_on = [terraform_data.pillow_layer_build]
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.pillow_layer_build]
+  }
+}
+
+locals {
   pillow_layer_arn = aws_lambda_layer_version.pillow.arn
 
   # DLC registry - auto-constructed from aws_region for commercial regions.
@@ -63,11 +72,14 @@ locals {
     inference_bucket      = data.terraform_remote_state.training.outputs.inference_results_bucket
     processed_data_bucket = data.terraform_remote_state.training.outputs.processed_data_bucket
     monitoring_bucket     = data.terraform_remote_state.training.outputs.monitoring_bucket
+    model_artifacts       = data.terraform_remote_state.training.outputs.model_artifacts_bucket
     kms_key_arn           = data.terraform_remote_state.training.outputs.kms_key_arn
   }
 
-  # Define endpoint name in inference pipeline
   endpoint_name = "${var.project_name}-endpoint"
+
+  # Browser origin allowed to call the API: the CloudFront frontend.
+  frontend_origin = module.frontend_hosting.cloudfront_url
 
   # Lambda configurations
   lambda_configs = {
@@ -79,6 +91,7 @@ locals {
         ENDPOINT_NAME    = local.endpoint_name
         INFERENCE_BUCKET = local.training_outputs.inference_bucket
         PROJECT_NAME     = var.project_name
+        ALLOWED_ORIGIN   = local.frontend_origin
         # Hard cap on the base64-encoded image size the handler accepts.
         # Guards against bill-inflation attacks (see variables.tf).
         MAX_IMAGE_BYTES = tostring(var.max_image_bytes)
@@ -87,8 +100,7 @@ locals {
         ENABLE_BEDROCK_HYBRID        = tostring(var.enable_bedrock_hybrid_inference)
         BEDROCK_MODEL_ID             = var.bedrock_model_id
         BEDROCK_CONFIDENCE_THRESHOLD = tostring(var.bedrock_confidence_threshold)
-        # Human-in-the-loop review: low-confidence cases start an A2I human loop
-        # against this flow definition (empty = disabled; see monitoring.tf).
+        # Optional A2I human review of low-confidence cases (empty = disabled).
         FLOW_DEFINITION_ARN = var.enable_human_review ? module.a2i_review[0].flow_definition_arn : ""
         # Bedrock guardrail applied to the hybrid FM reasoning output (empty = none).
         BEDROCK_GUARDRAIL_ID      = var.enable_bedrock_hybrid_inference ? aws_bedrock_guardrail.hybrid[0].guardrail_id : ""
@@ -109,14 +121,13 @@ locals {
     }
   }
 
-  # Log groups configuration
   log_groups = {
     api_gateway = {
-      name = "/aws/apigateway/${var.project_name}-api"
+      name = module.api_gateway.access_log_group_name
     }
   }
 
-  # Dashboard configuration - uses native AWS metrics + inference handler custom metrics
+  # Native AWS metrics plus the inference handler's custom metrics.
   dashboard_config = jsonencode({
     widgets = [
       {
@@ -169,6 +180,7 @@ locals {
             ["AWS/SageMaker", "ModelLatency", "EndpointName", local.endpoint_name, "VariantName", "AllTraffic"],
             [".", "Invocations", ".", ".", ".", "."],
             [".", "InvocationModelErrors", ".", ".", ".", "."],
+            [".", "Invocation5XXErrors", ".", ".", ".", "."],
             [".", "Invocation4XXErrors", ".", ".", ".", "."]
           ]
           view    = "timeSeries"
@@ -221,7 +233,6 @@ locals {
     ]
   })
 
-  # Alarms configuration - uses native AWS metrics only
   alarms_config = {
     api_4xx_errors = {
       alarm_name          = "${var.project_name}-api-4xx-errors"
@@ -278,5 +289,3 @@ locals {
     }
   }
 }
-
-

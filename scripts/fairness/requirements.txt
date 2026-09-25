@@ -1,6 +1,8 @@
-# Installed by run_fairness.sh at Processing-job start. Runs in the SageMaker
-# scikit-learn Processing image (Part 4 ongoing fairness monitoring), which
-# already carries boto3, numpy, pandas and scikit-learn - only Fairlearn is
-# actually added. Version pinned to match scripts/bias/requirements.txt so the
-# scheduled job and the in-pipeline gate compute metrics identically.
-fairlearn==0.14.0
+# Installed by run_fairness.sh. Runs in the SageMaker scikit-learn Processing
+# image (Python 3.9, scikit-learn 1.4), which already carries boto3, numpy,
+# pandas and scikit-learn, so only Fairlearn is added. fairlearn 0.13.0 is the
+# newest release that supports Python 3.9 and scikit-learn 1.4; the in-pipeline
+# gate (scripts/bias) uses 0.14.0 in the TensorFlow image. The two metrics
+# used, demographic_parity_difference and equalized_odds_difference, are
+# computed the same way in both releases.
+fairlearn==0.13.0

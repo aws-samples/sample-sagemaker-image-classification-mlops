@@ -20,9 +20,9 @@ module "s3_cloudtrail_logs" {
   # the SSL-only deny below), so the module must not also attach one.
   enable_ssl_enforcement = false
 
-  # Expire old CloudTrail logs after 400 days - balances audit retention
-  # (HIPAA requires 6 years but most orgs ship CloudTrail to a SIEM for
-  # long-term retention and only keep ~1 year in S3).
+  # Expire old CloudTrail logs after var.cloudtrail_retention_days. HIPAA
+  # requires 6 years of audit retention, which most organizations meet by
+  # shipping CloudTrail to a SIEM and keeping about a year in S3.
   lifecycle_rules = [{
     id                              = "expire-old-logs"
     status                          = "Enabled"
@@ -31,7 +31,7 @@ module "s3_cloudtrail_logs" {
     abort_incomplete_multipart_days = 7
   }]
 
-  tags = merge(local.common_tags, { Purpose = "cloudtrail-logs" })
+  tags = { Purpose = "cloudtrail-logs" }
 }
 
 # Bucket policy that grants CloudTrail service principal the write access
@@ -40,6 +40,8 @@ resource "aws_s3_bucket_policy" "cloudtrail" {
   count  = var.enable_cloudtrail ? 1 : 0
   bucket = module.s3_cloudtrail_logs[0].bucket_id
 
+  # KICS: the policy denies s3:* when aws:SecureTransport is false; KICS does not match the jsonencode form
+  # kics-scan ignore-line
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -125,25 +127,26 @@ resource "aws_cloudtrail" "audit" {
     aws_cloudwatch_log_group.cloudtrail,
   ]
 
-  tags = merge(local.common_tags, { Purpose = "audit-trail" })
+  tags = { Purpose = "audit-trail" }
 }
 
-# CloudWatch log group that CloudTrail streams events into. KMS-encrypted
-# with the project CMK; 400-day retention to match S3 audit trail policy.
+# CloudWatch log group that CloudTrail streams events into, encrypted with the
+# project CMK and kept as long as the S3 copy.
 resource "aws_cloudwatch_log_group" "cloudtrail" {
   count = var.enable_cloudtrail ? 1 : 0
 
   name              = "/aws/cloudtrail/${var.project_name}"
   retention_in_days = var.cloudtrail_retention_days
   kms_key_id        = module.kms.key_arn
-  tags              = merge(local.common_tags, { Purpose = "audit-trail" })
+  tags              = { Purpose = "audit-trail" }
 }
 
 # IAM role that CloudTrail assumes to write to the log group.
 resource "aws_iam_role" "cloudtrail_cwl" {
   count = var.enable_cloudtrail ? 1 : 0
 
-  name = "${var.project_name}-cloudtrail-cwl-role"
+  name                 = "${var.project_name}-cloudtrail-cwl-role"
+  permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -153,8 +156,6 @@ resource "aws_iam_role" "cloudtrail_cwl" {
       Action    = "sts:AssumeRole"
     }]
   })
-
-  tags = local.common_tags
 }
 
 resource "aws_iam_role_policy" "cloudtrail_cwl" {
@@ -174,14 +175,14 @@ resource "aws_iam_role_policy" "cloudtrail_cwl" {
 }
 
 # SNS topic CloudTrail publishes log-file-delivery notifications to.
-# Using AWS-managed alias/aws/sns so the CloudTrail service principal
-# can publish without a custom key-policy grant.
+# CloudTrail cannot publish to a topic encrypted with alias/aws/sns, so the
+# topic uses the project CMK, whose policy grants CloudTrail when this is on.
 resource "aws_sns_topic" "cloudtrail_notifications" {
   count = var.enable_cloudtrail && var.enable_cloudtrail_sns ? 1 : 0
 
   name              = "${var.project_name}-cloudtrail-notifications"
-  kms_master_key_id = "alias/aws/sns"
-  tags              = merge(local.common_tags, { Purpose = "audit-trail" })
+  kms_master_key_id = module.kms.key_arn
+  tags              = { Purpose = "audit-trail" }
 }
 
 resource "aws_sns_topic_policy" "cloudtrail_notifications" {
@@ -222,7 +223,7 @@ resource "aws_budgets_budget" "monthly" {
   limit_amount      = tostring(var.monthly_budget_usd)
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
-  time_period_start = "2026-01-01_00:00"
+  time_period_start = var.budget_start_date
 
   cost_filter {
     name = "TagKeyValue"
@@ -261,5 +262,5 @@ resource "aws_budgets_budget" "monthly" {
     }
   }
 
-  tags = merge(local.common_tags, { Purpose = "cost-governance" })
+  tags = { Purpose = "cost-governance" }
 }

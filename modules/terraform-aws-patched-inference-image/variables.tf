@@ -72,7 +72,13 @@ variable "tags" {
 }
 
 variable "build_image_on_create" {
-  description = "Trigger one CodeBuild run at apply time (and wait) so the patched :latest image exists before the first model approval/auto-deploy. Requires AWS CLI on the Terraform runner. Set false in CI where the image is built by a separate stage."
+  description = "Trigger one CodeBuild run at apply time (and wait) so a patched image exists before the endpoint and auto-deploy Lambda pin its digest. Requires AWS CLI on the Terraform runner. When false, an image must already be in the repository (built by a separate stage) or the apply fails reading it."
   type        = bool
   default     = true
+}
+
+variable "permissions_boundary_arn" {
+  description = "ARN of the permissions boundary attached to the IAM roles this module creates. null leaves them unbounded."
+  type        = string
+  default     = null
 }

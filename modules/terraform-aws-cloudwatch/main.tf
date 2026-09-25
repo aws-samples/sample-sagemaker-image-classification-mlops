@@ -20,7 +20,7 @@ locals {
       properties = {
         query  = "SOURCE '${var.log_group_names.processing}'\n| fields @timestamp, @message\n| filter @message like /PerformanceHistoryRecord/ and @message like /${model}/\n| sort @timestamp desc\n| limit 10"
         region = var.aws_region
-        title  = "${model == "vgg16" ? "🔵" : model == "densenet121" ? "🟢" : "🟡"} ${title(model)} Performance History"
+        title  = "${title(model)} Performance History"
         view   = "table"
       }
     }
@@ -52,7 +52,7 @@ locals {
       ]
       view   = "singleValue"
       region = var.aws_region
-      title  = "🎯 Ensemble Performance"
+      title  = "Ensemble Performance"
       period = 300
       stat   = "Maximum"
     }
@@ -117,7 +117,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
         properties = {
           query  = "SOURCE '${var.log_group_names.processing}'\n| fields @timestamp, @message\n| filter @message like /dataset_version/\n| sort @timestamp desc\n| limit 10"
           region = var.aws_region
-          title  = "📊 Dataset History Table"
+          title  = "Dataset History Table"
           view   = "table"
         }
       }],
@@ -132,7 +132,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
         properties = {
           query  = "SOURCE '${var.log_group_names.processing}'\n| fields @timestamp, @message\n| filter @message like /PerformanceHistoryRecord/ and @message like /ensemble/\n| sort @timestamp desc\n| limit 10"
           region = var.aws_region
-          title  = "🎯 Ensemble Performance History"
+          title  = "Ensemble Performance History"
           view   = "table"
         }
       }],
@@ -147,7 +147,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
             metrics = local.training_accuracy_metrics
             view    = "timeSeries"
             region  = var.aws_region
-            title   = "📈 Training Accuracy Comparison"
+            title   = "Training Accuracy Comparison"
             period  = 300
             stat    = "Maximum"
             yAxis   = { left = { min = 0, max = 100 } }
@@ -163,7 +163,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
             metrics = local.validation_accuracy_metrics
             view    = "timeSeries"
             region  = var.aws_region
-            title   = "📊 Validation Accuracy Comparison"
+            title   = "Validation Accuracy Comparison"
             period  = 300
             stat    = "Maximum"
             yAxis   = { left = { min = 0, max = 100 } }
@@ -179,7 +179,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
             metrics = local.training_loss_metrics
             view    = "timeSeries"
             region  = var.aws_region
-            title   = "📉 Training Loss Comparison"
+            title   = "Training Loss Comparison"
             period  = 300
             stat    = "Maximum"
           }
@@ -194,7 +194,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
             metrics = local.validation_loss_metrics
             view    = "timeSeries"
             region  = var.aws_region
-            title   = "📉 Validation Loss Comparison"
+            title   = "Validation Loss Comparison"
             period  = 300
             stat    = "Maximum"
           }
@@ -209,7 +209,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
             metrics = local.training_precision_metrics
             view    = "timeSeries"
             region  = var.aws_region
-            title   = "🎯 Training Precision Comparison"
+            title   = "Training Precision Comparison"
             period  = 300
             stat    = "Maximum"
             yAxis   = { left = { min = 0, max = 100 } }
@@ -225,7 +225,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
             metrics = local.training_recall_metrics
             view    = "timeSeries"
             region  = var.aws_region
-            title   = "🔍 Training Recall Comparison"
+            title   = "Training Recall Comparison"
             period  = 300
             stat    = "Maximum"
             yAxis   = { left = { min = 0, max = 100 } }
@@ -241,7 +241,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
             metrics = local.validation_precision_metrics
             view    = "timeSeries"
             region  = var.aws_region
-            title   = "🎯 Validation Precision Comparison"
+            title   = "Validation Precision Comparison"
             period  = 300
             stat    = "Maximum"
             yAxis   = { left = { min = 0, max = 100 } }
@@ -257,7 +257,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
             metrics = local.validation_recall_metrics
             view    = "timeSeries"
             region  = var.aws_region
-            title   = "🔍 Validation Recall Comparison"
+            title   = "Validation Recall Comparison"
             period  = 300
             stat    = "Maximum"
             yAxis   = { left = { min = 0, max = 100 } }
@@ -273,7 +273,7 @@ resource "aws_cloudwatch_dashboard" "training_dashboard" {
             metrics     = local.overfitting_gap_metrics
             view        = "timeSeries"
             region      = var.aws_region
-            title       = "⚠️ Overfitting Gap Analysis (Lower is Better)"
+            title       = "Overfitting Gap Analysis (Lower is Better)"
             period      = 300
             stat        = "Maximum"
             annotations = { horizontal = [{ value = 0.2, label = "Warning Threshold" }] }
@@ -297,6 +297,8 @@ resource "aws_cloudwatch_dashboard" "generic" {
 ################################################################################
 
 # Training mode: Data processing metrics
+# KICS: application metric filter; the CIS S3 bucket-policy-change alarm is an account-level control outside this sample
+# kics-scan ignore-line
 resource "aws_cloudwatch_log_metric_filter" "data_metrics" {
   for_each = var.enable_training_monitoring ? toset(local.processed_data_types) : toset([])
 
@@ -315,6 +317,8 @@ resource "aws_cloudwatch_log_metric_filter" "data_metrics" {
 }
 
 # Training mode: Training metrics per model
+# KICS: application metric filter; the CIS S3 bucket-policy-change alarm is an account-level control outside this sample
+# kics-scan ignore-line
 resource "aws_cloudwatch_log_metric_filter" "training_metrics" {
   for_each = var.enable_training_monitoring ? {
     for pair in setproduct(var.training_models, local.training_metric_types) :
@@ -339,6 +343,8 @@ resource "aws_cloudwatch_log_metric_filter" "training_metrics" {
 }
 
 # Training mode: Evaluation summary metrics
+# KICS: application metric filter; the CIS S3 bucket-policy-change alarm is an account-level control outside this sample
+# kics-scan ignore-line
 resource "aws_cloudwatch_log_metric_filter" "evaluation_summary_metrics" {
   for_each = var.enable_training_monitoring ? toset(local.evaluation_summary_values) : toset([])
 
@@ -357,6 +363,8 @@ resource "aws_cloudwatch_log_metric_filter" "evaluation_summary_metrics" {
 }
 
 # Training mode: Ensemble metrics
+# KICS: application metric filter; the CIS S3 bucket-policy-change alarm is an account-level control outside this sample
+# kics-scan ignore-line
 resource "aws_cloudwatch_log_metric_filter" "ensemble_metrics" {
   for_each = var.enable_training_monitoring ? toset(local.ensemble_values) : toset([])
 
@@ -375,6 +383,8 @@ resource "aws_cloudwatch_log_metric_filter" "ensemble_metrics" {
 }
 
 # Training mode: Registry metrics
+# KICS: application metric filter; the CIS S3 bucket-policy-change alarm is an account-level control outside this sample
+# kics-scan ignore-line
 resource "aws_cloudwatch_log_metric_filter" "registry_metrics" {
   for_each = var.enable_training_monitoring ? toset(local.registry_values) : toset([])
 
@@ -393,6 +403,8 @@ resource "aws_cloudwatch_log_metric_filter" "registry_metrics" {
 }
 
 # Generic mode: Custom metric filters
+# KICS: application metric filter; the CIS S3 bucket-policy-change alarm is an account-level control outside this sample
+# kics-scan ignore-line
 resource "aws_cloudwatch_log_metric_filter" "generic" {
   for_each = var.enable_training_monitoring ? {} : var.metric_filters
 

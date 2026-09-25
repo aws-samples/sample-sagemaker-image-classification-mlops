@@ -1,4 +1,6 @@
 <!DOCTYPE html>
+<!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. -->
+<!-- SPDX-License-Identifier: MIT-0 -->
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -47,7 +49,7 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1>🔬 Medical Image Classification</h1>
+            <h1>Medical Image Classification</h1>
             <p>AI-powered medical image analysis using deep learning</p>
         </div>
 
@@ -58,7 +60,7 @@
             </div>
 
             <div class="upload-area" id="uploadArea">
-                <div class="upload-icon">📁</div>
+                <div class="upload-icon">&#128193;</div>
                 <div class="upload-text">Click to upload or drag and drop images</div>
                 <div style="font-size: 0.9em; color: #999; margin-top: 10px;">Supported formats: JPG, JPEG, PNG | Select multiple files</div>
                 <input type="file" id="fileInput" class="file-input" accept="image/*" multiple>
@@ -74,15 +76,17 @@
             <div class="result-area" id="resultArea"></div>
 
             <div style="text-align: center; margin-top: 30px;">
-                <button class="btn" id="predictBtn" disabled>🔍 Analyze Images</button>
+                <button class="btn" id="predictBtn" disabled>Analyze Images</button>
                 <div id="fileCounter" class="file-counter" style="display: none;">0 files selected</div>
             </div>
         </div>
     </div>
 
     <script>
-        // Configuration - Automatically injected by Terraform
+        // Injected by Terraform. The API key meters and rate-limits callers; it
+        // is visible to anyone who loads this page, so it is not authentication.
         const API_ENDPOINT = '${api_url}/predict';
+        const API_KEY = '${api_key}';
 
         let selectedFiles = [];
 
@@ -207,11 +211,13 @@
                         const base64Image = await fileToBase64(file);
 
                         // Send base64 - Lambda will decode and convert to model format
+                        const headers = { 'Content-Type': 'application/json' };
+                        if (API_KEY) {
+                            headers['x-api-key'] = API_KEY;
+                        }
                         const response = await fetch(API_ENDPOINT, {
                             method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
+                            headers: headers,
                             body: JSON.stringify({
                                 image: base64Image.split(',')[1] // Remove data:image/jpeg;base64, prefix
                             })
@@ -270,14 +276,15 @@
                     const isMalignant = prediction.toLowerCase().includes('malignant');
                     const confidencePercent = Math.round(confidence * 100);
                     const confidenceClass = isMalignant ? 'confidence-malignant' : 'confidence-benign';
-                    const emoji = isMalignant ? '⚠️' : '✅';
+                    const marker = isMalignant ? '&#9888;' : '&#10003;';
 
                     cardsHtml += `
                         <div class="result-card">
                             <img src="$${URL.createObjectURL(item.file)}" alt="$${item.file.name}">
                             <div style="font-weight: bold; margin-bottom: 8px;">$${item.file.name}</div>
-                            <div style="font-size: 1.1em; margin-bottom: 5px;">$${emoji} $${prediction}</div>
+                            <div style="font-size: 1.1em; margin-bottom: 5px;">$${marker} $${prediction}</div>
                             <div style="margin-bottom: 8px;">Confidence: $${confidencePercent}%</div>
+                            $${typeof item.result.threshold_used === 'number' ? `<div style="font-size: 0.85em; color: #666; margin-bottom: 8px;">Decision threshold: $${item.result.threshold_used.toFixed(2)}</div>` : ''}
                             <div class="confidence-bar">
                                 <div class="confidence-fill $${confidenceClass}" style="width: $${confidencePercent}%"></div>
                             </div>
@@ -288,7 +295,7 @@
                         <div class="result-card" style="border-color: #dc3545;">
                             <img src="$${URL.createObjectURL(item.file)}" alt="$${item.file.name}">
                             <div style="font-weight: bold; margin-bottom: 8px;">$${item.file.name}</div>
-                            <div style="color: #dc3545;">❌ Error: $${item.error}</div>
+                            <div style="color: #dc3545;">Error: $${item.error}</div>
                         </div>
                     `;
                 }
@@ -311,7 +318,7 @@
         function showError(message) {
             resultArea.className = 'result-area result-error';
             resultArea.innerHTML = `
-                <div class="prediction">❌ Error</div>
+                <div class="prediction">Error</div>
                 <div>$${message}</div>
             `;
             resultArea.style.display = 'block';

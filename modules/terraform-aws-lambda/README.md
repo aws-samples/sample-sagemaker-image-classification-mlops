@@ -13,7 +13,7 @@ Reusable Lambda function module with automatic source code packaging, configurab
 ## Requirements
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | terraform | ~> 1.15 |
 | archive | ~> 2.0 |
 | aws | ~> 6.0 |
@@ -21,14 +21,14 @@ Reusable Lambda function module with automatic source code packaging, configurab
 ## Providers
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | archive | ~> 2.0 |
 | aws | ~> 6.0 |
 
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [aws_cloudwatch_log_group.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_log_group) | resource |
 | [aws_lambda_function.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function) | resource |
 | [aws_lambda_permission.permissions](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_permission) | resource |
@@ -36,14 +36,14 @@ Reusable Lambda function module with automatic source code packaging, configurab
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
+| ---- | ----------- | ---- | ------- | :------: |
 | execution\_role\_arn | Lambda execution role ARN | `string` | n/a | yes |
 | function\_name | Lambda function name | `string` | n/a | yes |
 | handler | Lambda function handler | `string` | n/a | yes |
 | source\_dir | Path to Lambda source code directory | `string` | n/a | yes |
 | dead\_letter\_target\_arn | ARN of an SQS queue or SNS topic that receives failed async invocation events after Lambda exhausts its retry policy. Null = no DLQ (synchronous/API GW invocations don't need one). | `string` | `null` | no |
 | description | Description of the Lambda function | `string` | `null` | no |
-| enable\_xray\_tracing | Enable Active X-Ray tracing on the Lambda function. Recommended for production - gives end-to-end latency visibility across API GW → Lambda → downstream AWS services. | `bool` | `true` | no |
+| enable\_xray\_tracing | Enable Active X-Ray tracing on the Lambda function. Recommended for production - gives end-to-end latency visibility across API Gateway, Lambda and downstream AWS services. | `bool` | `true` | no |
 | env\_kms\_key\_arn | KMS CMK ARN used to encrypt Lambda environment variables. Null = AWS-managed key (still encrypted at rest). | `string` | `null` | no |
 | environment\_variables | Environment variables for Lambda | `map(string)` | `null` | no |
 | layers | List of Lambda Layer ARNs | `list(string)` | `[]` | no |
@@ -59,7 +59,7 @@ Reusable Lambda function module with automatic source code packaging, configurab
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ---- | ----------- |
 | function\_arn | Lambda function ARN |
 | function\_name | Lambda function name |
 | invoke\_arn | Lambda function invoke ARN |
@@ -71,7 +71,7 @@ Reusable Lambda function module with automatic source code packaging, configurab
 
 ```
 modules/terraform-aws-lambda/
-├── main.tf          # Archive data source, Lambda function, Lambda permissions
-├── outputs.tf       # Function name, ARN, invoke ARN
-└── variables.tf     # Source dir, function config, permissions, layers, tags
+|-- main.tf          # Archive data source, Lambda function, log group, Lambda permissions
+|-- outputs.tf       # Function name, ARN, invoke ARN
+`-- variables.tf     # Source dir, function config, permissions, layers, tags
 ```

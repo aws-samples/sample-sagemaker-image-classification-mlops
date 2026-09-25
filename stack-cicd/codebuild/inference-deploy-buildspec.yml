@@ -1,18 +1,20 @@
-version: 0.2
-
-# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 #
 # Builds the Pillow+NumPy Lambda layer and applies the inference Terraform
-# root. Uses uv (https://github.com/astral-sh/uv) for package installs -
-# ~10-100x faster than pip, drop-in replacement, drastically shortens the
-# wheel-building step for Pillow on the CodeBuild container.
+# root. The backend settings (TF_STATE_*) and the TF_VAR_* inputs are set on
+# the CodeBuild project by stack-cicd. Uses uv
+# (https://github.com/astral-sh/uv) for package installs: a drop-in for pip
+# that shortens the wheel-building step for Pillow on the CodeBuild container.
+
+version: 0.2
 
 env:
   variables:
     LAYER_DIR: "stack-inference/lambda-layers"
     BUILD_DIR: "/tmp/lambda-layer-build"
     TERRAFORM_VERSION: "1.15.6"
-    PILLOW_VERSION: "12.2.0"
+    PILLOW_VERSION: "12.3.0"
     NUMPY_VERSION: "2.4.4"
     UV_VERSION: "0.9.9"
     PYTHON_VERSION: "3.13"
@@ -24,9 +26,11 @@ phases:
     commands:
       - "echo Installing Terraform ${TERRAFORM_VERSION}..."
       - "dnf update -y python3-pip libtasn1 libxml2 || true"
-      - "curl -fsSL https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip -o terraform.zip"
-      - "unzip terraform.zip"
-      - "mv terraform /usr/local/bin/"
+      - curl -fsSLO "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+      - curl -fsSLO "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"
+      - grep " terraform_${TERRAFORM_VERSION}_linux_amd64.zip$" "terraform_${TERRAFORM_VERSION}_SHA256SUMS" | sha256sum -c -
+      - unzip -o "terraform_${TERRAFORM_VERSION}_linux_amd64.zip" terraform -d /usr/local/bin/
+      - rm -f "terraform_${TERRAFORM_VERSION}_linux_amd64.zip" "terraform_${TERRAFORM_VERSION}_SHA256SUMS"
       - "terraform --version"
       # Install uv from PyPI at a pinned version. pip resolves it through the
       # hash-checked package index instead of piping a live remote installer
@@ -53,12 +57,31 @@ phases:
       - "ls -lh $CODEBUILD_SRC_DIR/$LAYER_DIR/pillow-numpy-layer.zip"
       - "rm -rf $BUILD_DIR"
       - "echo Initializing Terraform"
-      - "cd $CODEBUILD_SRC_DIR/stack-inference && terraform init"
+      - cd "$CODEBUILD_SRC_DIR/stack-inference" && terraform init -input=false -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="region=${TF_STATE_REGION}" -backend-config="kms_key_id=${TF_STATE_KMS_KEY_ID}"
 
   build:
     commands:
       - "cd $CODEBUILD_SRC_DIR/stack-inference"
-      - "terraform apply -auto-approve"
+      # The endpoint serves the newest Approved package in the group: the
+      # approved baseline on the first run, later the version the auto-deploy
+      # Lambda has already rolled out. A TF_VAR_model_package_arn set on the
+      # project wins. Fails early when nothing is approved yet.
+      - |
+        if [ -z "${TF_VAR_model_package_arn:-}" ]; then
+          TF_VAR_model_package_arn="$(aws sagemaker list-model-packages \
+            --model-package-group-name "${MODEL_PACKAGE_GROUP_NAME}" \
+            --model-approval-status Approved \
+            --sort-by CreationTime --sort-order Descending --max-results 1 \
+            --query 'ModelPackageSummaryList[0].ModelPackageArn' --output text)"
+        fi
+        if [ -z "${TF_VAR_model_package_arn}" ] || [ "${TF_VAR_model_package_arn}" = "None" ]; then
+          echo "ERROR no Approved model package in ${MODEL_PACKAGE_GROUP_NAME}. Approve the baseline first (see baseline-model-buildspec.yml)."
+          exit 1
+        fi
+        export TF_VAR_model_package_arn
+        echo "Deploying model package ${TF_VAR_model_package_arn}"
+        terraform plan -input=false -out=tfplan
+      - "terraform apply -input=false tfplan"
 
   post_build:
     commands:

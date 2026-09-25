@@ -16,8 +16,19 @@ class ModelReportGenerator:
         self.output_path = output_path
         os.makedirs(output_path, exist_ok=True)
 
-    def generate_all_reports(self, evaluation_results, predictions_data, true_labels):
+    def generate_all_reports(
+        self,
+        evaluation_results,
+        predictions_data,
+        true_labels,
+        decision_threshold=None,
+        subgroup_labels=None,
+    ):
         """Generate every report the RegisterModel step references in S3.
+
+        decision_threshold is the validation-tuned threshold applied to the
+        averaged score (0.5 only when none was tuned); subgroup_labels is one
+        subgroup per test image (magnification for BreakHis).
 
         This includes the bias and explainability reports. The training
         pipeline's RegisterModel step points at evaluation/bias_report.json,
@@ -34,7 +45,9 @@ class ModelReportGenerator:
         reports["data_quality_constraints"] = self.generate_data_quality_constraints()
         reports["test_input"] = self.generate_test_input()
 
-        bias_report, data_bias_report = self.generate_bias_reports(predictions_data, true_labels)
+        bias_report, data_bias_report = self.generate_bias_reports(
+            predictions_data, true_labels, subgroup_labels, decision_threshold
+        )
         reports["bias_report"] = bias_report
         reports["data_bias_report"] = data_bias_report
         reports["explainability_report"] = self.generate_explainability_report()
@@ -174,7 +187,9 @@ class ModelReportGenerator:
         stacked = np.stack([arr[:min_len] for arr in score_arrays], axis=0)
         return stacked.mean(axis=0)
 
-    def generate_bias_reports(self, predictions_data, true_labels, subgroup_labels=None):
+    def generate_bias_reports(
+        self, predictions_data, true_labels, subgroup_labels=None, decision_threshold=None
+    ):
         """Write the pre-training and post-training bias reports.
 
         Produces two files in an analysis.json-compatible
@@ -192,7 +207,8 @@ class ModelReportGenerator:
         scores = self._ensemble_scores(predictions_data)
 
         pre_training = self._build_pre_training_bias(labels, subgroup_labels)
-        post_training = self._build_post_training_bias(labels, scores, subgroup_labels)
+        threshold = 0.5 if decision_threshold is None else float(decision_threshold)
+        post_training = self._build_post_training_bias(labels, scores, subgroup_labels, threshold)
 
         data_bias_path = os.path.join(self.output_path, "data_bias_report.json")
         with open(data_bias_path, "w") as f:
@@ -282,12 +298,12 @@ class ModelReportGenerator:
             ),
         }
 
-    def _build_post_training_bias(self, labels, scores, subgroup_labels):
+    def _build_post_training_bias(self, labels, scores, subgroup_labels, threshold=0.5):
         """Compute post-training bias metrics across real or proxy subgroups."""
         notes = [
             "Post-training bias compares model behaviour across subgroups. "
-            "Label 1 (malignant) is the positive class; predictions use a 0.5 "
-            "decision threshold on the averaged ensemble score.",
+            "Label 1 (malignant) is the positive class; predictions use a "
+            f"{threshold:.2f} decision threshold on the averaged model score.",
         ]
         metrics = []
 
@@ -306,20 +322,20 @@ class ModelReportGenerator:
                 "note": " ".join(notes),
             }
 
-        predictions = (scores >= 0.5).astype(int)
+        predictions = (scores >= threshold).astype(int)
 
         if subgroup_labels is not None:
             subgroups = np.asarray(subgroup_labels).flatten()
             facet = "provided_subgroup"
             if subgroups.size != labels.size:
-                subgroups = self._proxy_subgroups(scores)
+                subgroups = self._proxy_subgroups(scores, threshold)
                 facet = "proxy_confidence_terciles"
                 notes.append(
                     "Provided subgroup labels did not align with the test set, "
                     "so a proxy split was used instead."
                 )
         else:
-            subgroups = self._proxy_subgroups(scores)
+            subgroups = self._proxy_subgroups(scores, threshold)
             facet = "proxy_confidence_terciles"
             notes.append(
                 "This dataset has no demographic facets (no patient sex, age, "
@@ -348,15 +364,15 @@ class ModelReportGenerator:
             "note": " ".join(notes),
         }
 
-    def _proxy_subgroups(self, scores):
+    def _proxy_subgroups(self, scores, threshold=0.5):
         """Split samples into terciles by prediction confidence.
 
-        Confidence is distance from the 0.5 decision boundary. Returns an int
+        Confidence is distance from the decision threshold. Returns an int
         array of subgroup ids (0 = least confident, 2 = most confident). Falls
         back to a first-half / second-half split when there are too few samples
         to form terciles.
         """
-        confidence = np.abs(scores - 0.5)
+        confidence = np.abs(scores - threshold)
         if confidence.size < 3:
             half = confidence.size // 2
             subgroups = np.zeros(confidence.size, dtype=int)

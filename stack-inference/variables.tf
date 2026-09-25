@@ -26,6 +26,28 @@ variable "aws_region" {
   type        = string
 }
 
+variable "state_bucket_name" {
+  description = "Name of the Terraform state bucket (stack-backend-setup output state_bucket_id). The inference stack reads the training stack's outputs from it."
+  type        = string
+
+  validation {
+    condition     = var.state_bucket_name != ""
+    error_message = "Set state_bucket_name to the stack-backend-setup output state_bucket_id (make passes it as TF_VAR_state_bucket_name)."
+  }
+}
+
+variable "state_bucket_region" {
+  description = "Region of the Terraform state bucket (stack-backend-setup output state_bucket_region). If empty, aws_region is used."
+  type        = string
+  default     = ""
+}
+
+variable "permissions_boundary_arn" {
+  description = "ARN of the permissions boundary attached to every IAM role this stack creates (stack-backend-setup output workload_boundary_arn). Required when CI/CD CodeBuild applies the stack; null leaves the roles unbounded."
+  type        = string
+  default     = null
+}
+
 ################################################################################
 # API Gateway
 ################################################################################
@@ -34,6 +56,46 @@ variable "api_stage_name" {
   description = "API Gateway stage name"
   type        = string
   default     = "prod"
+}
+
+variable "api_authorization_type" {
+  description = <<-EOT
+    Authorization on POST /predict and GET /results/{id}. "NONE" (default)
+    relies on the API key, usage plan and WAF; the key is visible to anyone who
+    loads the frontend, so it limits and meters callers but does not
+    authenticate them. To authenticate:
+      - "AWS_IAM": callers sign with SigV4 and need execute-api:Invoke on the
+        API (browsers get credentials from a Cognito identity pool).
+      - "COGNITO_USER_POOLS": set api_cognito_user_pool_arns; callers send the
+        user pool ID token in the Authorization header. The static frontend
+        would need a sign-in flow added.
+  EOT
+  type        = string
+  default     = "NONE"
+}
+
+variable "api_cognito_user_pool_arns" {
+  description = "Cognito user pool ARNs for the API authorizer when api_authorization_type = \"COGNITO_USER_POOLS\"."
+  type        = list(string)
+  default     = []
+}
+
+variable "api_require_api_key" {
+  description = "Require the x-api-key header on the API. The key is created with a usage plan and injected into the static frontend's config."
+  type        = bool
+  default     = true
+}
+
+variable "api_enable_waf" {
+  description = "Associate a regional AWS WAF web ACL (AWS managed common rule set + per-IP rate-based rule) with the API stage."
+  type        = bool
+  default     = true
+}
+
+variable "api_waf_rate_limit" {
+  description = "Requests per client IP in any 5-minute window before the WAF rate-based rule blocks that IP."
+  type        = number
+  default     = 300
 }
 
 variable "api_throttling_rate_limit" {
@@ -146,10 +208,22 @@ variable "endpoint_initial_instance_count" {
   default     = 1
 }
 
+variable "model_package_arn" {
+  description = "Versioned ARN of the Approved model package the endpoint starts with (arn:aws:sagemaker:<region>:<account>:model-package/<group>/<version>). Seed and approve a baseline first (CI/CD baseline-model stage or stack-cicd/scripts/create_baseline_model.py). Later approvals are rolled out by the auto-deploy Lambda."
+  type        = string
+  default     = ""
+}
+
 variable "data_capture_sampling_percentage" {
-  description = "Percentage of data to capture for monitoring (0-100)"
+  description = "Percentage of endpoint invocations written to data capture (0-100). Applies to the Terraform-managed and auto-deployed endpoint configs."
   type        = number
   default     = 100
+}
+
+variable "data_capture_input" {
+  description = "Also capture request payloads. Off by default: drift and fairness monitoring read model output only, and Input capture stores every uploaded image."
+  type        = bool
+  default     = false
 }
 
 ################################################################################
@@ -181,12 +255,9 @@ variable "serverless_max_concurrency" {
   default     = 10
 }
 
-
 ################################################################################
-# Network
+# Scheduled drift Processing job
 ################################################################################
-
-
 
 variable "enable_drift_job" {
   description = "Enable the scheduled drift Processing job (Part 3). EventBridge Scheduler starts a SageMaker Processing job that reads endpoint data-capture output from S3, computes a Population Stability Index against the training baseline, and publishes it to CloudWatch, where the drift alarm and the EventBridge retrain rule consume it. Requires data capture, so it is skipped for serverless endpoints."
@@ -225,7 +296,7 @@ variable "drift_job_max_runtime" {
 }
 
 variable "monitoring_job_image_tag" {
-  description = "Tag of the AWS-managed scikit-learn Processing image used to run the scheduled drift and fairness scripts. Must carry a numpy/pandas/scikit-learn stack that already satisfies Fairlearn, otherwise pip upgrades numpy at job start and the container's pre-compiled scikit-learn fails with a binary-incompatibility ValueError. The 1.2-1 image is too old on both counts (Python 3.9, pandas 1.1.3); this matches the tag stack-training uses for its own Processing steps."
+  description = "Tag of the AWS-managed scikit-learn Processing image used to run the scheduled drift and fairness scripts. Must carry a numpy/pandas/scikit-learn stack that already satisfies Fairlearn, otherwise pip upgrades numpy at job start and the container's pre-compiled scikit-learn fails with a binary-incompatibility ValueError. The 1.2-1 image is too old on both counts (pandas 1.1.3)."
   type        = string
   default     = "1.4-2-cpu-py3"
 }
@@ -301,7 +372,7 @@ variable "patched_image_source_tag" {
 variable "dlc_ecr_registry" {
   description = "ECR registry hostname for the AWS Deep Learning Containers. Defaults to commercial-region canonical DLC registry. Override for GovCloud/CN: see https://github.com/aws/deep-learning-containers/blob/master/available_images.md"
   type        = string
-  default     = "" # Empty = construct from aws_region at the provider level (see locals in data.tf)
+  default     = "" # Empty = built from aws_region (see locals in data.tf)
 }
 
 variable "dlc_source_repository" {
@@ -318,12 +389,6 @@ variable "drift_threshold" {
   description = "Population Stability Index on the prediction-score distribution above which the drift alarm fires and retraining is triggered."
   type        = number
   default     = 0.2
-}
-
-variable "drift_feature_name" {
-  description = "Feature name whose feature_baseline_drift_<name> CloudWatch metric the drift alarm watches. For an image model only the model output is monitored, so this is the prediction score column from the output-only baseline."
-  type        = string
-  default     = "prediction_score"
 }
 
 variable "drift_alarm_period" {
@@ -359,7 +424,7 @@ variable "bedrock_confidence_threshold" {
 ################################################################################
 
 variable "enable_human_review" {
-  description = "When true, create the A2I human-review flow and let the inference Lambda route low-confidence predictions to a radiologist review queue (Part 4 human-in-the-loop). Requires review_workteam_arn for the flow definition to be created."
+  description = "Opt in to Amazon A2I human review: create the review flow and let the inference Lambda route low-confidence predictions to a reviewer queue. Amazon A2I is in maintenance mode (no longer open to new customers), so this is off by default and only works in accounts that already use A2I. Requires review_workteam_arn for the flow definition."
   type        = bool
   default     = false
 }

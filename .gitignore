@@ -17,7 +17,7 @@ env/
 # Data & Models
 # Note: the `data/` directory itself is ignored (too big for git), but DVC
 # metadata files (`data.dvc`, `.dvc/*` except `.dvc/cache` and `.dvc/tmp`)
-# MUST be committed — they're the pointer that says "this exact git commit
+# MUST be committed - they're the pointer that says "this exact git commit
 # trained against this exact S3 dataset hash".
 data/
 !data.dvc
@@ -29,11 +29,12 @@ models/
 
 # Terraform
 .terraform/
-.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 tfplan
 *.tfplan
+# Per-stack backend settings written by `make backend-config`
+backend.hcl
 
 # AWS
 .aws/
@@ -73,11 +74,7 @@ Thumbs.db
 project-doc/
 .gitkeep
 
-# Mirador security exports (contain account-internal data)
-mirador-resources-export-*.csv
-mirador-resources-export-*.json
-
-# Blog content — not part of the deployable codebase
+# Blog content - not part of the deployable codebase
 blog_docs/
 charts/
 *.docx

@@ -31,26 +31,28 @@ output "kms_key_arn" {
 }
 
 output "kms_key_alias" {
-  description = "Alias of the state encryption KMS key (usable in backend `kms_key_id`)"
-  value       = "alias/${var.project_name}-terraform-state"
+  description = "Alias of the state encryption KMS key (usable as the backend kms_key_id)"
+  value       = "alias/${local.kms_key_alias}"
 }
 
 ################################################################################
-# Backend Usage Snippet
+# IAM
 ################################################################################
 
-output "backend_block_example" {
-  description = "Copy-paste this backend block into each consumer root (update `key` per root)"
+output "workload_boundary_arn" {
+  description = "ARN of the permissions boundary that every training and inference role must carry"
+  value       = aws_iam_policy.workload_boundary.arn
+}
+
+################################################################################
+# Backend configuration for the other stacks
+################################################################################
+
+output "backend_hcl" {
+  description = "Contents for backend.hcl in stack-training, stack-inference and stack-cicd (`make backend-config` writes it for you)"
   value       = <<-EOT
-    terraform {
-      backend "s3" {
-        bucket       = "${module.state_bucket.s3_bucket_id}"
-        key          = "<root-name>/terraform.tfstate"
-        region       = "${module.state_bucket.s3_bucket_region}"
-        encrypt      = true
-        kms_key_id   = "alias/${var.project_name}-terraform-state"
-        use_lockfile = true
-      }
-    }
+    bucket     = "${module.state_bucket.s3_bucket_id}"
+    region     = "${module.state_bucket.s3_bucket_region}"
+    kms_key_id = "alias/${local.kms_key_alias}"
   EOT
 }

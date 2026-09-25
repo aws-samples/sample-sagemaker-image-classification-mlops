@@ -1,19 +1,20 @@
-# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
-#
-# This AWS Content is provided subject to the terms of the AWS Customer Agreement
-# available at http://aws.amazon.com/agreement or other written agreement between
-# Customer and either Amazon Web Services, Inc. or Amazon Web Services EMEA SARL or both.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 
 project_name = "medical-image-classification"
 environment  = "dev"
 aws_region   = "us-east-1"
 
-# Leave bucket_name empty to auto-generate a unique name with a random suffix.
-# Once provisioned, copy the state_bucket_id output into the other roots'
-# backend.tf `bucket` attribute.
-bucket_name = "medical-image-classification-terraform-state-1757646452"
+# Leave bucket_name empty to generate a unique name with a random suffix.
+# After apply, run `make backend-config` to write backend.hcl for the other
+# stacks from this stack's outputs.
+bucket_name = ""
 
-force_destroy                     = true
+# Leave empty to use alias/<project_name>-terraform-state.
+kms_key_alias = ""
+
+# Keep false: the state bucket holds every other stack's state.
+force_destroy                     = false
 noncurrent_version_retention_days = 90
 kms_key_deletion_window_days      = 30
 kms_key_administrators            = []

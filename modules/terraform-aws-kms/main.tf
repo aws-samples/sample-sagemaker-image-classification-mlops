@@ -31,8 +31,24 @@ locals {
       }
     }
   ] : []
+
+  # CloudTrail publishing to an SNS topic encrypted with this CMK. The key
+  # policy statement from the CloudTrail SNS notification documentation.
+  cloudtrail_sns_statements = var.enable_cloudtrail_sns_grant ? [
+    {
+      Sid       = "AllowCloudTrailPublishToEncryptedTopic"
+      Effect    = "Allow"
+      Principal = { Service = "cloudtrail.amazonaws.com" }
+      Action = [
+        "kms:GenerateDataKey*",
+        "kms:Decrypt",
+      ]
+      Resource = "*"
+    }
+  ] : []
 }
 
+# nosemgrep: terraform.aws.security.aws-kms-no-rotation.aws-kms-no-rotation - enable_key_rotation defaults to true and every caller passes true
 resource "aws_kms_key" "this" {
   description             = var.description
   deletion_window_in_days = var.deletion_window_days
@@ -88,7 +104,7 @@ resource "aws_kms_key" "this" {
         Sid    = "AllowCloudWatchLogs"
         Effect = "Allow"
         Principal = {
-          Service = "logs.${data.aws_region.current.id}.amazonaws.com"
+          Service = "logs.${data.aws_region.current.region}.amazonaws.com"
         }
         Action = [
           "kms:Encrypt",
@@ -100,11 +116,11 @@ resource "aws_kms_key" "this" {
         Resource = "*"
         Condition = {
           ArnEquals = {
-            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${data.aws_region.current.id}:${data.aws_caller_identity.current.account_id}:*"
+            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:*"
           }
         }
       }
-    ], local.cloudtrail_statements)
+    ], local.cloudtrail_statements, local.cloudtrail_sns_statements)
   })
 }
 

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 
 variable "name_prefix" {
-  description = "Prefix for the A2I human-task UI and flow-definition names."
+  description = "Prefix for the A2I human-task UI and flow-definition names. Amazon A2I is in maintenance mode (no longer open to new customers): call this module only behind an opt-in flag that defaults to false."
   type        = string
 }
 

@@ -1,19 +1,17 @@
-# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
-#
-# This AWS Content is provided subject to the terms of the AWS Customer Agreement
-# available at http://aws.amazon.com/agreement or other written agreement between
-# Customer and either Amazon Web Services, Inc. or Amazon Web Services EMEA SARL or both.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 
 # General
 project_name = "medical-image-classification"
 environment  = "dev"
 aws_region   = "us-east-1"
 
-# Audit & Compliance
-enable_cloudtrail         = true
+# Audit & Compliance. The trail is account-wide and multi-region; leave it off
+# when an organization trail already records this account.
+enable_cloudtrail         = false
 cloudtrail_retention_days = 400
 
-# Cost Governance — project-scoped monthly budget (filtered by Project tag)
+# Cost Governance - project-scoped monthly budget (filtered by Project tag)
 # Set monthly_budget_usd = 0 to disable. Emails are notified at 80% actual
 # and 100% forecasted thresholds.
 monthly_budget_usd  = 200
@@ -62,7 +60,7 @@ pipeline_steps = {
     cache_expiry   = "P7D"
   }
 
-  # Part 4 fairness gate. Runs Fairlearn on the evaluation output and writes
+  # Part 4 fairness gate. Runs Fairlearn on the ensemble predictions and writes
   # bias_metrics.json, which the clinical quality gate reads alongside the
   # accuracy metrics.
   bias = {
@@ -92,11 +90,13 @@ pipeline_steps = {
 kms_deletion_window_days = 7
 enable_kms_key_rotation  = true
 
-# Training
-training_data_path   = "dummy5050/"
-min_images_per_class = 50
-enable_auto_trigger  = true
-training_input_mode  = "FastFile"
+# Training. training_data_path is the prefix scripts/data_uploader.sh writes to;
+# its .batch_complete marker (auto_trigger_marker_key) starts the pipeline.
+training_data_path      = "medical_image_data/"
+auto_trigger_marker_key = "medical_image_data/.batch_complete"
+min_images_per_class    = 50
+enable_auto_trigger     = true
+training_input_mode     = "FastFile"
 
 # Monitoring
 enable_training_monitoring = true

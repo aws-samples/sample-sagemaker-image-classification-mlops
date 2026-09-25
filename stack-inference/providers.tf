@@ -13,3 +13,8 @@ provider "aws" {
     }
   }
 }
+
+# Reads the approved model package in the endpoint module.
+provider "awscc" {
+  region = var.aws_region
+}

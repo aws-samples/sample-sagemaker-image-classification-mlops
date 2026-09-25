@@ -1,4 +1,7 @@
-# Checkov configuration for the Breast Cancer MLOps project.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Checkov configuration for this sample.
 #
 # Every skip below is a deliberate decision for a PUBLIC, single-region blog
 # demo (not a production clinical deployment), or a documented Checkov
@@ -15,8 +18,6 @@ directory:
 # Do not scan vendored Terraform provider/module caches or local venvs.
 skip-path:
   - ".*/\\.terraform/.*"
-  - "charts/.*"
-  - "analysis-scripts/.*"
 
 compact: true
 quiet: true
@@ -26,10 +27,11 @@ skip-check:
   # Deliberate demo-architecture choices (documented in code)
   # ---------------------------------------------------------------------------
 
-  # The /predict + /results API is INTENTIONALLY public and unauthenticated for
-  # the blog demo. A production clinical deployment would add Cognito/IAM auth
-  # and WAF; that is called out in the README and the security review. Adding
-  # auth here would break the public demo the blog walks readers through.
+  # The /predict + /results API defaults to authorization NONE plus an API key,
+  # usage plan and a WAF web ACL (modules/terraform-aws-api-gateway). The key
+  # meters callers but is not user authentication; set api_authorization_type
+  # to AWS_IAM or COGNITO_USER_POOLS for that. The WAF association is gated on
+  # enable_waf, which Checkov does not resolve.
   - CKV_AWS_59     # open access to back-end resources through API
   - CKV2_AWS_29    # public API gateway protected by WAF
   - CKV_AWS_68     # CloudFront should have WAF enabled
@@ -50,10 +52,6 @@ skip-check:
   # image (docker-in-docker) in modules/terraform-aws-patched-inference-image.
   - CKV_AWS_316    # CodeBuild privileged mode
 
-  # ECR mutable tags are intentional: the patched-inference image re-publishes
-  # the same floating major.minor tag as AWS ships DLC patches (auto-pickup).
-  - CKV_AWS_51     # ECR image tag immutability
-
   # API Gateway / CloudFront caching is intentionally OFF: medical inference
   # responses are per-image and must never be cached/served to another caller.
   - CKV_AWS_120    # API Gateway caching
@@ -67,10 +65,10 @@ skip-check:
   - CKV2_AWS_42    # CloudFront custom SSL certificate
   - CKV2_AWS_32    # CloudFront response-headers policy
 
-  # SageMaker model network isolation is OFF on purpose so trainers can pull
-  # ImageNet weights over the network (see resolve_weights_path / the optional
-  # weights channel in stack-training). Toggle enable_network_isolation = true
-  # with the pre-downloaded weights channel for an isolated production run.
+  # Training jobs run network-isolated by default (stack-training
+  # enable_network_isolation). The hosted model (aws_sagemaker_model in the
+  # endpoint module) does not set network isolation; turn it on there as a
+  # production hardening step.
   - CKV_AWS_370    # SageMaker model network isolation
 
   # Code-signing for Lambda is not used; functions are deployed from

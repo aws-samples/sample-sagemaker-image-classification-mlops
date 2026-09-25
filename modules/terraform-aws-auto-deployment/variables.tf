@@ -27,9 +27,15 @@ variable "endpoint_instance_type" {
 }
 
 variable "data_capture_sampling_percentage" {
-  description = "Percentage of endpoint invocations captured for drift detection"
+  description = "Percentage of endpoint invocations captured for drift detection. Must match the endpoint module."
   type        = number
   default     = 100
+}
+
+variable "data_capture_input" {
+  description = "Also capture request payloads in auto-deployed endpoint configs. Must match the endpoint module (default false: Output only)."
+  type        = bool
+  default     = false
 }
 
 variable "sagemaker_role_arn" {
@@ -43,11 +49,33 @@ variable "monitoring_bucket" {
 }
 
 ################################################################################
-# Patched Inference Image
+# Drift baseline
 ################################################################################
 
-variable "patched_image_uri" {
-  description = "ECR URI (optional) of a CVE-patched inference image. When set, the auto-deployer swaps the public DLC image for this one on every deployment."
+variable "model_artifacts_bucket" {
+  description = "Bucket holding the ensemble artefacts. After each deploy the Lambda copies the package's predictions.json (next to model.tar.gz) from here to drift_baseline_key in the monitoring bucket. Empty disables the baseline refresh."
+  type        = string
+  default     = ""
+}
+
+variable "drift_baseline_key" {
+  description = "Object key in the monitoring bucket that the drift job reads its baseline scores from."
+  type        = string
+  default     = "monitoring/baselines/output-only/statistics.json"
+}
+
+variable "artifacts_kms_key_arn" {
+  description = "KMS key that encrypts the model artefacts and monitoring buckets, for the baseline copy. Null when they use SSE-S3."
+  type        = string
+  default     = null
+}
+
+################################################################################
+# Serving image
+################################################################################
+
+variable "serving_image_uri" {
+  description = "Inference image every auto-deployed model runs on, pinned by digest. Pass the same value as the endpoint module's serving_image_uri so Terraform-created and auto-deployed models share one image. Empty = use the image recorded in the model package."
   type        = string
   default     = ""
 }
@@ -114,4 +142,16 @@ variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)
   default     = {}
+}
+
+variable "permissions_boundary_arn" {
+  description = "ARN of the permissions boundary attached to the IAM roles this module creates. null leaves them unbounded."
+  type        = string
+  default     = null
+}
+
+variable "volume_kms_key_arn" {
+  description = "KMS key ARN for the ML storage volume of the endpoint configs the Lambda creates (real-time mode). Null leaves the volume on the SageMaker default key."
+  type        = string
+  default     = null
 }

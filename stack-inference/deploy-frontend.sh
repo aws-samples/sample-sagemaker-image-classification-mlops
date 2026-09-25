@@ -2,63 +2,40 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-# Deploy Frontend Script
-set -e
+# Refresh the static frontend after `terraform apply` in stack-inference.
+#
+# Terraform renders static-frontend/index.html.tpl (API URL and API key) and
+# uploads it to the frontend bucket, so this script only invalidates the
+# CloudFront cache and prints the URLs. It never runs `terraform apply`.
+#
+# Usage: ./deploy-frontend.sh [aws-profile]
+set -euo pipefail
 
-echo "🚀 Deploying Medical Image Classification Frontend..."
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# Check if we're in the right directory
-if [ ! -f "main.tf" ]; then
-    echo "❌ Error: Please run this script from the inference directory"
+PROFILE_ARGS=()
+if [ -n "${1:-}" ]; then
+    PROFILE_ARGS=(--profile "$1")
+elif [ -n "${AWS_PROFILE:-}" ]; then
+    PROFILE_ARGS=(--profile "$AWS_PROFILE")
+fi
+
+if ! terraform output -raw frontend_cloudfront_distribution_id >/dev/null 2>&1; then
+    echo "ERROR: no stack-inference outputs found. Run terraform apply in stack-inference first." >&2
     exit 1
 fi
 
-# Check if HTML file exists
-if [ ! -f "static-frontend/index.html" ]; then
-    echo "❌ Error: Frontend HTML file not found at static-frontend/index.html"
-    exit 1
-fi
-
-echo "📋 Step 1: Initializing Terraform..."
-terraform init
-
-echo "📋 Step 2: Planning deployment..."
-terraform plan
-
-echo "📋 Step 3: Applying infrastructure..."
-terraform apply -auto-approve
-
-echo "📋 Step 4: Getting outputs..."
 API_URL=$(terraform output -raw api_gateway_url)
 FRONTEND_URL=$(terraform output -raw frontend_cloudfront_url)
-S3_BUCKET=$(terraform output -raw frontend_s3_bucket)
+DISTRIBUTION_ID=$(terraform output -raw frontend_cloudfront_distribution_id)
 
-echo "📋 Step 5: Updating HTML with API endpoint..."
-# Update the HTML file with the actual API Gateway URL
-sed -i.bak "s|https://your-api-gateway-url.execute-api.us-east-1.amazonaws.com/prod/predict|${API_URL}/predict|g" static-frontend/index.html
-
-echo "📋 Step 6: Re-uploading updated HTML..."
-aws s3 cp static-frontend/index.html s3://${S3_BUCKET}/index.html --content-type "text/html"
-
-echo "📋 Step 7: Invalidating CloudFront cache..."
-DISTRIBUTION_ID=$(terraform output -raw frontend_cloudfront_distribution_id 2>/dev/null || echo "")
-if [ ! -z "$DISTRIBUTION_ID" ]; then
-    aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
-    echo "✅ CloudFront cache invalidated"
-else
-    echo "⚠️  CloudFront distribution ID not found, skipping cache invalidation"
-fi
+echo "Invalidating CloudFront distribution ${DISTRIBUTION_ID}..."
+aws cloudfront create-invalidation "${PROFILE_ARGS[@]}" \
+    --distribution-id "$DISTRIBUTION_ID" --paths "/index.html" >/dev/null
 
 echo ""
-echo "🎉 Frontend deployment completed successfully!"
+echo "Frontend URL: ${FRONTEND_URL}"
+echo "API URL:      ${API_URL}"
 echo ""
-echo "📱 Frontend URL: $FRONTEND_URL"
-echo "🔗 API Gateway URL: $API_URL"
-echo ""
-echo "📝 Next steps:"
-echo "1. Wait 2-3 minutes for CloudFront distribution to deploy"
-echo "2. Open the frontend URL in your browser"
-echo "3. Upload a medical histopathology image"
-echo "4. Get AI-powered predictions!"
-echo ""
-echo "💡 Note: If you see 'API endpoint not configured' error, wait a few minutes for DNS propagation"
+echo "The page sends the API key in the x-api-key header. For command-line calls:"
+echo "  terraform output -raw api_key_value"

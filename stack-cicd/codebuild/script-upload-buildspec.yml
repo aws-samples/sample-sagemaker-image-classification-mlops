@@ -1,11 +1,12 @@
-version: 0.2
-
-# © 2026 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 #
 # Uploads ML pipeline scripts to S3 + downloads pretrained ImageNet weights
 # for the three trainers (network-isolation support). Uses uv for the TF
 # install because downloading a 500MB wheel in CodeBuild is the slow part;
 # uv drops this from ~3 min to ~20 sec.
+
+version: 0.2
 
 env:
   variables:
@@ -28,7 +29,7 @@ phases:
       - export PATH=$HOME/.local/bin:$PATH
       - echo "Preparing ML scripts for upload"
       - cd scripts
-      - export SCRIPTS_BUCKET=$(aws s3api list-buckets --query "Buckets[?contains(Name, 'scripts')].Name" --output text | grep medical-image-classification)
+      - export SCRIPTS_BUCKET=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, '${PROJECT_NAME}-') && contains(Name, 'scripts')].Name" --output text)
       - echo "Using bucket $SCRIPTS_BUCKET"
 
   build:

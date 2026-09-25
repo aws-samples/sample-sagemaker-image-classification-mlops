@@ -1,3 +1,6 @@
-numpy
-Pillow
-opencv-python-headless
+# Installed by run_validation.sh. The step runs in the TensorFlow CPU training
+# image (Python 3.12); numpy stays on the release TensorFlow 2.19 supports.
+# OpenCV powers the optional image-quality check.
+Pillow==12.3.0
+numpy==2.1.3
+opencv-python-headless==4.11.0.86

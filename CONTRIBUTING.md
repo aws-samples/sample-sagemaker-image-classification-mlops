@@ -36,44 +36,37 @@ To send us a pull request, please:
 5. Send us a pull request, answering any default questions in the pull request interface.
 6. Pay attention to any automated CI failures reported in the pull request, and stay involved in the conversation.
 
-GitHub provides additional document on [forking a repository](https://help.github.com/articles/fork-a-repo/) and
-[creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
+GitHub provides additional documentation on [forking a repository](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/fork-a-repo) and
+[creating a pull request](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/creating-a-pull-request).
 
 
 ## Local checks
 
-This project is Terraform plus Python, so please run both sets of checks before opening a pull
-request. They mirror what CI runs, so catching failures locally saves a review round-trip.
-
-Requirements: Terraform `~> 1.15` (pinned in each stack's `versions.tf`) and Python `>= 3.13`
-(declared in `pyproject.toml`).
-
-Python - `ruff` handles both linting and formatting; its rules live in `pyproject.toml`:
+This project is Terraform plus Python. Run the local checks before opening a pull request; they
+mirror the GitHub Actions workflow in [.github/workflows/ci.yml](.github/workflows/ci.yml), so
+catching failures locally saves a review round-trip.
 
 ```bash
-ruff check .
-ruff format --check .
+make fmt validate lint test
 ```
 
-Terraform - format every directory, then validate whichever stacks or modules you touched:
+| Target | What it runs |
+| --- | --- |
+| `fmt` | `terraform fmt -recursive` and `ruff format .` (rewrites files) |
+| `validate` | `terraform init -backend=false` and `terraform validate` in every stack |
+| `lint` | `terraform fmt -check`, `ruff check`, `ruff format --check` and `checkov` (uses `.checkov.yaml`) |
+| `test` | `pytest` over `tests/` |
 
-```bash
-terraform fmt -recursive
-cd stack-training && terraform init -backend=false && terraform validate
-```
+Requirements: Terraform `~> 1.15` (pinned in each stack's `versions.tf`), Python `>= 3.13`
+(declared in `pyproject.toml`), and `checkov`. `pip install --group dev` (pip 25.1 or later)
+installs ruff, pytest and the test dependencies. `validate` needs no credentials or access to the
+remote state bucket.
 
-`-backend=false` keeps validation local, so you do not need credentials or access to the remote
-state bucket.
-
-Security and misconfiguration scanning - `.checkov.yaml` is picked up automatically and documents
-every deliberate skip:
-
-```bash
-checkov -d .
-```
+If you edit `scripts/mlops_common/`, run `scripts/sync_mlops_common.sh` to refresh the inference
+Lambda's copy; a test fails when the two differ.
 
 If you add or rename a Terraform variable, output, or resource, refresh the generated
-documentation tables rather than hand-editing them - each stack and module README has a
+documentation tables rather than hand-editing them. Each stack and module README has a
 `BEGIN_TF_DOCS` / `END_TF_DOCS` block that is injected from the `.tf` files:
 
 ```bash
@@ -96,7 +89,7 @@ opensource-codeofconduct@amazon.com with any additional questions or comments.
 
 
 ## Security issue notifications
-If you discover a potential security issue in this project we ask that you notify AWS/Amazon Security via our [vulnerability reporting page](http://aws.amazon.com/security/vulnerability-reporting/). Please do **not** create a public github issue.
+If you discover a potential security issue in this project we ask that you notify AWS/Amazon Security via our [vulnerability reporting page](https://aws.amazon.com/security/vulnerability-reporting/). Please do **not** create a public github issue.
 
 
 ## Licensing

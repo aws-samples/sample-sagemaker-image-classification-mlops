@@ -42,7 +42,7 @@ def download_and_upload_weights(bucket_name):
             # Skip if weights already uploaded - idempotent on repeat CI/CD runs.
             try:
                 s3.head_object(Bucket=bucket_name, Key=s3_key)
-                print(f"✓ {name} weights already exist in S3, skipping")
+                print(f"{name} weights already exist in S3, skipping")
                 continue
             except ClientError as exc:
                 # 404 = object missing, proceed with download. Anything else = re-raise.
@@ -56,14 +56,14 @@ def download_and_upload_weights(bucket_name):
 
             print(f"Uploading {name} weights to S3...")
             s3.upload_file(weights_path, bucket_name, s3_key)
-            print(f"✅ {name} weights uploaded")
+            print(f"{name} weights uploaded")
 
             os.remove(weights_path)
     finally:
         # Cleanup the whole temp directory even on failure.
         shutil.rmtree(weights_dir, ignore_errors=True)
 
-    print("✅ All weights processed successfully")
+    print("All weights processed successfully")
 
 
 if __name__ == "__main__":

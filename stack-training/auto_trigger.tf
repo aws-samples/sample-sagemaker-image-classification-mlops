@@ -16,16 +16,16 @@ resource "aws_cloudwatch_event_rule" "new_data_uploaded" {
       }
       object = {
         key = [{
-          prefix = "medical_image_data/.batch_complete"
+          prefix = var.auto_trigger_marker_key
         }]
       }
     }
   })
-
-  tags = local.common_tags
 }
 
-# Direct EventBridge target to SageMaker Pipeline
+# Direct EventBridge target to SageMaker Pipeline. Stamps the execution with
+# RetrainingReason=data_upload so the registered model package records why it
+# was trained.
 resource "aws_cloudwatch_event_target" "pipeline_trigger" {
   count = var.enable_auto_trigger ? 1 : 0
 
@@ -33,13 +33,21 @@ resource "aws_cloudwatch_event_target" "pipeline_trigger" {
   target_id = "SageMakerPipelineTargetFixed"
   arn       = aws_sagemaker_pipeline.medical_image_pipeline.arn
   role_arn  = aws_iam_role.eventbridge_sagemaker_role[0].arn
+
+  sagemaker_pipeline_target {
+    pipeline_parameter_list {
+      name  = "RetrainingReason"
+      value = "data_upload"
+    }
+  }
 }
 
 # IAM role for EventBridge to invoke SageMaker Pipeline
 resource "aws_iam_role" "eventbridge_sagemaker_role" {
   count = var.enable_auto_trigger ? 1 : 0
 
-  name = "${var.project_name}-eventbridge-sagemaker-role"
+  name                 = "${var.project_name}-eventbridge-sagemaker-role"
+  permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -53,8 +61,6 @@ resource "aws_iam_role" "eventbridge_sagemaker_role" {
       }
     ]
   })
-
-  tags = local.common_tags
 }
 
 resource "aws_iam_role_policy" "eventbridge_sagemaker_policy" {

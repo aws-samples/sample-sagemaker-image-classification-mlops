@@ -11,7 +11,11 @@ locals {
   # Fairness shares the drift namespace so both signals graph side by side.
   drift_metric_namespace = "${var.project_name}/DriftDetection"
   drift_metric_name      = "prediction_score_psi"
-  fairness_metric_name   = "fairness_max_disparity"
+
+  # Baseline score distribution the drift job compares against. The
+  # auto-deploy Lambda rewrites it from each deployed package's test scores.
+  drift_baseline_key   = "monitoring/baselines/output-only/statistics.json"
+  fairness_metric_name = "fairness_max_disparity"
 
   # The retrain rule fires on any monitoring alarm that exists. A fairness
   # breach is as much a reason to retrain as a distribution shift.
@@ -52,7 +56,7 @@ resource "aws_cloudwatch_metric_alarm" "prediction_drift_psi" {
   alarm_actions = [module.sns_alerts.sns_topic_arn]
   ok_actions    = [module.sns_alerts.sns_topic_arn]
 
-  tags = merge(local.common_tags, { Purpose = "DriftDetection" })
+  tags = { Purpose = "DriftDetection" }
 }
 
 # Schedule the drift Processing job. EventBridge Scheduler calls
@@ -92,7 +96,7 @@ resource "aws_scheduler_schedule" "drift_job" {
           "python3", "/opt/ml/processing/input/code/compute_drift.py",
           "--monitoring-bucket", local.training_outputs.monitoring_bucket,
           "--capture-prefix", "data-capture",
-          "--baseline-key", "monitoring/baselines/output-only/statistics.json",
+          "--baseline-key", local.drift_baseline_key,
           "--metric-namespace", local.drift_metric_namespace,
           "--metric-name", local.drift_metric_name,
           "--endpoint-name", local.endpoint_name,
@@ -144,7 +148,8 @@ resource "aws_scheduler_schedule" "drift_job" {
 resource "aws_iam_role" "drift_job_scheduler" {
   count = local.drift_job_count
 
-  name = "${var.project_name}-drift-job-scheduler"
+  name                 = "${var.project_name}-drift-job-scheduler"
+  permissions_boundary = var.permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -156,8 +161,6 @@ resource "aws_iam_role" "drift_job_scheduler" {
       }
     }]
   })
-
-  tags = local.common_tags
 }
 
 resource "aws_iam_role_policy" "drift_job_scheduler" {
@@ -177,7 +180,8 @@ resource "aws_iam_role_policy" "drift_job_scheduler" {
       },
       {
         # Hand the SageMaker execution role to SageMaker only.
-        Effect   = "Allow"
+        Effect = "Allow"
+        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure - PassRole on the one SageMaker execution role, to sagemaker.amazonaws.com only
         Action   = ["iam:PassRole"]
         Resource = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
         Condition = {
@@ -225,7 +229,7 @@ resource "aws_cloudwatch_metric_alarm" "fairness_disparity" {
   alarm_actions = [module.sns_alerts.sns_topic_arn]
   ok_actions    = [module.sns_alerts.sns_topic_arn]
 
-  tags = merge(local.common_tags, { Purpose = "FairnessMonitoring" })
+  tags = { Purpose = "FairnessMonitoring" }
 }
 
 # Schedule the fairness Processing job. Same universal-target pattern as the
@@ -333,7 +337,8 @@ resource "aws_scheduler_schedule" "fairness_job" {
 resource "aws_iam_role" "fairness_job_scheduler" {
   count = local.fairness_job_count
 
-  name = "${var.project_name}-fairness-job-scheduler"
+  name                 = "${var.project_name}-fairness-job-scheduler"
+  permissions_boundary = var.permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -345,8 +350,6 @@ resource "aws_iam_role" "fairness_job_scheduler" {
       }
     }]
   })
-
-  tags = local.common_tags
 }
 
 resource "aws_iam_role_policy" "fairness_job_scheduler" {
@@ -366,7 +369,8 @@ resource "aws_iam_role_policy" "fairness_job_scheduler" {
       },
       {
         # Hand the SageMaker execution role to SageMaker only.
-        Effect   = "Allow"
+        Effect = "Allow"
+        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure - PassRole on the one SageMaker execution role, to sagemaker.amazonaws.com only
         Action   = ["iam:PassRole"]
         Resource = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
         Condition = {
@@ -398,8 +402,6 @@ resource "aws_cloudwatch_event_rule" "drift_retrain" {
       }
     }
   })
-
-  tags = local.common_tags
 }
 
 resource "aws_cloudwatch_event_target" "drift_retrain_pipeline" {
@@ -421,7 +423,8 @@ resource "aws_cloudwatch_event_target" "drift_retrain_pipeline" {
 resource "aws_iam_role" "drift_retrain" {
   count = local.drift_retrain_count
 
-  name = "${var.project_name}-drift-retrain-events-role"
+  name                 = "${var.project_name}-drift-retrain-events-role"
+  permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -431,8 +434,6 @@ resource "aws_iam_role" "drift_retrain" {
       Principal = { Service = "events.amazonaws.com" }
     }]
   })
-
-  tags = local.common_tags
 }
 
 resource "aws_iam_role_policy" "drift_retrain" {
@@ -452,14 +453,14 @@ resource "aws_iam_role_policy" "drift_retrain" {
 }
 
 ################################################################################
-# Human-in-the-loop review (Amazon A2I)
+# Optional human-in-the-loop review (Amazon A2I, off by default)
 ################################################################################
 #
-# Routes low-confidence predictions to a private workforce of radiologists. The
-# inference Lambda calls start_human_loop against the flow definition ARN; the
-# reviewer decision lands in the monitoring bucket and feeds the next retrain.
-# Gated on enable_human_review + a workteam ARN (the private workforce is a
-# one-time per-account Cognito setup outside Terraform).
+# Amazon A2I is in maintenance mode (no longer open to new customers), so this
+# is opt-in through enable_human_review. When on, the inference Lambda calls
+# start_human_loop for low-confidence predictions and the reviewer decision
+# lands in the monitoring bucket for the next retrain. Needs a workteam ARN
+# (a one-time per-account private workforce set up outside Terraform).
 module "a2i_review" {
   count  = var.enable_human_review ? 1 : 0
   source = "../modules/terraform-aws-a2i-review"
@@ -468,8 +469,6 @@ module "a2i_review" {
   workteam_arn       = var.review_workteam_arn
   output_s3_uri      = "s3://${local.training_outputs.monitoring_bucket}/human-review"
   execution_role_arn = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
-
-  tags = local.common_tags
 }
 
 ################################################################################
@@ -517,6 +516,4 @@ resource "aws_bedrock_guardrail" "hybrid" {
       output_enabled = true
     }
   }
-
-  tags = local.common_tags
 }

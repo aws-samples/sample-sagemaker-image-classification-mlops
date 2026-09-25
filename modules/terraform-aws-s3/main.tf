@@ -8,6 +8,20 @@ resource "aws_s3_bucket" "this" {
 }
 
 ################################################################################
+# Object Ownership
+################################################################################
+
+# BucketOwnerEnforced disables ACLs: the bucket owner owns every object and
+# access is controlled by policy alone.
+resource "aws_s3_bucket_ownership_controls" "this" {
+  bucket = aws_s3_bucket.this.id
+
+  rule {
+    object_ownership = var.object_ownership
+  }
+}
+
+################################################################################
 # Encryption
 ################################################################################
 
@@ -19,6 +33,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
       kms_master_key_id = var.kms_key_arn
       sse_algorithm     = var.kms_key_arn != null ? "aws:kms" : "AES256"
     }
+    # An S3 Bucket Key cuts KMS request volume (and cost) for SSE-KMS.
+    bucket_key_enabled = var.kms_key_arn != null
   }
 }
 
@@ -63,6 +79,8 @@ resource "aws_s3_bucket_policy" "ssl_only" {
   count  = var.enable_ssl_enforcement ? 1 : 0
   bucket = aws_s3_bucket.this.id
 
+  # KICS: the policy denies s3:* when aws:SecureTransport is false; KICS does not match the jsonencode form
+  # kics-scan ignore-line
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -164,14 +182,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
   # lifecycle configuration references noncurrent-version rules.
   depends_on = [aws_s3_bucket_versioning.this]
 }
-
-
-################################################################################
-# (Cross-region replication removed 2026-05 - no buckets in this project
-#  needed DR coverage. Training data is a public dataset; models are
-#  re-trainable; the CloudTrail and SBOM buckets don't need cross-region
-#  redundancy. Add back to this module if a real DR requirement arises.)
-################################################################################
 
 ################################################################################
 # Server Access Logging (optional)

@@ -21,9 +21,16 @@ variable "model_package_group_name" {
   type        = string
 }
 
-variable "aws_region" {
-  description = "AWS region for SageMaker API calls"
+variable "model_package_arn" {
+  description = "Versioned ARN of the Approved model package the Terraform-managed model serves, for example arn:aws:sagemaker:us-east-1:111122223333:model-package/<group>/1. Later approvals are rolled out by the auto-deploy Lambda, so this only seeds the first deployment."
   type        = string
+  default     = ""
+}
+
+variable "serving_image_uri" {
+  description = "Inference image to run the package's artefact on, pinned by digest (the patched image). Pass the same value to the auto-deployment module so every model runs on one image. Empty = use the image recorded in the model package."
+  type        = string
+  default     = ""
 }
 
 ################################################################################
@@ -86,9 +93,20 @@ variable "instance_type" {
 }
 
 variable "data_capture_sampling_percentage" {
-  description = "Percentage of data to capture for monitoring (0-100)"
+  description = "Percentage of invocations written to data capture (0-100). Real-time mode only."
   type        = number
   default     = 100
+
+  validation {
+    condition     = var.data_capture_sampling_percentage >= 0 && var.data_capture_sampling_percentage <= 100
+    error_message = "data_capture_sampling_percentage must be between 0 and 100."
+  }
+}
+
+variable "data_capture_input" {
+  description = "Also capture request payloads. Off by default: the monitoring jobs only need model output, and Input capture stores every uploaded image (potential PHI, several MB per request)."
+  type        = bool
+  default     = false
 }
 
 variable "monitoring_bucket" {
@@ -140,10 +158,10 @@ variable "target_concurrent_requests_per_model" {
 # CloudWatch Alarms
 ################################################################################
 
-variable "error_rate_threshold" {
-  description = "Error rate threshold percentage for the CloudWatch alarm"
+variable "error_count_threshold" {
+  description = "Rollback fires when Invocation5XXErrors or InvocationModelErrors (Sum per minute) exceed this for 2 consecutive minutes."
   type        = number
-  default     = 5
+  default     = 3
 }
 
 variable "latency_threshold" {
@@ -171,7 +189,6 @@ variable "traffic_shift_wait_interval" {
   type        = number
   default     = 60
 }
-
 
 variable "termination_wait_seconds" {
   description = "Seconds to wait after deployment before terminating old fleet"

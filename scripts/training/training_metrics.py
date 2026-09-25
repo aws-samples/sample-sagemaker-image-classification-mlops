@@ -102,7 +102,7 @@ def send_training_metrics_to_cloudwatch(model_name, history):
             )
         )
 
-        logger.info(f"✅ Published training metrics for {model_name} to CloudWatch")
+        logger.info(f"Published training metrics for {model_name} to CloudWatch")
 
     except Exception as e:
-        logger.warning(f"⚠️ Failed to send training metrics: {e}")
+        logger.warning(f"Failed to send training metrics: {e}")

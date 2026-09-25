@@ -19,8 +19,6 @@ module "s3_sbom" {
     noncurrent_version_days         = 30
     abort_incomplete_multipart_days = 7
   }]
-
-  tags = local.common_tags
 }
 
 resource "random_id" "sbom_suffix" {

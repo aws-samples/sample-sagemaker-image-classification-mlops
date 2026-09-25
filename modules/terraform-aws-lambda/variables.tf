@@ -103,7 +103,7 @@ variable "log_kms_key_arn" {
 ################################################################################
 
 variable "enable_xray_tracing" {
-  description = "Enable Active X-Ray tracing on the Lambda function. Recommended for production - gives end-to-end latency visibility across API GW → Lambda → downstream AWS services."
+  description = "Enable Active X-Ray tracing on the Lambda function. Recommended for production - gives end-to-end latency visibility across API Gateway, Lambda and downstream AWS services."
   type        = bool
   default     = true
 }

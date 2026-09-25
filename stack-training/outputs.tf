@@ -69,13 +69,13 @@ output "pipeline_log_groups" {
 ################################################################################
 
 output "mlflow_tracking_server_arn" {
-  description = "ARN of the MLflow tracking server"
-  value       = aws_sagemaker_mlflow_tracking_server.mlflow.arn
+  description = "ARN of the MLflow tracking server. Null when enable_mlflow = false."
+  value       = try(aws_sagemaker_mlflow_tracking_server.mlflow[0].arn, null)
 }
 
 output "mlflow_tracking_server_url" {
-  description = "URL of the MLflow tracking server"
-  value       = aws_sagemaker_mlflow_tracking_server.mlflow.tracking_server_url
+  description = "URL of the MLflow tracking server. Null when enable_mlflow = false."
+  value       = try(aws_sagemaker_mlflow_tracking_server.mlflow[0].tracking_server_url, null)
 }
 
 ################################################################################
@@ -85,6 +85,11 @@ output "mlflow_tracking_server_url" {
 output "model_package_group_name" {
   description = "Name of the model package group"
   value       = aws_sagemaker_model_package_group.medical_image_models.model_package_group_name
+}
+
+output "network_isolation_enabled" {
+  description = "Whether the training jobs run with network isolation. When true, the ImageNet weights must be in s3://<scripts-bucket>/pretrained-weights/ (make weights)."
+  value       = var.enable_network_isolation
 }
 
 ################################################################################
@@ -117,7 +122,6 @@ output "kms_key_arn" {
 output "sagemaker_image_uris" {
   description = "SageMaker Docker image URIs fetched dynamically from AWS"
   value = {
-    sklearn_image_uri        = data.aws_sagemaker_prebuilt_ecr_image.sklearn.registry_path
     tensorflow_gpu_image_uri = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_gpu.registry_path
     tensorflow_cpu_image_uri = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_cpu.registry_path
   }

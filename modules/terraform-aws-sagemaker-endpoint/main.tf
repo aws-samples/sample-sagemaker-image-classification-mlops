@@ -1,68 +1,50 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-data "external" "latest_approved_model" {
-  program = ["bash", "-c", <<-EOT
-    MODEL_ARN=$(aws sagemaker list-model-packages \
-      --model-package-group-name ${var.model_package_group_name} \
-      --model-approval-status Approved \
-      --sort-by CreationTime \
-      --sort-order Descending \
-      --max-results 1 \
-      --region ${var.aws_region} \
-      --query 'ModelPackageSummaryList[0].ModelPackageArn' \
-      --output text)
+locals {
+  # Serve the approved package's artefact on var.serving_image_uri when one is
+  # given (the patched image, pinned by digest). The auto-deploy Lambda builds
+  # its models the same way, so the Terraform-created model and every
+  # auto-deployed model run on one image.
+  use_serving_image = var.serving_image_uri != ""
+  package_container = try(data.awscc_sagemaker_model_package.approved[0].inference_specification.containers[0], null)
 
-    if [ "$MODEL_ARN" = "None" ] || [ -z "$MODEL_ARN" ]; then
-      echo '{"model_package_arn": "", "model_data_url": "", "image_uri": ""}' | jq -c
-      exit 0
-    fi
-
-    MODEL_DATA=$(aws sagemaker describe-model-package \
-      --model-package-name "$MODEL_ARN" \
-      --region ${var.aws_region} \
-      --query 'InferenceSpecification.Containers[0]' \
-      --output json)
-
-    IMAGE_URI=$(echo "$MODEL_DATA" | jq -r '.Image')
-    MODEL_URL=$(echo "$MODEL_DATA" | jq -r '.ModelDataUrl')
-
-    jq -n --arg arn "$MODEL_ARN" --arg url "$MODEL_URL" --arg image "$IMAGE_URI" \
-      '{model_package_arn: $arn, model_data_url: $url, image_uri: $image}'
-  EOT
-  ]
+  # The model name changes whenever its inputs change so create_before_destroy
+  # on the endpoint config can stand up the replacement before the old one goes.
+  model_name = "${substr(var.project_name, 0, 45)}-model-${substr(sha1("${var.model_package_arn}|${var.serving_image_uri}"), 0, 8)}"
 }
 
-# SageMaker Model resource
+# Reads the approved package through the Cloud Control API (no shell-out, no
+# ambient CLI credentials). Only used when the image is overridden; otherwise
+# the model references the package directly. The count must not depend on
+# serving_image_uri: the patched image digest is unknown until the first apply.
+data "awscc_sagemaker_model_package" "approved" {
+  count = var.model_package_arn != "" ? 1 : 0
+
+  id = var.model_package_arn
+}
+
 resource "aws_sagemaker_model" "this" {
-  name               = "${var.project_name}-model"
+  name               = local.model_name
   execution_role_arn = var.execution_role_arn
 
   primary_container {
-    # Use image and model data URL from the latest approved model package.
-    # coalesce to a syntactically-valid placeholder when no approved model
-    # exists yet (cold start) or after the registry is emptied (teardown):
-    # the empty string the data source returns is rejected by the provider at
-    # plan time, which would otherwise block both the first apply AND destroy.
-    # The lifecycle precondition below still fails the APPLY with an actionable
-    # message, so a placeholder model is never actually created.
-    image          = coalesce(data.external.latest_approved_model.result.image_uri, "placeholder")
-    model_data_url = coalesce(data.external.latest_approved_model.result.model_data_url, "s3://placeholder/model.tar.gz")
+    model_package_name = local.use_serving_image ? null : var.model_package_arn
+    image              = local.use_serving_image ? var.serving_image_uri : null
+    model_data_url     = local.use_serving_image ? try(local.package_container.model_data_url, null) : null
+    environment        = local.use_serving_image ? try(local.package_container.environment, null) : null
   }
 
   tags = merge(var.tags, {
-    Name = "${var.project_name}-model"
+    Name = local.model_name
   })
 
   lifecycle {
-    # Fail fast with an actionable message on a cold first deploy instead of
-    # the cryptic "PrimaryContainer.Image cannot be empty" CreateModel error
-    # you get when no model has been Approved yet. The CI/CD baseline-model
-    # stage (or stack-cicd/scripts/create_baseline_model.py) registers an
-    # approved model first; run it before applying stack-inference.
+    create_before_destroy = true
+
     precondition {
-      condition     = data.external.latest_approved_model.result.image_uri != ""
-      error_message = "No Approved model in package group ${var.model_package_group_name}. Seed one first (CI/CD baseline-model stage or python stack-cicd/scripts/create_baseline_model.py), then re-apply."
+      condition     = can(regex("^arn:aws[a-z-]*:sagemaker:[a-z0-9-]+:[0-9]{12}:model-package/[^/]+/[0-9]+$", var.model_package_arn))
+      error_message = "model_package_arn must be the versioned ARN of an Approved package in ${var.model_package_group_name}. The baseline (CI/CD baseline-model stage or python stack-cicd/scripts/create_baseline_model.py) is registered as PendingManualApproval: approve it with aws sagemaker update-model-package --model-package-arn <arn> --model-approval-status Approved, then pass that ARN."
     }
   }
 }
@@ -87,7 +69,9 @@ resource "aws_sagemaker_model" "this" {
 # attach no ML storage volume and reject the argument, so it must be null there.
 # kics-scan ignore-block
 resource "aws_sagemaker_endpoint_configuration" "this" {
-  name = "${var.project_name}-endpoint-config"
+  # name_prefix + create_before_destroy: a model or capture change creates the
+  # new config before the old one is deleted, instead of failing on a name clash.
+  name_prefix = "${substr(var.project_name, 0, 32)}-epc-"
 
   # Encrypt the ML storage volume on real-time variants with the project CMK.
   # Serverless variants attach no volume and reject this argument, so only set
@@ -146,11 +130,13 @@ resource "aws_sagemaker_endpoint_configuration" "this" {
       initial_sampling_percentage = var.data_capture_sampling_percentage
       destination_s3_uri          = "s3://${var.monitoring_bucket}/data-capture"
 
-      capture_options {
-        capture_mode = "Input"
-      }
-      capture_options {
-        capture_mode = "Output"
+      # Output only by default: the drift and fairness jobs read prediction
+      # scores, and capturing Input would store every uploaded image.
+      dynamic "capture_options" {
+        for_each = var.data_capture_input ? ["Input", "Output"] : ["Output"]
+        content {
+          capture_mode = capture_options.value
+        }
       }
     }
   }
@@ -159,14 +145,17 @@ resource "aws_sagemaker_endpoint_configuration" "this" {
     Name          = "${var.project_name}-endpoint-config"
     InferenceMode = var.use_serverless_inference ? "Serverless" : "RealTime"
   })
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 ################################################################################
 # SageMaker Endpoint
 ################################################################################
 
-# SageMaker Endpoint with blue/green deployment and auto-rollback
-# Managed by Terraform with deployment_config for safe model updates
+# Blue/green deployment with auto-rollback on the two alarms below.
 resource "aws_sagemaker_endpoint" "this" {
   name                 = var.endpoint_name
   endpoint_config_name = aws_sagemaker_endpoint_configuration.this.name
@@ -213,28 +202,57 @@ resource "aws_sagemaker_endpoint" "this" {
 # CloudWatch Alarms
 ################################################################################
 
-# Alarm for endpoint error rate (4XX errors)
+# Rollback alarm on server-side failures. 4XX errors are caller mistakes and
+# say nothing about the new model; Invocation5XXErrors and
+# InvocationModelErrors do. InvocationModelErrors already counts model 5XX
+# responses, so the alarm takes the larger of the two sums rather than adding
+# them.
 resource "aws_cloudwatch_metric_alarm" "endpoint_error_rate" {
   alarm_name          = "${var.project_name}-endpoint-error-rate"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
-  metric_name         = "ModelInvocation4XXErrors"
-  namespace           = "AWS/SageMaker"
-  period              = 60
-  statistic           = "Average"
-  threshold           = var.error_rate_threshold
-  alarm_description   = "Triggers rollback if endpoint error rate exceeds ${var.error_rate_threshold}%"
+  threshold           = var.error_count_threshold
+  alarm_description   = "Triggers rollback if Invocation5XXErrors or InvocationModelErrors exceed ${var.error_count_threshold} per minute"
   treat_missing_data  = "notBreaching"
 
-  dimensions = {
-    EndpointName = var.endpoint_name
-    VariantName  = "AllTraffic"
+  metric_query {
+    id          = "errors"
+    expression  = "MAX([FILL(m5xx, 0), FILL(model_errors, 0)])"
+    label       = "Server and model errors"
+    return_data = true
+  }
+
+  metric_query {
+    id = "m5xx"
+    metric {
+      metric_name = "Invocation5XXErrors"
+      namespace   = "AWS/SageMaker"
+      period      = 60
+      stat        = "Sum"
+      dimensions = {
+        EndpointName = var.endpoint_name
+        VariantName  = "AllTraffic"
+      }
+    }
+  }
+
+  metric_query {
+    id = "model_errors"
+    metric {
+      metric_name = "InvocationModelErrors"
+      namespace   = "AWS/SageMaker"
+      period      = 60
+      stat        = "Sum"
+      dimensions = {
+        EndpointName = var.endpoint_name
+        VariantName  = "AllTraffic"
+      }
+    }
   }
 
   tags = merge(var.tags, {
-    Name        = "${var.project_name}-endpoint-error-rate"
-    Purpose     = "AutoRollback"
-    Description = "Monitors endpoint 4XX error rate for automatic rollback"
+    Name    = "${var.project_name}-endpoint-error-rate"
+    Purpose = "AutoRollback"
   })
 }
 
@@ -257,9 +275,8 @@ resource "aws_cloudwatch_metric_alarm" "endpoint_latency" {
   }
 
   tags = merge(var.tags, {
-    Name        = "${var.project_name}-endpoint-latency"
-    Purpose     = "AutoRollback"
-    Description = "Monitors endpoint latency for automatic rollback"
+    Name    = "${var.project_name}-endpoint-latency"
+    Purpose = "AutoRollback"
   })
 }
 
@@ -286,8 +303,7 @@ resource "aws_appautoscaling_target" "this" {
   depends_on = [aws_sagemaker_endpoint.this]
 
   tags = merge(var.tags, {
-    Name        = "${var.project_name}-autoscaling-target"
-    Description = "Auto-scaling target for SageMaker endpoint"
+    Name = "${var.project_name}-autoscaling-target"
   })
 }
 
@@ -309,12 +325,8 @@ resource "aws_appautoscaling_policy" "this" {
     predefined_metric_specification {
       predefined_metric_type = "SageMakerVariantConcurrentRequestsPerModelHighResolution"
     }
-    target_value = var.target_concurrent_requests_per_model
-
-    # Scale-in cooldown: wait 300 seconds before scaling down again
-    scale_in_cooldown = 300
-
-    # Scale-out cooldown: wait 60 seconds before scaling up again
+    target_value       = var.target_concurrent_requests_per_model
+    scale_in_cooldown  = 300
     scale_out_cooldown = 60
   }
 }

@@ -12,7 +12,9 @@ module "kms" {
   # This CMK also encrypts the CloudTrail trail + its CloudWatch log group, so
   # grant the CloudTrail service principal encrypt rights on the key.
   enable_cloudtrail_grant = var.enable_cloudtrail
-  tags                    = local.common_tags
+
+  # The optional CloudTrail SNS topic is encrypted with this CMK too.
+  enable_cloudtrail_sns_grant = var.enable_cloudtrail && var.enable_cloudtrail_sns
 }
 
 ################################################################################
@@ -34,7 +36,6 @@ module "s3_raw_data" {
   enable_versioning   = var.bucket_defaults.enable_versioning
   block_public_access = var.bucket_defaults.block_public_access
   enable_eventbridge  = var.enable_auto_trigger
-  tags                = local.common_tags
 }
 
 module "s3_processed_data" {
@@ -45,7 +46,6 @@ module "s3_processed_data" {
   kms_key_arn         = module.kms.key_arn
   enable_versioning   = var.bucket_defaults.enable_versioning
   block_public_access = var.bucket_defaults.block_public_access
-  tags                = local.common_tags
 }
 
 module "s3_scripts" {
@@ -56,7 +56,6 @@ module "s3_scripts" {
   kms_key_arn         = module.kms.key_arn
   enable_versioning   = var.bucket_defaults.enable_versioning
   block_public_access = var.bucket_defaults.block_public_access
-  tags                = local.common_tags
 }
 
 module "s3_model_artifacts" {
@@ -67,7 +66,6 @@ module "s3_model_artifacts" {
   kms_key_arn         = module.kms.key_arn
   enable_versioning   = var.bucket_defaults.enable_versioning
   block_public_access = var.bucket_defaults.block_public_access
-  tags                = local.common_tags
 }
 
 module "s3_inference_results" {
@@ -78,7 +76,6 @@ module "s3_inference_results" {
   kms_key_arn         = module.kms.key_arn
   enable_versioning   = var.bucket_defaults.enable_versioning
   block_public_access = var.bucket_defaults.block_public_access
-  tags                = local.common_tags
 }
 
 module "s3_monitoring" {
@@ -89,7 +86,6 @@ module "s3_monitoring" {
   kms_key_arn         = module.kms.key_arn
   enable_versioning   = var.bucket_defaults.enable_versioning
   block_public_access = var.bucket_defaults.block_public_access
-  tags                = local.common_tags
 }
 
 ################################################################################
@@ -100,7 +96,8 @@ module "s3_monitoring" {
 module "sagemaker_execution_role" {
   source = "../modules/terraform-aws-iam"
 
-  role_name = "${var.project_name}-sagemaker-execution-role"
+  role_name                = "${var.project_name}-sagemaker-execution-role"
+  permissions_boundary_arn = var.permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -122,7 +119,7 @@ module "sagemaker_execution_role" {
   inline_policies = {
     s3_access = jsonencode({
       Version = "2012-10-17"
-      Statement = [
+      Statement = concat([
         {
           Effect = "Allow"
           Action = [
@@ -160,6 +157,16 @@ module "sagemaker_execution_role" {
             "kms:DescribeKey"
           ]
           Resource = [module.kms.key_arn]
+        },
+        {
+          # Jobs encrypt their ML storage volumes with the project CMK
+          # (VolumeKmsKeyId), which needs a grant for the EBS attachment.
+          Effect   = "Allow"
+          Action   = ["kms:CreateGrant"]
+          Resource = [module.kms.key_arn]
+          Condition = {
+            Bool = { "kms:GrantIsForAWSResource" = "true" }
+          }
         },
         {
           Effect = "Allow"
@@ -306,38 +313,54 @@ module "sagemaker_execution_role" {
           ]
           Resource = "*"
         },
-        {
-          Effect = "Allow"
-          Action = [
-            "sagemaker-mlflow:AccessUI",
-            "sagemaker-mlflow:CreateExperiment",
-            "sagemaker-mlflow:CreateRun",
-            "sagemaker-mlflow:UpdateRun",
-            "sagemaker-mlflow:DeleteRun",
-            "sagemaker-mlflow:LogMetric",
-            "sagemaker-mlflow:LogParameter"
-          ]
-          Resource = "arn:aws:sagemaker:*:*:mlflow-tracking-server/${var.project_name}-mlflow"
-        }
-      ]
+        ],
+        var.enable_mlflow ? [
+          {
+            Effect = "Allow"
+            Action = [
+              "sagemaker-mlflow:AccessUI",
+              "sagemaker-mlflow:CreateExperiment",
+              "sagemaker-mlflow:CreateRun",
+              "sagemaker-mlflow:UpdateRun",
+              "sagemaker-mlflow:DeleteRun",
+              "sagemaker-mlflow:LogMetric",
+              "sagemaker-mlflow:LogParameter"
+            ]
+            Resource = "arn:aws:sagemaker:*:*:mlflow-tracking-server/${var.project_name}-mlflow"
+          }
+        ] : [],
+        # ENI management for training and processing jobs that run in your
+        # VPC (var.vpc_config): the set the SageMaker execution-role
+        # documentation lists for VPC jobs.
+        var.vpc_config != null ? [
+          {
+            Effect = "Allow"
+            Action = [
+              "ec2:CreateNetworkInterface",
+              "ec2:CreateNetworkInterfacePermission",
+              "ec2:DeleteNetworkInterface",
+              "ec2:DeleteNetworkInterfacePermission",
+              "ec2:DescribeNetworkInterfaces",
+              "ec2:DescribeVpcs",
+              "ec2:DescribeDhcpOptions",
+              "ec2:DescribeSubnets",
+              "ec2:DescribeSecurityGroups"
+            ]
+            Resource = "*"
+          }
+        ] : []
+      )
     })
   }
-
-  tags = local.common_tags
 }
 
 ################################################################################
 # SageMaker Model Registry
 ################################################################################
 
-# SageMaker Pipeline
 resource "aws_sagemaker_model_package_group" "medical_image_models" {
   model_package_group_name        = "${var.project_name}-model-package-group"
   model_package_group_description = "Model package group for medical image classification models"
-
-  lifecycle {
-    prevent_destroy = false
-  }
 }
 
 # Model Card - documents intended use, risk rating, and clinical context so a
@@ -367,16 +390,17 @@ resource "aws_sagemaker_model_card" "medical_image" {
       caveats_and_recommendations = "Validate thresholds with your clinical team. Do not deploy without review-board approval (models register as PendingManualApproval)."
     }
   })
-
-  tags = local.common_tags
 }
 
 ################################################################################
 # MLflow
 ################################################################################
 
-# MLflow Tracking Server for experiment tracking
+# Managed MLflow tracking server. Off by default: it is billed for every hour
+# it runs, whether or not a pipeline is training.
 resource "aws_sagemaker_mlflow_tracking_server" "mlflow" {
+  count = var.enable_mlflow ? 1 : 0
+
   tracking_server_name = "${var.project_name}-mlflow"
   artifact_store_uri   = "s3://${module.s3_model_artifacts.bucket_id}/mlflow-artifacts"
   role_arn             = module.sagemaker_execution_role.role_arn
@@ -388,16 +412,38 @@ resource "aws_sagemaker_mlflow_tracking_server" "mlflow" {
   }
 }
 
+# Keeps an existing server in state when upgrading with enable_mlflow = true.
+moved {
+  from = aws_sagemaker_mlflow_tracking_server.mlflow
+  to   = aws_sagemaker_mlflow_tracking_server.mlflow[0]
+}
+
 ################################################################################
 # SageMaker Pipeline
 ################################################################################
 
-# Fetch SageMaker prebuilt images dynamically using data sources
-data "aws_caller_identity" "current" {}
+# SageMaker Pipeline for Medical Image Classification MLOps: validation,
+# preprocessing, training, evaluation, ensemble, fairness check, clinical
+# quality gate and model registration. The definition lives in
+# pipeline.json.tftpl.
+locals {
+  # Resolves at run time to the execution's ID. Evaluation, ensemble and bias
+  # outputs are written under <prefix>/<execution-id>, so every registered
+  # model package points at its own weights and reports instead of one key
+  # that the next run overwrites.
+  execution_id = { Get = "Execution.PipelineExecutionId" }
 
-# SageMaker Pipeline for Medical Image Classification MLOps
-# This pipeline includes: validation, preprocessing, training,
-# evaluation, ensemble creation, model registration, and deployment
+  # SageMaker rejects VolumeKmsKeyId on instance types with local NVMe
+  # instance storage (encrypted by the instance hardware instead): families
+  # with a "d" suffix (m5d, c6id, g4dn, p4d) plus g5, g6, g6e, p5 and trn.
+  local_storage_instance_regex = "^ml\\.([a-z]+[0-9]+[a-z]*dn?|p4de|g5|g6e?|p5e?n?|trn[12]n?)\\."
+
+  pipeline_vpc_config = var.vpc_config == null ? null : {
+    Subnets          = var.vpc_config.subnet_ids
+    SecurityGroupIds = var.vpc_config.security_group_ids
+  }
+}
+
 resource "aws_sagemaker_pipeline" "medical_image_pipeline" {
   pipeline_name         = "${var.project_name}-pipeline"
   pipeline_display_name = "Medical-Image-Classification-Pipeline"
@@ -409,792 +455,54 @@ resource "aws_sagemaker_pipeline" "medical_image_pipeline" {
     max_parallel_execution_steps = var.pipeline_max_parallel_steps
   }
 
-  pipeline_definition = jsonencode({
-    Version = "2020-12-01"
-    Parameters = [
-      {
-        Name         = "ModelNames"
-        Type         = "String"
-        DefaultValue = local.model_names
-      },
-      {
-        Name         = "RetrainingReason"
-        Type         = "String"
-        DefaultValue = var.retraining_reason
-      }
-    ]
-    Steps = concat(
-      [
-        # Step 1: Data Validation
-        {
-          Name = var.pipeline_steps.validation.step_name
-          Type = var.pipeline_steps.validation.step_type
-          Arguments = {
-            ProcessingResources = {
-              ClusterConfig = {
-                InstanceType   = var.pipeline_steps.validation.instance_type
-                InstanceCount  = var.pipeline_steps.validation.instance_count
-                VolumeSizeInGB = var.pipeline_steps.validation.volume_size
-              }
-            }
-            AppSpecification = {
-              ImageUri = data.aws_sagemaker_prebuilt_ecr_image.sklearn.registry_path
-              ContainerEntrypoint = [
-                "python3", local.script_paths.validation_script,
-                "--input-path", local.processing_paths.input_data,
-                "--output-path", local.processing_paths.output
-              ]
-            }
-            ProcessingInputs = [
-              {
-                InputName = "code"
-                S3Input = {
-                  S3Uri       = "s3://${local.base_buckets.scripts}/validation/"
-                  LocalPath   = "/opt/ml/processing/input/code"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              },
-              {
-                InputName = "raw-data"
-                S3Input = {
-                  S3Uri       = "s3://${local.base_buckets.raw_data}/${var.training_data_path}"
-                  LocalPath   = "/opt/ml/processing/input/data"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              }
-            ]
-            ProcessingOutputConfig = {
-              Outputs = [
-                {
-                  OutputName = "validation-report"
-                  S3Output = {
-                    S3Uri        = "s3://${module.s3_processed_data.bucket_id}/validation-reports/"
-                    LocalPath    = "/opt/ml/processing/output"
-                    S3UploadMode = var.data_config.s3_upload_mode
-                  }
-                }
-              ]
-            }
-            RoleArn = module.sagemaker_execution_role.role_arn
-            Environment = {
-              PROJECT_NAME         = var.project_name
-              AWS_DEFAULT_REGION   = var.aws_region
-              MIN_IMAGES_PER_CLASS = tostring(var.min_images_per_class)
-            }
-          }
-          CacheConfig = {
-            Enabled     = var.pipeline_steps.validation.enable_cache
-            ExpireAfter = var.pipeline_steps.validation.cache_expiry
-          }
-        },
-        # Step 2: Data Preprocessing
-        {
-          Name = var.pipeline_steps.preprocessing.step_name
-          Type = var.pipeline_steps.preprocessing.step_type
-          Arguments = {
-            ProcessingResources = {
-              ClusterConfig = {
-                InstanceType   = var.pipeline_steps.preprocessing.instance_type
-                InstanceCount  = var.pipeline_steps.preprocessing.instance_count
-                VolumeSizeInGB = var.pipeline_steps.preprocessing.volume_size
-              }
-            }
-            AppSpecification = {
-              ImageUri = data.aws_sagemaker_prebuilt_ecr_image.sklearn.registry_path
-              # Install the preprocessing deps (imbalanced-learn for SMOTE,
-              # Pillow) before running. A raw ProcessingJob entrypoint does not
-              # auto-install requirements.txt the way ScriptProcessor does, and
-              # each ContainerEntrypoint string is capped at 256 chars, so the
-              # install + run is delegated to a small wrapper script uploaded
-              # alongside the preprocessor (run_preprocessing.sh).
-              ContainerEntrypoint = ["/bin/sh", "${local.container_paths.code}/run_preprocessing.sh"]
-              ContainerArguments = [
-                "--input-path", local.processing_paths.input_data,
-                "--output-path", local.processing_paths.output,
-                "--target-size", tostring(var.preprocessing_target_size),
-                "--apply-smote"
-              ]
-            }
-            ProcessingInputs = [
-              {
-                InputName = "code"
-                S3Input = {
-                  S3Uri       = "s3://${module.s3_scripts.bucket_id}/preprocessing/"
-                  LocalPath   = "/opt/ml/processing/input/code"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              },
-              {
-                InputName = "raw-data"
-                S3Input = {
-                  S3Uri       = "s3://${module.s3_raw_data.bucket_id}/${var.training_data_path}"
-                  LocalPath   = "/opt/ml/processing/input/data"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              }
-            ]
-            ProcessingOutputConfig = {
-              Outputs = [
-                {
-                  OutputName = "train-data"
-                  S3Output = {
-                    S3Uri        = "s3://${module.s3_processed_data.bucket_id}/train/"
-                    LocalPath    = "/opt/ml/processing/output/train"
-                    S3UploadMode = var.data_config.s3_upload_mode
-                  }
-                },
-                {
-                  OutputName = "validation-data"
-                  S3Output = {
-                    S3Uri        = "s3://${module.s3_processed_data.bucket_id}/validation/"
-                    LocalPath    = "/opt/ml/processing/output/validation"
-                    S3UploadMode = var.data_config.s3_upload_mode
-                  }
-                },
-                {
-                  OutputName = "test-data"
-                  S3Output = {
-                    S3Uri        = "s3://${module.s3_processed_data.bucket_id}/test/"
-                    LocalPath    = "/opt/ml/processing/output/test"
-                    S3UploadMode = var.data_config.s3_upload_mode
-                  }
-                }
-              ]
-            }
-            RoleArn = module.sagemaker_execution_role.role_arn
-            Environment = {
-              PROJECT_NAME       = var.project_name
-              AWS_DEFAULT_REGION = var.aws_region
-            }
-          }
-          CacheConfig = {
-            Enabled     = var.pipeline_steps.preprocessing.enable_cache
-            ExpireAfter = var.pipeline_steps.preprocessing.cache_expiry
-          }
-          DependsOn = [var.pipeline_steps.validation.step_name]
-        }
-      ],
-      # Steps 3-6: Model Training
-      [
-        for model_key in local.model_order : {
-          Name = var.models[model_key].step_name
-          Type = "Training"
-          Arguments = merge(
-            # CheckpointConfig only applies to managed-spot training; including
-            # it as a null key breaks the pipeline-definition JSON parser, so
-            # add the key only when spot is enabled.
-            var.enable_managed_spot_training ? {
-              CheckpointConfig = {
-                S3Uri     = "s3://${local.base_buckets.model_artifacts}/checkpoints/${model_key}/"
-                LocalPath = "/opt/ml/checkpoints"
-              }
-            } : {},
-            # SageMaker Experiments: associate each training run with a trial
-            # component so runs are tracked/comparable (Part 2). Inside a
-            # Pipeline, the experiment+trial are auto-managed from the pipeline
-            # execution, so only TrialComponentDisplayName is accepted here
-            # (passing ExperimentName is rejected by the pipeline parser).
-            var.enable_experiments ? {
-              ExperimentConfig = {
-                TrialComponentDisplayName = var.models[model_key].step_name
-              }
-            } : {},
-            # SageMaker Debugger built-in rules: surface overfitting and stalled
-            # loss within minutes (Part 2). RuleEvaluatorImage is region-specific.
-            # Built via list-spread merge (one-element list when enabled, empty
-            # otherwise) because a `cond ? {nested-list} : {}` ternary fails
-            # Terraform's conditional type-unification at plan time.
-            merge([
-              for _ in(var.enable_debugger ? [1] : []) : {
-                DebugHookConfig = {
-                  S3OutputPath = "s3://${local.base_buckets.model_artifacts}/debug-output/${model_key}/"
-                }
-                DebugRuleConfigurations = [
-                  {
-                    RuleConfigurationName = "Overfit"
-                    RuleEvaluatorImage    = var.debugger_rule_image
-                    RuleParameters        = { rule_to_invoke = "Overfit" }
-                  },
-                  {
-                    RuleConfigurationName = "LossNotDecreasing"
-                    RuleEvaluatorImage    = var.debugger_rule_image
-                    RuleParameters        = { rule_to_invoke = "LossNotDecreasing" }
-                  }
-                ]
-            }]...),
-            {
-              AlgorithmSpecification = {
-                # Pick the CPU or GPU training DLC based on the model's instance
-                # type. p-family and g-family are GPU; everything else (c5/m5)
-                # uses the CPU image. Lets the pipeline run on CPU when GPU quota
-                # is unavailable.
-                TrainingImage     = can(regex("^ml\\.(p|g)", var.models[model_key].instance_type)) ? data.aws_sagemaker_prebuilt_ecr_image.tensorflow_gpu.registry_path : data.aws_sagemaker_prebuilt_ecr_image.tensorflow_cpu.registry_path
-                TrainingInputMode = var.training_input_mode
-                MetricDefinitions = [
-                  {
-                    Name  = "train_loss"
-                    Regex = "Train Loss: ([0-9\\.]+)"
-                  },
-                  {
-                    Name  = "train_accuracy"
-                    Regex = "Train Accuracy: ([0-9\\.]+)"
-                  },
-                  {
-                    Name  = "validation_loss"
-                    Regex = "Validation Loss: ([0-9\\.]+)"
-                  },
-                  {
-                    Name  = "validation_accuracy"
-                    Regex = "Validation Accuracy: ([0-9\\.]+)"
-                  }
-                ]
-              }
-              RoleArn = module.sagemaker_execution_role.role_arn
-              # The "weights" channel feeds pre-downloaded ImageNet weights for
-              # network-isolation mode. It is only added when network isolation
-              # is enabled - otherwise the prefix may be empty and
-              # CreateTrainingJob fails ("No S3 objects found"). With isolation
-              # off, the trainers download ImageNet weights over the network
-              # (see resolve_weights_path in scripts/training/_common.py).
-              InputDataConfig = concat(
-                [
-                  {
-                    ChannelName = "training"
-                    DataSource = {
-                      S3DataSource = {
-                        S3DataType = var.data_config.s3_data_type
-                        S3Uri = {
-                          Get = "Steps.${var.pipeline_steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['train-data'].S3Output.S3Uri"
-                        }
-                      }
-                    }
-                    ContentType     = var.data_config.content_type
-                    CompressionType = var.data_config.compression_type
-                  }
-                ],
-                var.enable_network_isolation ? [
-                  {
-                    ChannelName = "weights"
-                    DataSource = {
-                      S3DataSource = {
-                        S3DataType = "S3Prefix"
-                        S3Uri      = "s3://${local.base_buckets.scripts}/pretrained-weights/"
-                      }
-                    }
-                  }
-                ] : []
-              )
-              OutputDataConfig = {
-                S3OutputPath = "s3://${local.base_buckets.model_artifacts}/models/${model_key}/"
-              }
-              ResourceConfig = merge(
-                {
-                  InstanceType   = var.models[model_key].instance_type
-                  InstanceCount  = var.models[model_key].instance_count
-                  VolumeSizeInGB = var.models[model_key].volume_size
-                },
-                # Warm pools and managed spot are mutually exclusive ("Spot
-                # training job can't retain cluster"), so only request a
-                # keep-alive period when spot is disabled.
-                (var.training_keep_alive_seconds > 0 && !var.enable_managed_spot_training) ? {
-                  KeepAlivePeriodInSeconds = var.training_keep_alive_seconds
-                } : {},
-              )
-              StoppingCondition = merge(
-                {
-                  MaxRuntimeInSeconds = var.models[model_key].max_runtime
-                },
-                var.enable_managed_spot_training ? {
-                  MaxWaitTimeInSeconds = var.models[model_key].max_runtime + var.spot_max_wait_buffer_seconds
-                } : {},
-              )
-              EnableManagedSpotTraining = var.enable_managed_spot_training
-              HyperParameters = merge({
-                sagemaker_program          = var.models[model_key].script_name
-                sagemaker_submit_directory = "s3://${local.base_buckets.scripts}/training/${var.models[model_key].tar_file}"
-              }, var.models[model_key].hyperparameters)
-              EnableNetworkIsolation = var.enable_network_isolation
-              Environment = {
-                PROJECT_NAME       = var.project_name
-                AWS_DEFAULT_REGION = var.aws_region
-              }
-            }
-          )
-          CacheConfig = {
-            Enabled     = var.models[model_key].enable_cache
-            ExpireAfter = var.models[model_key].cache_expiry
-          }
-          DependsOn = [var.pipeline_steps.preprocessing.step_name]
-        }
-      ],
-      [
-        # Step 7: Model Evaluation
-        {
-          Name = var.pipeline_steps.evaluation.step_name
-          Type = var.pipeline_steps.evaluation.step_type
-          Arguments = {
-            ProcessingResources = {
-              ClusterConfig = {
-                InstanceType   = var.pipeline_steps.evaluation.instance_type
-                InstanceCount  = var.pipeline_steps.evaluation.instance_count
-                VolumeSizeInGB = var.pipeline_steps.evaluation.volume_size
-              }
-            }
-            AppSpecification = {
-              ImageUri = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_cpu.registry_path
-              ContainerEntrypoint = [
-                "python3", local.script_paths.evaluation_script,
-                "--models-path", local.processing_paths.input_models,
-                "--data-path", local.processing_paths.input_test,
-                "--output-path", local.processing_paths.output
-              ]
-            }
-            ProcessingInputs = concat([
-              {
-                InputName = "code"
-                S3Input = {
-                  S3Uri       = "s3://${module.s3_scripts.bucket_id}/evaluation/"
-                  LocalPath   = "/opt/ml/processing/input/code"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              },
-              {
-                InputName = "test-data"
-                S3Input = {
-                  S3Uri = {
-                    Get = "Steps.${var.pipeline_steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['test-data'].S3Output.S3Uri"
-                  }
-                  LocalPath   = "/opt/ml/processing/input/data/test"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              }
-              ], [
-              for model_key in local.model_order : {
-                InputName = "${model_key}-model"
-                S3Input = {
-                  S3Uri = {
-                    Get = "Steps.${var.models[model_key].step_name}.ModelArtifacts.S3ModelArtifacts"
-                  }
-                  LocalPath   = "/opt/ml/processing/input/models/${model_key}"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              }
-            ])
-            ProcessingOutputConfig = {
-              Outputs = [
-                {
-                  OutputName = "evaluation-results"
-                  S3Output = {
-                    S3Uri        = "s3://${module.s3_model_artifacts.bucket_id}/evaluation/"
-                    LocalPath    = "/opt/ml/processing/output"
-                    S3UploadMode = var.data_config.s3_upload_mode
-                  }
-                }
-              ]
-            }
-            RoleArn = module.sagemaker_execution_role.role_arn
-            Environment = {
-              PROJECT_NAME       = var.project_name
-              AWS_DEFAULT_REGION = var.aws_region
-              MODEL_NAMES        = { "Get" : "Parameters.ModelNames" }
-            }
-          }
-          CacheConfig = {
-            Enabled     = var.pipeline_steps.evaluation.enable_cache
-            ExpireAfter = var.pipeline_steps.evaluation.cache_expiry
-          }
-          DependsOn = [for key in local.model_order : var.models[key].step_name]
-        }
-      ],
-      [
-        # Step 8: Ensemble Creation
-        {
-          Name = var.pipeline_steps.ensemble.step_name
-          Type = var.pipeline_steps.ensemble.step_type
-          Arguments = {
-            ProcessingResources = {
-              ClusterConfig = {
-                InstanceType   = var.pipeline_steps.ensemble.instance_type
-                InstanceCount  = var.pipeline_steps.ensemble.instance_count
-                VolumeSizeInGB = var.pipeline_steps.ensemble.volume_size
-              }
-            }
-            AppSpecification = {
-              ImageUri = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_cpu.registry_path
-              ContainerEntrypoint = [
-                "python3", local.script_paths.ensemble_script,
-                "--models-path", local.processing_paths.input_models,
-                "--evaluation-path", local.processing_paths.input_eval,
-                "--data-path", local.processing_paths.input_test,
-                "--output-path", local.processing_paths.output
-              ]
-            }
-            ProcessingInputs = concat([
-              {
-                InputName = "code"
-                S3Input = {
-                  S3Uri       = "s3://${module.s3_scripts.bucket_id}/ensemble/"
-                  LocalPath   = "/opt/ml/processing/input/code"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              },
-              {
-                InputName = "test-data"
-                S3Input = {
-                  S3Uri = {
-                    Get = "Steps.${var.pipeline_steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['test-data'].S3Output.S3Uri"
-                  }
-                  LocalPath   = "/opt/ml/processing/input/data/test"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              },
-              {
-                InputName = "evaluation-results"
-                S3Input = {
-                  S3Uri = {
-                    Get = "Steps.${var.pipeline_steps.evaluation.step_name}.ProcessingOutputConfig.Outputs['evaluation-results'].S3Output.S3Uri"
-                  }
-                  LocalPath   = "/opt/ml/processing/input/evaluation"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              }
-              ], [
-              for model_key in local.model_order : {
-                InputName = "${model_key}-model"
-                S3Input = {
-                  S3Uri = {
-                    Get = "Steps.${var.models[model_key].step_name}.ModelArtifacts.S3ModelArtifacts"
-                  }
-                  LocalPath   = "/opt/ml/processing/input/models/${model_key}"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              }
-            ])
-            ProcessingOutputConfig = {
-              Outputs = [
-                {
-                  OutputName = "ensemble-artifacts"
-                  S3Output = {
-                    S3Uri        = "s3://${module.s3_model_artifacts.bucket_id}/ensemble/"
-                    LocalPath    = "/opt/ml/processing/output"
-                    S3UploadMode = var.data_config.s3_upload_mode
-                  }
-                }
-              ]
-            }
-            RoleArn = module.sagemaker_execution_role.role_arn
-            Environment = {
-              PROJECT_NAME       = var.project_name
-              AWS_DEFAULT_REGION = var.aws_region
-              MODEL_NAMES        = { "Get" : "Parameters.ModelNames" }
-            }
-          }
-          CacheConfig = {
-            Enabled     = var.pipeline_steps.ensemble.enable_cache
-            ExpireAfter = var.pipeline_steps.ensemble.cache_expiry
-          }
-          DependsOn = [var.pipeline_steps.evaluation.step_name]
-        },
-        # Step 9 : Fairness check (Part 4). Runs Fairlearn over the evaluation
-        # output and writes bias_metrics.json. The clinical quality gate below
-        # reads max_disparity from this file, so accuracy and fairness must BOTH
-        # pass before the model registers.
-        {
-          Name = var.pipeline_steps.bias.step_name
-          Type = var.pipeline_steps.bias.step_type
-          Arguments = {
-            ProcessingResources = {
-              ClusterConfig = {
-                InstanceType   = var.pipeline_steps.bias.instance_type
-                InstanceCount  = var.pipeline_steps.bias.instance_count
-                VolumeSizeInGB = var.pipeline_steps.bias.volume_size
-              }
-            }
-            AppSpecification = {
-              ImageUri = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_cpu.registry_path
-              # Fairlearn is not in the DLC and a raw ProcessingJob entrypoint
-              # does not auto-install requirements.txt the way ScriptProcessor
-              # does, so a wrapper installs it before running the gate (same
-              # pattern as run_preprocessing.sh).
-              ContainerEntrypoint = ["/bin/sh", local.script_paths.bias_runner]
-              ContainerArguments = [
-                "--evaluation-path", local.processing_paths.input_eval,
-                "--output-path", local.processing_paths.output,
-                "--sensitive-feature", var.fairness_gate.sensitive_feature,
-                "--threshold", tostring(var.fairness_gate.max_disparity)
-              ]
-            }
-            ProcessingInputs = [
-              {
-                InputName = "code"
-                S3Input = {
-                  S3Uri       = "s3://${module.s3_scripts.bucket_id}/bias/"
-                  LocalPath   = "/opt/ml/processing/input/code"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              },
-              {
-                InputName = "evaluation-results"
-                S3Input = {
-                  S3Uri = {
-                    Get = "Steps.${var.pipeline_steps.evaluation.step_name}.ProcessingOutputConfig.Outputs['evaluation-results'].S3Output.S3Uri"
-                  }
-                  LocalPath   = "/opt/ml/processing/input/evaluation"
-                  S3DataType  = var.data_config.s3_data_type
-                  S3InputMode = var.data_config.s3_input_mode
-                }
-              }
-            ]
-            ProcessingOutputConfig = {
-              Outputs = [
-                {
-                  OutputName = "bias-metrics"
-                  S3Output = {
-                    S3Uri        = "s3://${module.s3_model_artifacts.bucket_id}/bias/"
-                    LocalPath    = "/opt/ml/processing/output"
-                    S3UploadMode = var.data_config.s3_upload_mode
-                  }
-                }
-              ]
-            }
-            RoleArn = module.sagemaker_execution_role.role_arn
-            Environment = {
-              PROJECT_NAME       = var.project_name
-              AWS_DEFAULT_REGION = var.aws_region
-            }
-          }
-          CacheConfig = {
-            Enabled     = var.pipeline_steps.bias.enable_cache
-            ExpireAfter = var.pipeline_steps.bias.cache_expiry
-          }
-          DependsOn = [var.pipeline_steps.ensemble.step_name]
-        },
-        # Step 10 : Clinical quality gate. Register only if the ensemble clears
-        # ALL of accuracy / recall / precision / AUC. Recall is the highest bar
-        # (0.95) because a missed malignant case is the costly error. The
-        # condition reads each metric from ensemble_results.json, the same file
-        # scripts/ensemble/ensemble_creator.py computes the clinical gate into.
-        {
-          Name        = "Condition"
-          Type        = "Condition"
-          DisplayName = "Clinical Quality Gate"
-          Arguments = {
-            Conditions = [
-              {
-                Type = "GreaterThanOrEqualTo"
-                LeftValue = {
-                  "Std:JsonGet" = {
-                    Path = "ensemble_accuracy"
-                    S3Uri = {
-                      "Std:Join" = {
-                        On = "",
-                        Values = [
-                          "s3://${module.s3_model_artifacts.bucket_id}/ensemble/ensemble_results.json"
-                        ]
-                      }
-                    }
-                  }
-                }
-                RightValue = var.clinical_quality_gate.accuracy
-              },
-              {
-                Type = "GreaterThanOrEqualTo"
-                LeftValue = {
-                  "Std:JsonGet" = {
-                    Path = "ensemble_recall"
-                    S3Uri = {
-                      "Std:Join" = {
-                        On = "",
-                        Values = [
-                          "s3://${module.s3_model_artifacts.bucket_id}/ensemble/ensemble_results.json"
-                        ]
-                      }
-                    }
-                  }
-                }
-                RightValue = var.clinical_quality_gate.recall
-              },
-              {
-                Type = "GreaterThanOrEqualTo"
-                LeftValue = {
-                  "Std:JsonGet" = {
-                    Path = "ensemble_precision"
-                    S3Uri = {
-                      "Std:Join" = {
-                        On = "",
-                        Values = [
-                          "s3://${module.s3_model_artifacts.bucket_id}/ensemble/ensemble_results.json"
-                        ]
-                      }
-                    }
-                  }
-                }
-                RightValue = var.clinical_quality_gate.precision
-              },
-              {
-                Type = "GreaterThanOrEqualTo"
-                LeftValue = {
-                  "Std:JsonGet" = {
-                    Path = "ensemble_auc"
-                    S3Uri = {
-                      "Std:Join" = {
-                        On = "",
-                        Values = [
-                          "s3://${module.s3_model_artifacts.bucket_id}/ensemble/ensemble_results.json"
-                        ]
-                      }
-                    }
-                  }
-                }
-                RightValue = var.clinical_quality_gate.auc_roc
-              },
-              # Fairness gate (Part 4). max_disparity is the larger of
-              # demographic-parity and equal-opportunity difference, computed by
-              # scripts/bias/compute_bias.py. Conditions are ANDed, so a model
-              # registers only when accuracy AND fairness both clear their bars.
-              {
-                Type = "LessThanOrEqualTo"
-                LeftValue = {
-                  "Std:JsonGet" = {
-                    Path = "max_disparity"
-                    S3Uri = {
-                      "Std:Join" = {
-                        On = "",
-                        Values = [
-                          "s3://${module.s3_model_artifacts.bucket_id}/bias/bias_metrics.json"
-                        ]
-                      }
-                    }
-                  }
-                }
-                RightValue = var.fairness_gate.max_disparity
-              }
-            ]
-            IfSteps = [{
-              Name = var.pipeline_steps.registry.step_name
-              Type = var.pipeline_steps.registry.step_type
-              Arguments = {
-                ModelPackageGroupName = aws_sagemaker_model_package_group.medical_image_models.model_package_group_name
-                # Register as PendingManualApproval so a clinical review board
-                # (not the pipeline) decides what reaches an endpoint. The
-                # auto-deploy Lambda fires on the Approved state change, so the
-                # human approval IS the deploy trigger.
-                ModelApprovalStatus     = "PendingManualApproval"
-                ModelPackageDescription = "Medical image classification ensemble model"
+  pipeline_definition = templatefile("${path.module}/pipeline.json.tftpl", {
+    project_name             = var.project_name
+    aws_region               = var.aws_region
+    role_arn                 = module.sagemaker_execution_role.role_arn
+    kms_key_arn              = module.kms.key_arn
+    model_package_group_name = aws_sagemaker_model_package_group.medical_image_models.model_package_group_name
+    buckets                  = local.base_buckets
+    images = {
+      tensorflow_cpu       = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_cpu.registry_path
+      tensorflow_gpu       = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_gpu.registry_path
+      tensorflow_inference = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_inference.registry_path
+    }
 
-                # Audit-traceability metadata: which retraining reason produced
-                # this version and the clinical metrics it cleared. Lets an
-                # auditor reconstruct provenance from the registry alone.
-                CustomerMetadataProperties = {
-                  retraining_reason   = var.retraining_reason
-                  accuracy_threshold  = tostring(var.clinical_quality_gate.accuracy)
-                  recall_threshold    = tostring(var.clinical_quality_gate.recall)
-                  precision_threshold = tostring(var.clinical_quality_gate.precision)
-                  auc_threshold       = tostring(var.clinical_quality_gate.auc_roc)
-                  project_name        = var.project_name
-                  # Data + code lineage (DVC-style) so an auditor can reconstruct
-                  # exactly which dataset hash and git commit produced this model
-                  # version. Populated from pipeline parameters / CI env.
-                  data_version = var.dataset_version
-                  code_commit  = var.code_commit_sha
-                }
+    steps            = var.pipeline_steps
+    models           = var.models
+    model_order      = local.model_order
+    model_names      = local.model_names
+    data_config      = var.data_config
+    container_paths  = local.container_paths
+    processing_paths = local.processing_paths
+    script_paths     = local.script_paths
 
-                InferenceSpecification = {
-                  Containers = [
-                    {
-                      Image        = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_inference.registry_path
-                      ModelDataUrl = "s3://${module.s3_model_artifacts.bucket_id}/ensemble/model.tar.gz"
-                      Environment = {
-                        SAGEMAKER_PROGRAM          = "inference.py"
-                        SAGEMAKER_SUBMIT_DIRECTORY = "/opt/ml/code"
-                      }
-                    }
-                  ]
-                  SupportedContentTypes                   = ["application/json", "image/jpeg", "image/png"]
-                  SupportedResponseMIMETypes              = ["application/json"]
-                  SupportedRealtimeInferenceInstanceTypes = ["ml.m5.large", "ml.m5.xlarge", "ml.m5.2xlarge"]
-                  SupportedTransformInstanceTypes         = ["ml.m5.large", "ml.m5.xlarge"]
-                }
+    training_data_path           = var.training_data_path
+    training_input_mode          = var.training_input_mode
+    preprocessing_target_size    = var.preprocessing_target_size
+    min_images_per_class         = var.min_images_per_class
+    enable_managed_spot_training = var.enable_managed_spot_training
+    spot_max_wait_buffer_seconds = var.spot_max_wait_buffer_seconds
+    training_keep_alive_seconds  = var.training_keep_alive_seconds
+    enable_experiments           = var.enable_experiments
+    enable_debugger              = var.enable_debugger
+    debugger_rule_image          = var.debugger_rule_image
+    enable_network_isolation     = var.enable_network_isolation
+    vpc_config                   = local.pipeline_vpc_config
+    local_storage_instance_regex = local.local_storage_instance_regex
 
-                ModelMetrics = {
-                  ModelQuality = {
-                    Statistics = {
-                      ContentType = "application/json"
-                      S3Uri       = "s3://${module.s3_model_artifacts.bucket_id}/evaluation/model_quality_statistics.json"
-                    }
-                    Constraints = {
-                      ContentType = "application/json"
-                      S3Uri       = "s3://${module.s3_model_artifacts.bucket_id}/evaluation/model_quality_constraints.json"
-                    }
-                  }
+    clinical_quality_gate = var.clinical_quality_gate
+    fairness_gate         = var.fairness_gate
+    allow_not_evaluable   = var.allow_not_evaluable
 
-                  ModelDataQuality = {
-                    Statistics = {
-                      ContentType = "application/json"
-                      S3Uri       = "s3://${module.s3_model_artifacts.bucket_id}/evaluation/data_quality_statistics.json"
-                    }
-                    Constraints = {
-                      ContentType = "application/json"
-                      S3Uri       = "s3://${module.s3_model_artifacts.bucket_id}/evaluation/data_quality_constraints.json"
-                    }
-                  }
+    # Defaults for the RetrainingReason, DatasetVersion and CodeCommitSha
+    # pipeline parameters.
+    retraining_reason = var.retraining_reason
+    dataset_version   = var.dataset_version
+    code_commit_sha   = var.code_commit_sha
 
-                  Bias = {
-                    Report = {
-                      ContentType = "application/json"
-                      S3Uri       = "s3://${module.s3_model_artifacts.bucket_id}/evaluation/bias_report.json"
-                    }
-                    PreTrainingReport = {
-                      ContentType = "application/json"
-                      S3Uri       = "s3://${module.s3_model_artifacts.bucket_id}/evaluation/data_bias_report.json"
-                    }
-                  }
-
-                  Explainability = {
-                    Report = {
-                      ContentType = "application/json"
-                      S3Uri       = "s3://${module.s3_model_artifacts.bucket_id}/evaluation/explainability_report.json"
-                    }
-                  }
-                }
-              }
-              DependsOn = [var.pipeline_steps.ensemble.step_name]
-              }
-            ]
-            ElseSteps = [
-              {
-                Name        = "Fail"
-                Type        = "Fail"
-                DisplayName = "Fail Clinical Quality Gate"
-                Arguments = {
-                  ErrorMessage = "Ensemble did not meet clinical quality gate (accuracy/recall/precision/AUC). See ensemble_results.json clinical_quality_gate for the failing metric and gap."
-                }
-              }
-            ]
-          }
-          # Must depend on BiasCheck, not just the ensemble: the fairness
-          # condition below reads max_disparity from the bias step's S3 output
-          # via Std:JsonGet. With only the ensemble edge, SageMaker schedules
-          # this step in parallel with BiasCheck and the JsonGet resolves before
-          # bias_metrics.json is uploaded, failing with "Cannot access S3 key".
-          DependsOn = [
-            var.pipeline_steps.ensemble.step_name,
-            var.pipeline_steps.bias.step_name,
-          ]
-        }
-      ]
-    )
+    execution_id          = local.execution_id
+    evaluation_output_uri = { Get = "Steps.${var.pipeline_steps.evaluation.step_name}.ProcessingOutputConfig.Outputs['evaluation-results'].S3Output.S3Uri" }
+    bias_output_uri       = { Get = "Steps.${var.pipeline_steps.bias.step_name}.ProcessingOutputConfig.Outputs['bias-metrics'].S3Output.S3Uri" }
   })
 }

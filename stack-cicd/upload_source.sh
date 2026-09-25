@@ -41,9 +41,7 @@ else
 fi
 
 echo "Uploading to S3 bucket: $BUCKET_NAME"
-aws s3 cp "$TEMP_ZIP" "s3://$BUCKET_NAME/source.zip"
-
-if [ $? -eq 0 ]; then
+if aws s3 cp "$TEMP_ZIP" "s3://$BUCKET_NAME/source.zip"; then
     echo "Successfully uploaded source.zip to S3"
     echo "Pipeline should trigger automatically"
 else

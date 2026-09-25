@@ -1,0 +1,10 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# Copy to backend.hcl (gitignored) or run `make backend-config`, then:
+#   terraform init -backend-config=backend.hcl
+# Values come from the stack-backend-setup outputs state_bucket_id,
+# state_bucket_region and kms_key_alias.
+bucket     = "your-project-tfstate-1a2b3c4d"
+region     = "us-east-1"
+kms_key_id = "alias/your-project-terraform-state"

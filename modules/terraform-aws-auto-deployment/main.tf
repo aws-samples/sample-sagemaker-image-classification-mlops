@@ -39,7 +39,8 @@ resource "aws_lambda_permission" "allow_eventbridge" {
 
 # IAM role for auto-deployment Lambda
 resource "aws_iam_role" "auto_deploy_lambda_role" {
-  name = "${var.project_name}-auto-deploy-lambda-role"
+  name                 = "${var.project_name}-auto-deploy-lambda-role"
+  permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -67,7 +68,7 @@ resource "aws_iam_role_policy" "auto_deploy_lambda_policy" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Effect = "Allow"
         Action = [
@@ -157,13 +158,43 @@ resource "aws_iam_role_policy" "auto_deploy_lambda_policy" {
         ]
         Resource = "*"
       }
-    ]
+      ],
+      # The endpoint configs it creates carry the project CMK (KmsKeyId);
+      # SageMaker needs a grant from the caller of UpdateEndpoint to attach
+      # the encrypted volume.
+      var.volume_kms_key_arn == null ? [] : [
+        {
+          Effect   = "Allow"
+          Action   = ["kms:CreateGrant", "kms:DescribeKey"]
+          Resource = var.volume_kms_key_arn
+          Condition = {
+            Bool = { "kms:GrantIsForAWSResource" = "true" }
+          }
+        }
+      ],
+      # Drift baseline refresh: read the deployed package's predictions.json
+      # and write the baseline object the drift job reads.
+      var.model_artifacts_bucket == "" ? [] : [
+        {
+          Effect   = "Allow"
+          Action   = ["s3:GetObject"]
+          Resource = "arn:aws:s3:::${var.model_artifacts_bucket}/ensemble/*"
+        },
+        {
+          Effect   = "Allow"
+          Action   = ["s3:PutObject"]
+          Resource = "arn:aws:s3:::${var.monitoring_bucket}/${var.drift_baseline_key}"
+        }
+      ],
+      (var.model_artifacts_bucket == "" || var.artifacts_kms_key_arn == null) ? [] : [
+        {
+          Effect   = "Allow"
+          Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
+          Resource = var.artifacts_kms_key_arn
+        }
+    ])
   })
 }
-
-################################################################################
-# Lambda Function
-################################################################################
 
 ################################################################################
 # Lambda Function
@@ -227,8 +258,7 @@ resource "aws_lambda_function" "auto_deploy" {
   # consistency across resources).
   kms_key_arn = var.env_kms_key_arn
 
-  # Active X-Ray tracing so we can see the full EventBridge → Lambda →
-  # SageMaker call chain when a deploy misbehaves.
+  # Active X-Ray tracing: EventBridge to Lambda to SageMaker call chain.
   tracing_config {
     mode = "Active"
   }
@@ -245,9 +275,14 @@ resource "aws_lambda_function" "auto_deploy" {
       PROJECT_NAME                     = var.project_name
       MODEL_PACKAGE_GROUP_NAME         = var.model_package_group_name
       MONITORING_BUCKET                = var.monitoring_bucket
+      DRIFT_BASELINE_KEY               = var.drift_baseline_key
+      MODEL_ARTIFACTS_BUCKET           = var.model_artifacts_bucket
       INSTANCE_TYPE                    = var.endpoint_instance_type
       DATA_CAPTURE_SAMPLING_PERCENTAGE = tostring(var.data_capture_sampling_percentage)
-      PATCHED_IMAGE_URI                = var.patched_image_uri
+      DATA_CAPTURE_INPUT               = tostring(var.data_capture_input)
+      SERVING_IMAGE_URI                = var.serving_image_uri
+      # Project CMK for the endpoint's ML storage volume (real-time only).
+      VOLUME_KMS_KEY_ID = var.volume_kms_key_arn == null ? "" : var.volume_kms_key_arn
       # Serverless inference opt-in - mirrors the Terraform module flag so
       # the Lambda builds endpoint configs matching the initial deploy.
       USE_SERVERLESS_INFERENCE   = tostring(var.use_serverless_inference)

@@ -13,20 +13,20 @@ Dual-mode CloudWatch monitoring module supporting ML training dashboards and gen
 ## Requirements
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | terraform | ~> 1.15 |
 | aws | ~> 6.0 |
 
 ## Providers
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | aws | ~> 6.0 |
 
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [aws_cloudwatch_dashboard.generic](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_dashboard) | resource |
 | [aws_cloudwatch_dashboard.training_dashboard](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_dashboard) | resource |
 | [aws_cloudwatch_log_group.generic](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_log_group) | resource |
@@ -42,7 +42,7 @@ Dual-mode CloudWatch monitoring module supporting ML training dashboards and gen
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
+| ---- | ----------- | ---- | ------- | :------: |
 | aws\_region | AWS region for monitoring | `string` | n/a | yes |
 | project\_name | Project name for resource naming | `string` | n/a | yes |
 | dashboard\_config | Dashboard configuration JSON (generic mode only) | `string` | `""` | no |
@@ -60,7 +60,7 @@ Dual-mode CloudWatch monitoring module supporting ML training dashboards and gen
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ---- | ----------- |
 | dashboard\_name | Dashboard name |
 | generic\_log\_groups | Generic log groups created |
 | metric\_filters | Metric filters created |
@@ -73,8 +73,8 @@ Dual-mode CloudWatch monitoring module supporting ML training dashboards and gen
 
 ```
 modules/terraform-aws-cloudwatch/
-├── main.tf          # Log groups, dashboards, metric filters (training + generic modes)
-├── outputs.tf       # Dashboard name/URL, log groups, metric filters
-├── README.md        # Module documentation
-└── variables.tf     # Project config, training monitoring, generic monitoring, tags
+|-- main.tf          # Log groups, dashboards, metric filters (training + generic modes)
+|-- outputs.tf       # Dashboard name/URL, log groups, metric filters
+|-- README.md        # Module documentation
+`-- variables.tf     # Project config, training monitoring, generic monitoring, tags
 ```

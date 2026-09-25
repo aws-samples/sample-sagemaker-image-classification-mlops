@@ -69,8 +69,24 @@ variable "kms_key_deletion_window_days" {
   }
 }
 
+variable "kms_key_alias" {
+  description = "Alias name (without the alias/ prefix) for the state encryption KMS key. If empty, <project_name>-terraform-state is used."
+  type        = string
+  default     = ""
+}
+
 variable "kms_key_administrators" {
   description = "IAM ARNs allowed to administer the state encryption KMS key. Defaults to the caller's account root."
   type        = list(string)
   default     = []
+}
+
+################################################################################
+# IAM
+################################################################################
+
+variable "workload_boundary_name" {
+  description = "Name of the IAM permissions boundary policy attached to every workload role. If empty, <project_name>-workload-boundary is used."
+  type        = string
+  default     = ""
 }

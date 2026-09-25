@@ -10,8 +10,8 @@ CODE_DIR="/opt/ml/processing/input/code"
 # the SageMaker Python SDK's ScriptProcessor does, so install Fairlearn here.
 # Without this the fairness gate fails at import time: the TensorFlow DLC does
 # not ship Fairlearn.
-pip install -q -r "${CODE_DIR}/requirements.txt" 2>/dev/null \
-  || pip install -q fairlearn
+# No fallback: a failed install must fail the step, not run an unpinned version.
+pip install -q -r "${CODE_DIR}/requirements.txt"
 
 # All flags arrive as ContainerArguments and are forwarded verbatim.
 exec python3 "${CODE_DIR}/compute_bias.py" "$@"

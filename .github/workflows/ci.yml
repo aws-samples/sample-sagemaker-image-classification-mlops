@@ -1,0 +1,79 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Static checks only: no AWS credentials, no terraform plan or apply.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.15.6"
+
+jobs:
+  terraform:
+    name: terraform (${{ matrix.stack }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack:
+          - stack-backend-setup
+          - stack-training
+          - stack-inference
+          - stack-cicd
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+      - name: terraform init
+        run: terraform -chdir=${{ matrix.stack }} init -backend=false -input=false
+      - name: terraform validate
+        run: terraform -chdir=${{ matrix.stack }} validate
+
+  checkov:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install checkov
+        run: python -m pip install checkov==3.2.504
+      - name: checkov
+        run: checkov --config-file .checkov.yaml
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install dev dependencies
+        # Dependency groups need pip 25.1 or later; the dev group in
+        # pyproject.toml pins ruff, pytest and the test dependencies.
+        run: |
+          python -m pip install --upgrade "pip>=25.1"
+          python -m pip install --group dev
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format
+        run: ruff format --check .
+      - name: pytest
+        # Exit code 5 means no tests were collected.
+        run: pytest || [ $? -eq 5 ]

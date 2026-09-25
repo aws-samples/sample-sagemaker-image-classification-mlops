@@ -21,22 +21,63 @@ variable "lambda_function_arn" {
 }
 
 ################################################################################
+# Authentication
+################################################################################
+
+variable "authorization_type" {
+  description = <<-EOT
+    Method authorization for POST /predict and GET /results/{id}.
+    "NONE" (default) relies on the API key, usage plan and WAF only: the key
+    meters callers but is public once it ships in the static frontend.
+    To authenticate users instead:
+      - "AWS_IAM": callers sign requests with SigV4; grant execute-api:Invoke
+        on this API's execution ARN to the calling role (for a browser, use
+        Cognito identity pool credentials).
+      - "COGNITO_USER_POOLS": set cognito_user_pool_arns; callers send the user
+        pool ID token in the Authorization header.
+    Both can be combined with require_api_key.
+  EOT
+  type        = string
+  default     = "NONE"
+
+  validation {
+    condition     = contains(["NONE", "AWS_IAM", "COGNITO_USER_POOLS"], var.authorization_type)
+    error_message = "authorization_type must be NONE, AWS_IAM or COGNITO_USER_POOLS."
+  }
+}
+
+variable "cognito_user_pool_arns" {
+  description = "Cognito user pool ARNs for the COGNITO_USER_POOLS authorizer. Required when authorization_type = \"COGNITO_USER_POOLS\"."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = var.authorization_type != "COGNITO_USER_POOLS" || length(var.cognito_user_pool_arns) > 0
+    error_message = "cognito_user_pool_arns must list at least one user pool when authorization_type = COGNITO_USER_POOLS."
+  }
+}
+
+variable "require_api_key" {
+  description = "Require the x-api-key header on POST /predict and GET /results/{id}. Creates one API key attached to the usage plan (the usage plan is created whenever this is true). The key is output as api_key_value (sensitive)."
+  type        = bool
+  default     = true
+}
+
+################################################################################
 # CORS
 ################################################################################
 
-variable "cors_origins" {
-  description = "List of allowed CORS origins"
-  type        = list(string)
-  default     = ["*"]
+variable "cors_allowed_origin" {
+  description = "Origin returned in Access-Control-Allow-Origin, for example https://d111111abcdef8.cloudfront.net. Only this origin can call the API from a browser."
+  type        = string
 }
 
 ################################################################################
 # Throttling
 ################################################################################
 
-# Stage-wide throttle - applies to every request (authenticated or not).
-# AWS account default is 10k req/sec burst, 5k rate. For a medical-image
-# demo endpoint we aggressively cap to prevent bill-inflation attacks.
+# Stage-wide throttle for every request. The account default is 10,000
+# requests per second; a medical-image demo caps far lower.
 variable "throttling_rate_limit" {
   description = "Stage-wide throttling rate limit (requests per second across all methods)"
   type        = number
@@ -60,29 +101,29 @@ variable "throttling_burst_limit" {
 }
 
 ################################################################################
-# Usage Plan (optional)
+# Usage Plan
 ################################################################################
 
 variable "create_usage_plan" {
-  description = "Create an API Gateway usage plan. Enables per-API-key quotas and throttles for authenticated clients."
+  description = "Create the usage plan even when require_api_key = false. The plan is always created when an API key is required."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "usage_plan_rate_limit" {
-  description = "Per-client rate limit (req/sec) when usage plan is enabled"
+  description = "Per-key rate limit (requests per second)"
   type        = number
   default     = 10
 }
 
 variable "usage_plan_burst_limit" {
-  description = "Per-client burst limit when usage plan is enabled"
+  description = "Per-key burst limit"
   type        = number
   default     = 20
 }
 
 variable "usage_plan_quota_limit" {
-  description = "Per-client quota - maximum requests in the `usage_plan_quota_period`"
+  description = "Per-key quota - maximum requests in the usage_plan_quota_period"
   type        = number
   default     = 10000
 }
@@ -95,6 +136,27 @@ variable "usage_plan_quota_period" {
   validation {
     condition     = contains(["DAY", "WEEK", "MONTH"], var.usage_plan_quota_period)
     error_message = "usage_plan_quota_period must be one of DAY, WEEK, MONTH."
+  }
+}
+
+################################################################################
+# AWS WAF
+################################################################################
+
+variable "enable_waf" {
+  description = "Associate a regional AWS WAF web ACL with the stage: AWS managed common and known-bad-inputs rule sets plus a per-IP rate-based rule. WAF logs go to a CloudWatch log group with the x-api-key header redacted."
+  type        = bool
+  default     = true
+}
+
+variable "waf_rate_limit" {
+  description = "Requests per client IP in any 5-minute window before the WAF rate-based rule blocks that IP."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.waf_rate_limit >= 10 && var.waf_rate_limit <= 2000000000
+    error_message = "waf_rate_limit must be between 10 and 2,000,000,000."
   }
 }
 
@@ -134,4 +196,10 @@ variable "tags" {
   description = "Tags to apply to resources"
   type        = map(string)
   default     = {}
+}
+
+variable "permissions_boundary_arn" {
+  description = "ARN of the permissions boundary attached to the IAM roles this module creates. null leaves them unbounded."
+  type        = string
+  default     = null
 }
