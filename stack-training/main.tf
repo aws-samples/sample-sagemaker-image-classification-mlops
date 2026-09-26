@@ -381,7 +381,7 @@ resource "aws_sagemaker_model_card" "medical_image" {
     intended_uses = {
       purpose_of_model                   = "Assist radiologists/pathologists in flagging suspicious medical image findings."
       intended_uses                      = "Primary screening decision support; flags cases for human review. Not for autonomous diagnosis."
-      factors_affecting_model_efficiency = "Performance varies by scanner/stain and may not generalize across datasets (in-distribution ~97% vs external BreakHis ~52%)."
+      factors_affecting_model_efficiency = "Performance varies by scanner, stain and magnification and may not generalize to images from other sites or datasets. Validate on your own data before use."
       risk_rating                        = var.model_card_risk_rating
       explanations_for_risk_rating       = "Predictions influence clinical decisions; a missed malignant case (false negative) is high-consequence, hence the recall-weighted clinical quality gate."
     }

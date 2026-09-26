@@ -282,8 +282,8 @@ locals {
       namespace           = "AWS/SageMaker"
       period              = "300"
       statistic           = "Average"
-      threshold           = "5000"
-      alarm_description   = "SageMaker endpoint high latency"
+      threshold           = "5000000" # ModelLatency is in microseconds: 5 s
+      alarm_description   = "SageMaker endpoint average model latency above 5 s"
       dimensions          = { EndpointName = local.endpoint_name }
       treat_missing_data  = "notBreaching"
     }

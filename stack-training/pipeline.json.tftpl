@@ -854,9 +854,9 @@ ${jsonencode({
             {
               Name        = "Fail"
               Type        = "Fail"
-              DisplayName = "Fail Clinical Quality Gate"
+              DisplayName = "Fail Quality Or Fairness Gate"
               Arguments = {
-                ErrorMessage = "Ensemble did not meet clinical quality gate (accuracy/recall/precision/AUC). See ensemble_results.json clinical_quality_gate for the failing metric and gap."
+                ErrorMessage = "Ensemble did not pass the clinical quality gate (accuracy/recall/precision/AUC) or the fairness gate (max_disparity). See clinical_quality_gate in ensemble_results.json and max_disparity in bias_metrics.json."
               }
             }
           ]

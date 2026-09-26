@@ -39,4 +39,4 @@ serverless_max_concurrency = 10   # max concurrent requests (1-200)
 # End-to-end exercise of opt-in responsible-AI features (Part 3/4).
 enable_bedrock_hybrid_inference = true
 bedrock_confidence_threshold    = 0.99 # high so the demo prediction routes to Bedrock
-enable_async_explainability     = true
+enable_async_explainability     = false

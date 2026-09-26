@@ -436,7 +436,7 @@ variable "review_workteam_arn" {
 }
 
 variable "enable_async_explainability" {
-  description = "When true, the inference response includes a pointer to where the asynchronous Grad-CAM/SHAP explainability artifact is written (Part 4). The artifact itself is produced by an async job; the API Lambda cannot run Grad-CAM inline (no TF runtime / conv-layer access in the served ensemble)."
+  description = "When true, the inference response includes a pointer to where an asynchronous Grad-CAM explainability artifact would be written. No job in this sample writes it: turn this on only after you add your own job that does. The API Lambda cannot run Grad-CAM inline (no TF runtime or conv-layer access in the served ensemble)."
   type        = bool
   default     = false
 }

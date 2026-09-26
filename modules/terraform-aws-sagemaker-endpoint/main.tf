@@ -265,7 +265,7 @@ resource "aws_cloudwatch_metric_alarm" "endpoint_latency" {
   namespace           = "AWS/SageMaker"
   period              = 60
   statistic           = "Average"
-  threshold           = var.latency_threshold
+  threshold           = var.latency_threshold * 1000 # ModelLatency is in microseconds
   alarm_description   = "Triggers rollback if endpoint latency exceeds ${var.latency_threshold}ms"
   treat_missing_data  = "notBreaching"
 
