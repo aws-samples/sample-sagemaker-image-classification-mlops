@@ -105,9 +105,11 @@ locals {
         # Bedrock guardrail applied to the hybrid FM reasoning output (empty = none).
         BEDROCK_GUARDRAIL_ID      = var.enable_bedrock_hybrid_inference ? aws_bedrock_guardrail.hybrid[0].guardrail_id : ""
         BEDROCK_GUARDRAIL_VERSION = var.enable_bedrock_hybrid_inference ? aws_bedrock_guardrail.hybrid[0].version : ""
-        # Bucket where async Grad-CAM/SHAP explainability artifacts are written
-        # (empty = explainability pointer omitted from the response).
-        EXPLAIN_BUCKET = var.enable_async_explainability ? local.training_outputs.monitoring_bucket : ""
+        # Opt-in per-request explanations, computed on the endpoint. The caps
+        # are set here, not by the caller, because they bound endpoint compute.
+        EXPLANATIONS_ENABLED   = tostring(var.enable_request_explanations)
+        EXPLAIN_MAX_EVALS      = tostring(var.explanation_max_evaluations)
+        EXPLAIN_TIME_BUDGET_MS = tostring(var.explanation_time_budget_ms)
       }
     }
     endpoint_refresher = {

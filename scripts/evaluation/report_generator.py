@@ -436,49 +436,40 @@ class ModelReportGenerator:
             return 0.0
         return float(np.mean(predictions[positives] == 1))
 
-    def generate_explainability_report(self, feature_importances=None):
-        """Write the explainability report in a kernel_shap-style shape.
+    def generate_explainability_report(self):
+        """Describe the explanations the served model returns per request.
 
-        The report carries a kernel_shap explanations section, so this
-        mirrors that structure. When real feature importances are supplied they
-        are used directly. Otherwise this falls back to a coarse, honest channel
-        -level summary: the three input channels (R, G, B) of the 224x224x3
-        tiles are given uniform placeholder importance, and the note states
-        plainly that pixel-region attribution is a coarse proxy and that a full
-        Grad-CAM or SHAP attribution runs as a separate processing job.
+        This sample computes no global attribution at evaluation time, so the
+        report carries none. Explanations are per image: a POST /predict with
+        "explain": true returns a Grad-CAM heatmap and region Shapley values,
+        computed on the endpoint from signatures exported with each member
+        model (scripts/ensemble/explain_export.py, scripts/ensemble/inference.py).
         """
-        if feature_importances:
-            importances = {str(k): float(v) for k, v in feature_importances.items()}
-            note = (
-                "Explainability importances were supplied by the caller and are "
-                "reported as global per-feature attribution."
-            )
-            global_importance = importances
-        else:
-            channels = ["channel_0_red", "channel_1_green", "channel_2_blue"]
-            uniform = round(1.0 / len(channels), 6)
-            global_importance = {name: uniform for name in channels}
-            note = (
-                "No precomputed feature importances were available. This report "
-                "carries a coarse channel-level placeholder over the three RGB "
-                "input channels of the 224x224x3 tiles, with uniform weights "
-                "because no per-channel attribution was computed here. Pixel and "
-                "region-level attribution (Grad-CAM or kernel SHAP) is a coarse "
-                "proxy for these histopathology images and is intended to run as "
-                "a separate processing job, not inline in evaluation. Do not read "
-                "clinical meaning into these placeholder values."
-            )
-
         report = {
-            "version": "1.0",
-            "explanations": {
-                "kernel_shap": {
-                    "global_shap_values": global_importance,
-                    "expected_value": 0.5,
-                    "label": "malignant",
-                }
+            "version": "2.0",
+            "global_attribution": None,
+            "per_request_explanations": {
+                "how_to_request": 'POST /predict with "explain": true',
+                "gradcam": {
+                    "target": "predicted class",
+                    "layer": "feature map feeding global average pooling in each member",
+                    "combination": "ensemble-weighted average of per-model maps, each scaled to max 1",
+                    "output": "14x14 grid in [0, 1] and the box of the top region",
+                },
+                "region_shapley": {
+                    "method": "region Shapley values estimated by antithetic permutation sampling",
+                    "target": "ensemble malignant probability",
+                    "players": "4x4 grid of image regions",
+                    "baseline": "ImageNet mean colour (0 after normalisation)",
+                    "property": "values sum to f(image) - f(baseline)",
+                },
             },
-            "note": note,
+            "note": (
+                "No global attribution is computed for this model version. Use the "
+                "per-request explanations to see which image regions drove a "
+                "prediction. They are decision support for a reviewer, not evidence "
+                "of clinical validity."
+            ),
         }
 
         file_path = os.path.join(self.output_path, "explainability_report.json")

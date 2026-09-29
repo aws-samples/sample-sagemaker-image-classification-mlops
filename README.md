@@ -413,6 +413,81 @@ The API has two routes:
   Images larger than `max_image_bytes` (5 MB by default) return HTTP 413.
 - `GET /results/{request_id}` returns the stored prediction for that request.
 
+### Explanations in the response
+
+Add `"explain": true` to the `POST /predict` body to get per-image
+explanations with the prediction (`--explain` in `test_api.py`). They are off
+unless asked for, so a request without the field gets the same response, at
+the same latency, as before. `{"explain": {"methods": ["gradcam"]}}` asks for
+one method only (`gradcam` or `region_shapley`).
+
+```json
+{
+  "request_id": "3f1c2a9e-5b7d-4e2a-9c1f-0a1b2c3d4e5f",
+  "prediction": "malignant",
+  "confidence": 0.91,
+  "probabilities": {"benign": 0.09, "malignant": 0.91},
+  "threshold_used": 0.42,
+  "model_info": "Image analysis using ensemble model",
+  "routing": "high-confidence-custom",
+  "explanations": {
+    "gradcam": {
+      "method": "grad-cam",
+      "target": "malignant",
+      "layer": "feature map feeding global average pooling (last convolutional block)",
+      "combination": "ensemble-weighted average of per-model maps, each scaled to max 1",
+      "grid_size": 14,
+      "grid": [[0.021, 0.054, 0.112]],
+      "top_region": {"box": [0.2857, 0.1429, 0.6429, 0.5], "peak_cell": [4, 6], "cells": 19},
+      "elapsed_ms": 310
+    },
+    "region_shapley": {
+      "method": "region Shapley values estimated by antithetic permutation sampling",
+      "target": "malignant probability",
+      "grid_size": 4,
+      "values": [[0.012, -0.003, 0.041, 0.0]],
+      "baseline": "ImageNet mean colour (0 after normalisation)",
+      "baseline_score": 0.3712,
+      "full_score": 0.91,
+      "sum": 0.5388,
+      "permutations": 2,
+      "evaluations": 32,
+      "seed": 0,
+      "elapsed_ms": 4100
+    },
+    "explain_ms": 4420
+  }
+}
+```
+
+`grid` (14 x 14) and `values` (4 x 4) are cut to their first row here. The
+whole `explanations` object is under 3 KB. How they are computed, on the
+endpoint, for the ensemble that made the call:
+
+- **Grad-CAM** for the predicted class. Each member model's SavedModel carries
+  a `gradcam` signature: activations are the feature map that feeds its global
+  average pooling layer (the last convolutional block), gradients are of the
+  malignant logit (negated for a benign call), and the map is resized to
+  14 x 14. The handler scales each member's map to a maximum of 1 and averages
+  them with the ensemble weights. `top_region.box` is `[x_min, y_min, x_max,
+  y_max]` as fractions of the image, around the connected cells at 50% of the
+  peak or more.
+- **Region Shapley values**, estimated by sampling. The image is split into a
+  4 x 4 grid; a region left out is set to the ImageNet mean colour. The value
+  of a region is its average marginal effect on the ensemble's malignant
+  probability over random orderings of the regions, drawn in antithetic
+  pairs with a fixed seed. The values always sum to `full_score -
+  baseline_score`. This is not the `shap` library, and 32 evaluations of 16
+  regions is a coarse estimate, not an exact Shapley value.
+
+Each explained request costs up to `explanation_max_evaluations` (default 32)
+masked-image passes through every member model, within
+`explanation_time_budget_ms` (default 5000). When time runs short, fewer
+permutations run and `permutations` says how many. Set
+`enable_request_explanations = false` to turn the option off. A model package
+trained before this feature reports `"status": "unavailable"`; retrain to get
+the signatures.
+
 The web UI is at `terraform -chdir=stack-inference output -raw
 frontend_cloudfront_url`. It carries the same API key, so the key identifies
 and meters callers; it does not authenticate them (see [SECURITY.md](SECURITY.md)).
@@ -478,6 +553,12 @@ exist. The drift and fairness jobs need data capture, so they are skipped when
   and drift-triggered retrains.
 - **Model Card** recording intended use, a High risk rating and clinical
   caveats (`enable_model_card`).
+- **Per-request explanations** (opt-in per call): `"explain": true` returns a
+  Grad-CAM heatmap and region Shapley values with the prediction, computed on
+  the endpoint for the served ensemble (see
+  [Explanations in the response](#explanations-in-the-response)). They show
+  which image regions drove the score. They are decision support for a
+  reviewer and are not validated against pathologist annotations.
 - **Hybrid inference** (optional): low-confidence predictions get a Bedrock
   explanation constrained by a guardrail (content filters, name
   anonymization).

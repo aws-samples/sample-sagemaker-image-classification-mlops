@@ -28,6 +28,18 @@ make deploy-inference
 
 `make deploy-inference` and the CI/CD Inference-Deploy stage both deploy the newest Approved package in the group and stop with an error when there is none. Set `TF_VAR_model_package_arn` to pin a version.
 
+## Explanations
+
+A `POST /predict` body with `"explain": true` also returns a Grad-CAM heatmap
+and region Shapley values for the prediction (contract and method in the root
+README, [Explanations in the response](../README.md#explanations-in-the-response)).
+The Lambda forwards the flag to the endpoint with the caps from
+`explanation_max_evaluations` and `explanation_time_budget_ms`; callers cannot
+raise them. The endpoint computes both in TensorFlow Serving from signatures
+exported with each member model, so the explain path needs no extra packages
+in the serving image. `enable_request_explanations = false` turns the option
+off. Requests without the field are unchanged.
+
 ## Access control
 
 The API requires the `x-api-key` header (`api_require_api_key`). The key is injected into the web UI, so it meters and limits callers but does not authenticate them. For authentication set `api_authorization_type` to `AWS_IAM` or `COGNITO_USER_POOLS`. WAF (`api_enable_waf`) applies the AWS managed common and known-bad-inputs rule sets and a per-IP rate limit (`api_waf_rate_limit`). See [SECURITY.md](../SECURITY.md).
@@ -136,15 +148,17 @@ terraform -chdir=stack-inference output -raw frontend_cloudfront_url
 | drift\_job\_instance\_type | Instance type for the scheduled drift Processing job. The job is IO-bound over a few thousand small JSON records, so the smallest general-purpose type is sufficient. | `string` | `"ml.t3.medium"` | no |
 | drift\_job\_max\_runtime | MaxRuntimeInSeconds for the drift Processing job. Caps cost if a capture prefix grows unexpectedly large. | `number` | `900` | no |
 | drift\_threshold | Population Stability Index on the prediction-score distribution above which the drift alarm fires and retraining is triggered. | `number` | `0.2` | no |
-| enable\_async\_explainability | When true, the inference response includes a pointer to where the asynchronous Grad-CAM/SHAP explainability artifact is written (Part 4). The artifact itself is produced by an async job; the API Lambda cannot run Grad-CAM inline (no TF runtime / conv-layer access in the served ensemble). | `bool` | `false` | no |
 | enable\_bedrock\_hybrid\_inference | When true, the inference Lambda routes low-confidence predictions to an Amazon Bedrock foundation model for additional reasoning and a natural-language explanation (Part 3 hybrid inference). Adds bedrock:InvokeModel to the Lambda role. | `bool` | `false` | no |
 | enable\_drift\_job | Enable the scheduled drift Processing job (Part 3). EventBridge Scheduler starts a SageMaker Processing job that reads endpoint data-capture output from S3, computes a Population Stability Index against the training baseline, and publishes it to CloudWatch, where the drift alarm and the EventBridge retrain rule consume it. Requires data capture, so it is skipped for serverless endpoints. | `bool` | `true` | no |
 | enable\_fairness\_job | Enable the scheduled fairness Processing job (Part 4). EventBridge Scheduler starts a SageMaker Processing job that joins endpoint data capture with the confirmed diagnostic outcomes clinicians upload, computes demographic parity and equalized odds per subgroup with Fairlearn, and publishes the largest disparity to CloudWatch beside the drift metric. The alarm feeds the same retrain rule. Requires data capture, so it is skipped for serverless endpoints. | `bool` | `true` | no |
 | enable\_human\_review | Opt in to Amazon A2I human review: create the review flow and let the inference Lambda route low-confidence predictions to a reviewer queue. Amazon A2I is in maintenance mode (no longer open to new customers), so this is off by default and only works in accounts that already use A2I. Requires review\_workteam\_arn for the flow definition. | `bool` | `false` | no |
+| enable\_request\_explanations | Allow POST /predict callers to ask for explanations (Part 4) with "explain": true (Grad-CAM heatmap and region Shapley values, computed on the endpoint). Requests without the field are unaffected either way. When false, a request that asks gets "explanations": {"status": "disabled"}. | `bool` | `true` | no |
 | endpoint\_initial\_instance\_count | Initial number of instances for SageMaker endpoint | `number` | `1` | no |
 | endpoint\_instance\_type | Instance type for SageMaker endpoint | `string` | `"ml.m5.xlarge"` | no |
 | endpoint\_max\_capacity | Maximum number of instances for auto-scaling | `number` | `3` | no |
 | endpoint\_min\_capacity | Minimum number of instances for auto-scaling | `number` | `1` | no |
+| explanation\_max\_evaluations | Cap on masked-image ensemble evaluations for the region Shapley estimate in one explained request. 17 is one permutation of the 4x4 regions, 32 an antithetic pair, 64 two pairs. | `number` | `32` | no |
+| explanation\_time\_budget\_ms | Time budget for the explain path on the endpoint, in milliseconds. Region Shapley skips permutations that would overrun it (the first always runs). Keep it well under API Gateway's 29 s integration timeout. | `number` | `5000` | no |
 | fairness\_alarm\_period | Evaluation period (seconds) for the fairness alarm. Should be >= the fairness schedule interval (daily = 86400) so each scheduled run produces one data point. | `number` | `86400` | no |
 | fairness\_disparity\_threshold | Disparity above which the fairness alarm fires and retraining is triggered. Bounds the larger of demographic-parity difference and equalized-odds difference on live traffic. Mirrors var.fairness\_gate.max\_disparity in stack-training so the deployed model is held to the same bar it was registered under. | `number` | `0.1` | no |
 | fairness\_ground\_truth\_prefix | Prefix in the monitoring bucket where confirmed diagnostic outcomes are uploaded as JSON Lines: {"request\_id": ..., "label": 0\|1, "group": "<subgroup>"}. Predictions with no matching label are skipped, never guessed. | `string` | `"ground-truth"` | no |

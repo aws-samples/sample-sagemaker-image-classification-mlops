@@ -164,3 +164,116 @@ def test_cors_header_uses_allowed_origin(aws, monkeypatch):
     monkeypatch.setenv("ALLOWED_ORIGIN", "https://app.example.com")
     resp = handler.lambda_handler({"httpMethod": "POST", "body": "{}"}, _context())
     assert resp["headers"]["Access-Control-Allow-Origin"] == "https://app.example.com"
+
+
+# --- Explanations -----------------------------------------------------------
+
+EXPLANATIONS = {
+    "gradcam": {"method": "grad-cam", "grid_size": 14, "grid": [[0.0] * 14] * 14},
+    "region_shapley": {
+        "method": "region Shapley values estimated by antithetic permutation sampling"
+    },
+    "explain_ms": 3100,
+}
+BASE_KEYS = {
+    "request_id",
+    "prediction",
+    "confidence",
+    "probabilities",
+    "threshold_used",
+    "model_info",
+    "routing",
+}
+
+
+@pytest.fixture
+def runtime(aws, monkeypatch):
+    """Record what the Lambda sends to the endpoint and answer with a fixed body."""
+    sent = []
+    answer = {"predictions": [[0.8]], "predicted_class": [[1]], "threshold_used": 0.5}
+
+    def invoke_endpoint(**kwargs):
+        sent.append(json.loads(kwargs["Body"]))
+        return {"Body": _body(answer), "ContentType": "application/json"}
+
+    fake = SimpleNamespace(invoke_endpoint=invoke_endpoint)
+    clients = {"s3": aws.s3, "cloudwatch": aws.cloudwatch, "sagemaker-runtime": fake}
+    monkeypatch.setattr(handler.boto3, "client", lambda name, **_: clients[name])
+    monkeypatch.setenv("EXPLANATIONS_ENABLED", "true")
+    monkeypatch.setenv("EXPLAIN_MAX_EVALS", "32")
+    monkeypatch.setenv("EXPLAIN_TIME_BUDGET_MS", "5000")
+    return SimpleNamespace(sent=sent, answer=answer)
+
+
+def _post_json(obj):
+    return {"httpMethod": "POST", "resource": "/predict", "body": json.dumps(obj)}
+
+
+def test_predict_without_explain_is_unchanged(runtime):
+    resp = handler.lambda_handler(_post_json({"image": _jpeg_b64()}), _context())
+    assert resp["statusCode"] == 200
+    assert set(runtime.sent[0]) == {"instances"}
+    assert set(json.loads(resp["body"])) == BASE_KEYS
+
+
+def test_explain_false_is_the_same_as_absent(runtime):
+    resp = handler.lambda_handler(_post_json({"image": _jpeg_b64(), "explain": False}), _context())
+    assert set(runtime.sent[0]) == {"instances"}
+    assert set(json.loads(resp["body"])) == BASE_KEYS
+
+
+def test_explain_true_forwards_caps_and_returns_explanations(runtime):
+    runtime.answer["explanations"] = EXPLANATIONS
+    resp = handler.lambda_handler(_post_json({"image": _jpeg_b64(), "explain": True}), _context())
+    assert resp["statusCode"] == 200
+    assert runtime.sent[0]["explain"] == {
+        "methods": ["gradcam", "region_shapley"],
+        "max_evals": 32,
+        "time_budget_ms": 5000,
+    }
+    body = json.loads(resp["body"])
+    assert body["explanations"] == EXPLANATIONS
+    assert set(body) == BASE_KEYS | {"explanations"}
+
+
+def test_explain_method_subset_is_forwarded(runtime):
+    runtime.answer["explanations"] = {"gradcam": EXPLANATIONS["gradcam"], "explain_ms": 300}
+    handler.lambda_handler(
+        _post_json({"image": _jpeg_b64(), "explain": {"methods": ["gradcam"]}}), _context()
+    )
+    assert runtime.sent[0]["explain"]["methods"] == ["gradcam"]
+
+
+@pytest.mark.parametrize(
+    "explain",
+    ["yes", 1, {"methods": []}, {"methods": ["lime"]}, {"max_evals": 1000}, [True]],
+)
+def test_invalid_explain_is_400_without_calling_the_endpoint(runtime, explain):
+    resp = handler.lambda_handler(
+        _post_json({"image": _jpeg_b64(), "explain": explain}), _context()
+    )
+    assert resp["statusCode"] == 400
+    assert runtime.sent == []
+
+
+def test_explain_when_disabled_says_so(runtime, monkeypatch):
+    monkeypatch.setenv("EXPLANATIONS_ENABLED", "false")
+    resp = handler.lambda_handler(_post_json({"image": _jpeg_b64(), "explain": True}), _context())
+    assert set(runtime.sent[0]) == {"instances"}
+    assert json.loads(resp["body"])["explanations"] == {"status": "disabled"}
+
+
+def test_explain_against_an_old_package_is_unavailable(runtime):
+    resp = handler.lambda_handler(_post_json({"image": _jpeg_b64(), "explain": True}), _context())
+    assert json.loads(resp["body"])["explanations"]["status"] == "unavailable"
+
+
+def test_explanations_are_stored_with_the_prediction(runtime, aws):
+    runtime.answer["explanations"] = EXPLANATIONS
+    handler.lambda_handler(_post_json({"image": _jpeg_b64(), "explain": True}), _context())
+    stored = json.loads(
+        aws.s3.get_object(Bucket=BUCKET, Key=f"predictions/{REQUEST_ID}/prediction.json")[
+            "Body"
+        ].read()
+    )
+    assert stored["explanations"] == EXPLANATIONS

@@ -18,6 +18,22 @@ KMS-encrypted ECR repo, and (optionally) generates a CycloneDX SBOM.
 5. Outputs the newest image pinned by digest (`image_uri`). Consumers deploy
    that digest; re-apply after a rebuild so the next deployment uses it.
 
+## What Runs In The Image
+
+The image is the SageMaker TensorFlow Serving DLC. It serves every
+`<name>_model/1` SavedModel in the ensemble `model.tar.gz` and runs the
+package's `code/inference.py` (`handler()`) in front of them; `SAGEMAKER_PROGRAM`
+is not used by this container. The handler combines the member scores and, for
+requests with `"explain": true`, calls the `gradcam` and `region_scores`
+signatures that `scripts/ensemble/explain_export.py` adds to each SavedModel.
+Gradients are part of those exported graphs, so TensorFlow Serving computes
+them and the image needs no TensorFlow Python, `shap` or other extra package.
+The patch step leaves the TensorFlow stack untouched, which keeps that true.
+
+The registered package sets `SAGEMAKER_GUNICORN_TIMEOUT_SECONDS=60` (the
+container default is 30) and `SAGEMAKER_GUNICORN_WORKERS=2`, so one explained
+request does not hold up plain predictions on the same instance.
+
 <!-- BEGIN_TF_DOCS -->
 ## Requirements
 

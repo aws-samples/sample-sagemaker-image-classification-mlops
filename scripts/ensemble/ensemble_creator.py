@@ -61,8 +61,13 @@ def safe_path_join(base_path, *paths):
 
 
 def load_and_export_models(models_path, output_path, model_names):
-    """Load each trained .h5 and export it as a SavedModel for TF Serving."""
+    """Load each trained .h5 and export it as a SavedModel for TF Serving.
+
+    Each SavedModel carries the serving signature plus the gradcam and
+    region_scores signatures the endpoint's explain path calls.
+    """
     import tensorflow as tf
+    from explain_export import export_with_explanations
 
     loaded = {}
     for model_name in model_names:
@@ -74,8 +79,7 @@ def load_and_export_models(models_path, output_path, model_names):
             model = tf.keras.models.load_model(model_file)
             saved_dir = safe_path_join(output_path, f"{model_name}_model", "1")
             os.makedirs(saved_dir, exist_ok=True)
-            # Keras 3 removed save_format='tf'; export() writes the SavedModel.
-            model.export(saved_dir)
+            export_with_explanations(model, saved_dir)
             loaded[model_name] = model
             logger.info("Loaded and exported %s", sanitize_for_log(model_name))
         except Exception as e:
@@ -126,24 +130,26 @@ def create_ensemble_package(output_path, weights, threshold):
     with open(safe_path_join(output_path, "ensemble_config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
+    # The TensorFlow Serving container runs code/inference.py in front of the
+    # SavedModels. No code/requirements.txt: the container would pip install
+    # it at startup, and the handler needs only the standard library.
     inference_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inference.py")
-    inference_dst = safe_path_join(output_path, "inference.py")
-    shutil.copy2(inference_src, inference_dst)
-
-    # Must match scripts/ensemble/requirements.txt: TF 2.19 wheels need numpy<2.2.
-    with open(safe_path_join(output_path, "requirements.txt"), "w") as f:
-        f.write("tensorflow==2.19.0\nnumpy==2.1.3\n")
+    code_dir = safe_path_join(output_path, "code")
+    os.makedirs(code_dir, exist_ok=True)
+    shutil.copy2(inference_src, safe_path_join(code_dir, "inference.py"))
 
     model_tar_path = safe_path_join(output_path, "model.tar.gz")
     with tarfile.open(model_tar_path, "w:gz") as tar:
-        for name in ("ensemble_config.json", "inference.py", "requirements.txt"):
-            tar.add(safe_path_join(output_path, name), arcname=name)
+        tar.add(safe_path_join(output_path, "ensemble_config.json"), arcname="ensemble_config.json")
+        tar.add(safe_path_join(code_dir, "inference.py"), arcname="code/inference.py")
         for model_name in weights:
             model_dir = safe_path_join(output_path, f"{model_name}_model")
             for root, _, files in os.walk(model_dir):
                 for file in files:
                     file_path = os.path.join(root, file)
-                    tar.add(file_path, arcname=os.path.relpath(file_path, output_path))
+                    # safe_path_join resolves symlinks, so the base must be resolved too.
+                    arcname = os.path.relpath(file_path, Path(output_path).resolve())
+                    tar.add(file_path, arcname=arcname)
     logger.info("Created %s (%d bytes)", model_tar_path, os.path.getsize(model_tar_path))
 
 

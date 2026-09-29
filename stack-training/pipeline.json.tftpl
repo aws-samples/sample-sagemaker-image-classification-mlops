@@ -807,9 +807,15 @@ ${jsonencode({
                         ]
                       }
                     }
+                    # The TensorFlow Serving container runs code/inference.py
+                    # from the package. Its gunicorn worker timeout defaults
+                    # to 30 s; raise it to the 60 s invocation timeout so an
+                    # explain request is bounded by the handler's own budget.
+                    # A second worker keeps plain predictions flowing while
+                    # one explain request runs.
                     Environment = {
-                      SAGEMAKER_PROGRAM          = "inference.py"
-                      SAGEMAKER_SUBMIT_DIRECTORY = "/opt/ml/code"
+                      SAGEMAKER_GUNICORN_TIMEOUT_SECONDS = "60"
+                      SAGEMAKER_GUNICORN_WORKERS         = "2"
                     }
                   }
                 ]

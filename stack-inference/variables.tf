@@ -435,8 +435,30 @@ variable "review_workteam_arn" {
   default     = ""
 }
 
-variable "enable_async_explainability" {
-  description = "When true, the inference response includes a pointer to where an asynchronous Grad-CAM explainability artifact would be written. No job in this sample writes it: turn this on only after you add your own job that does. The API Lambda cannot run Grad-CAM inline (no TF runtime or conv-layer access in the served ensemble)."
+variable "enable_request_explanations" {
+  description = "Allow POST /predict callers to ask for explanations (Part 4) with \"explain\": true (Grad-CAM heatmap and region Shapley values, computed on the endpoint). Requests without the field are unaffected either way. When false, a request that asks gets \"explanations\": {\"status\": \"disabled\"}."
   type        = bool
-  default     = false
+  default     = true
+}
+
+variable "explanation_max_evaluations" {
+  description = "Cap on masked-image ensemble evaluations for the region Shapley estimate in one explained request. 17 is one permutation of the 4x4 regions, 32 an antithetic pair, 64 two pairs."
+  type        = number
+  default     = 32
+
+  validation {
+    condition     = var.explanation_max_evaluations >= 17 && var.explanation_max_evaluations <= 64
+    error_message = "explanation_max_evaluations must be between 17 and 64."
+  }
+}
+
+variable "explanation_time_budget_ms" {
+  description = "Time budget for the explain path on the endpoint, in milliseconds. Region Shapley skips permutations that would overrun it (the first always runs). Keep it well under API Gateway's 29 s integration timeout."
+  type        = number
+  default     = 5000
+
+  validation {
+    condition     = var.explanation_time_budget_ms >= 1000 && var.explanation_time_budget_ms <= 25000
+    error_message = "explanation_time_budget_ms must be between 1000 and 25000."
+  }
 }

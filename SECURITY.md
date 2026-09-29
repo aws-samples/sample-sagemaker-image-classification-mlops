@@ -167,7 +167,7 @@ Run the same checks locally with `make fmt validate lint test`.
 | 5 | Endpoint and Lambda functions outside a VPC; hosted model without network isolation | Traffic to AWS services uses public service endpoints | Add private subnets and VPC endpoints for SageMaker, S3 and Bedrock, and enable network isolation on the model |
 | 6 | Stored images and predictions have no expiry | Uploaded images accumulate in the inference results bucket | Add a lifecycle rule that matches your retention policy |
 | 7 | Fairness uses a proxy subgroup | Magnification says nothing about patient demographics | Supply a real sensitive attribute and a confirmed-outcome feed |
-| 8 | Explainability is a placeholder | The evaluation step writes a uniform, channel-level placeholder report, and the optional `explainability` field in API responses points at a location no job in this sample writes to | Add a real attribution job (for example Grad-CAM) before relying on explanations |
+| 8 | Explanations are unvalidated and cost endpoint compute | `"explain": true` returns Grad-CAM and sampled region Shapley values that nobody has checked against pathologist annotations, and each explained request runs up to `explanation_max_evaluations` extra forward passes per member model | Validate the maps with clinicians before showing them in a clinical workflow; keep the caps, or set `enable_request_explanations = false` on a public API |
 | 9 | No cross-Region replication, Lambda code signing or custom CloudFront certificate | Reduced DR and deployment integrity controls | Add them for production |
 
 ## What you must still do

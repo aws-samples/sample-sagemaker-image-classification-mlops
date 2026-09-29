@@ -27,7 +27,8 @@ scripts/
 |   `-- report_generator.py
 |-- ensemble/               # Weighted ensemble, threshold on validation, gate on test
 |   |-- ensemble_creator.py
-|   `-- inference.py
+|   |-- explain_export.py   # SavedModel export with gradcam and region_scores signatures
+|   `-- inference.py        # Serving handler, packaged as code/inference.py
 |-- validation/             # Data integrity and format checks
 |   `-- data_validator.py
 |-- bias/                   # In-pipeline fairness gate on the ensemble (Fairlearn)

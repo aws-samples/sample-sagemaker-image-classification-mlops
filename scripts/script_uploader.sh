@@ -53,6 +53,7 @@ put_common evaluation
 
 # inference.py is packaged into the ensemble model.tar.gz by ensemble_creator.
 put ensemble/ensemble_creator.py ensemble/ensemble_creator.py
+put ensemble/explain_export.py ensemble/explain_export.py
 put ensemble/requirements.txt ensemble/requirements.txt
 put ensemble/inference.py ensemble/inference.py
 put_common ensemble

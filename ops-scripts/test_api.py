@@ -24,6 +24,7 @@ Usage:
   API_KEY="$(terraform -chdir=stack-inference output -raw api_key_value)" python ops-scripts/test_api.py
   python ops-scripts/test_api.py --api-url https://<...>/prod --image-path data/test/breast_benign_0338.jpg
   python ops-scripts/test_api.py --count 5                    # test 5 random images from each class
+  python ops-scripts/test_api.py --image-path <file> --explain  # also print the explanation summary
 """
 
 from __future__ import annotations
@@ -69,12 +70,15 @@ def encode_image(image_path: Path) -> str:
     return base64.b64encode(image_path.read_bytes()).decode()
 
 
-def call_api(api_url: str, image_b64: str, api_key: str | None, timeout: int = 30) -> dict:
+def call_api(
+    api_url: str, image_b64: str, api_key: str | None, timeout: int = 30, explain: bool = False
+) -> dict:
     """POST the image to /predict. Raises on non-2xx."""
     headers = {"x-api-key": api_key} if api_key else {}
+    payload = {"image": image_b64, "explain": True} if explain else {"image": image_b64}
     response = requests.post(
         f"{api_url.rstrip('/')}/predict",
-        json={"image": image_b64},
+        json=payload,
         headers=headers,
         timeout=timeout,
     )
@@ -105,8 +109,32 @@ def gather_test_images(data_path: Path, count: int) -> list[tuple[Path, str]]:
     return pairs
 
 
+def print_explanations(explanations: dict) -> None:
+    """One line per method: where Grad-CAM points and the strongest region value."""
+    if "status" in explanations:
+        print(f"   Explanations: {explanations['status']}")
+        return
+    gradcam = explanations.get("gradcam", {})
+    if gradcam.get("top_region"):
+        print(f"   Grad-CAM ({gradcam['target']}): top region box {gradcam['top_region']['box']}")
+    shapley = explanations.get("region_shapley", {})
+    if "values" in shapley:
+        flat = [(v, r, c) for r, row in enumerate(shapley["values"]) for c, v in enumerate(row)]
+        value, row, col = max(flat, key=lambda t: abs(t[0]))
+        print(
+            f"   Region Shapley: strongest region row {row} col {col} = {value:+.4f}, "
+            f"sum {shapley['sum']:+.4f} over {shapley['permutations']} permutation(s)"
+        )
+    print(f"   explain_ms={explanations.get('explain_ms')}")
+
+
 def test_api(
-    api_url: str, api_key: str | None, image_path: Path | None, count: int, data_path: Path
+    api_url: str,
+    api_key: str | None,
+    image_path: Path | None,
+    count: int,
+    data_path: Path,
+    explain: bool = False,
 ) -> bool:
     """Run one or more API calls and report accuracy against ground truth."""
     if image_path:
@@ -130,7 +158,7 @@ def test_api(
     for img_path, true_label in pairs:
         print(f"{img_path.name} (true: {true_label})")
         try:
-            result = call_api(api_url, encode_image(img_path), api_key)
+            result = call_api(api_url, encode_image(img_path), api_key, explain=explain)
         except Exception as exc:
             print(f"   API call failed: {exc}")
             errors += 1
@@ -148,6 +176,8 @@ def test_api(
             f"  threshold={threshold:.3f}" if isinstance(threshold, (int, float)) else ""
         )
         print(f"   Predicted: {prediction}  confidence={confidence:.3f}{threshold_text}")
+        if explain:
+            print_explanations(result.get("explanations") or {"status": "missing"})
         results[true_label]["total"] += 1
         total += 1
         if prediction == true_label:
@@ -201,6 +231,11 @@ def main() -> int:
         default=Path(__file__).resolve().parent.parent / "data",
         help="Local dataset root (expects breast_benign/ and breast_malignant/ subdirs)",
     )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help='Send "explain": true and print a summary of the Grad-CAM and region Shapley output',
+    )
     args = parser.parse_args()
 
     api_url = args.api_url or terraform_output("api_gateway_url")
@@ -214,7 +249,9 @@ def main() -> int:
             "No API key found; the request is sent without x-api-key and fails if the key is required."
         )
 
-    success = test_api(api_url, api_key, args.image_path, args.count, args.data_path)
+    success = test_api(
+        api_url, api_key, args.image_path, args.count, args.data_path, explain=args.explain
+    )
     return 0 if success else 1
 
 

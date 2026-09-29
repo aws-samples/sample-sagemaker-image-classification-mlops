@@ -37,6 +37,9 @@ IMAGE_FORMATS = {
     "BMP": ("image/bmp", "bmp", None),
 }
 
+# Explanation methods the endpoint handler implements (scripts/ensemble/inference.py).
+EXPLAIN_METHODS = ("gradcam", "region_shapley")
+
 # Lambda request ids (and so result ids) are lowercase UUIDs.
 _RESULT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -248,6 +251,42 @@ def _parse_body(event):
     return body or {}
 
 
+def explain_request(value):
+    """The endpoint's ``explain`` object for a request's ``explain`` field.
+
+    Returns None when no explanation was asked for. ``true`` asks for every
+    method; ``{"methods": [...]}`` for a subset. The evaluation cap and time
+    budget come from the Lambda environment, never from the caller, because
+    they set the endpoint compute each request may use. Raises ValueError for
+    anything else.
+    """
+    if value is None or value is False:
+        return None
+    if value is True:
+        methods = list(EXPLAIN_METHODS)
+    elif isinstance(value, dict) and set(value) <= {"methods"}:
+        methods = value.get("methods", list(EXPLAIN_METHODS))
+        if (
+            not isinstance(methods, list)
+            or not methods
+            or any(m not in EXPLAIN_METHODS for m in methods)
+        ):
+            raise ValueError(
+                f"explain.methods must be a non-empty subset of {list(EXPLAIN_METHODS)}"
+            )
+    else:
+        raise ValueError('explain must be true, false or {"methods": [...]}')
+    return {
+        "methods": methods,
+        "max_evals": int(os.environ.get("EXPLAIN_MAX_EVALS", "32")),
+        "time_budget_ms": int(os.environ.get("EXPLAIN_TIME_BUDGET_MS", "5000")),
+    }
+
+
+def _explanations_enabled():
+    return os.environ.get("EXPLANATIONS_ENABLED", "false").lower() == "true"
+
+
 def _handle_predict(event, request_id):
     endpoint_name = os.environ.get("ENDPOINT_NAME")
     if not endpoint_name:
@@ -275,17 +314,26 @@ def _handle_predict(event, request_id):
         )
 
     try:
+        explain = explain_request(body.get("explain"))
+    except ValueError as exc:
+        return _response(400, {"error": "Invalid explain option", "detail": str(exc)})
+
+    try:
         image_bytes, img, image_format = decode_image(image_data)
         model_input = preprocess(img)
     except ValueError as exc:
         return _response(400, {"error": "Invalid image", "detail": str(exc)})
+
+    endpoint_request = {"instances": [model_input.tolist()]}
+    if explain and _explanations_enabled():
+        endpoint_request["explain"] = explain
 
     try:
         response = boto3.client("sagemaker-runtime").invoke_endpoint(
             EndpointName=endpoint_name,
             ContentType="application/json",
             Accept="application/json",
-            Body=json.dumps({"instances": [model_input.tolist()]}),
+            Body=json.dumps(endpoint_request),
             # Recorded in data capture as eventMetadata.inferenceId, which the
             # fairness job joins with clinician-confirmed outcomes.
             InferenceId=request_id,
@@ -347,15 +395,16 @@ def _handle_predict(event, request_id):
         "model_info": "Image analysis using ensemble model",
     }
 
-    # Grad-CAM/SHAP for the served ensemble runs as an asynchronous job, so the
-    # response only points at where that artifact is written.
-    explain_bucket = os.environ.get("EXPLAIN_BUCKET", "")
-    if explain_bucket:
-        formatted_result["explainability"] = {
-            "heatmap_s3_uri": f"s3://{explain_bucket}/explainability/{request_id}/gradcam.png",
-            "status": "async-pending",
-            "method": "grad-cam+shap",
-        }
+    if explain:
+        if not _explanations_enabled():
+            formatted_result["explanations"] = {"status": "disabled"}
+        elif isinstance(result, dict) and isinstance(result.get("explanations"), dict):
+            formatted_result["explanations"] = result["explanations"]
+        else:
+            formatted_result["explanations"] = {
+                "status": "unavailable",
+                "reason": "the deployed model package does not return explanations",
+            }
 
     hybrid_enabled = os.environ.get("ENABLE_BEDROCK_HYBRID", "false").lower() == "true"
     if hybrid_enabled and is_low_confidence:
