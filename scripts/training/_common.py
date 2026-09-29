@@ -51,13 +51,13 @@ def resolve_weights_path(model_name: str) -> str | None:
     """Return the pre-downloaded ImageNet weights path injected by
     `SM_CHANNEL_WEIGHTS`, or None if network isolation is off.
 
-    The training roots sync weights into /opt/ml/input/data/weights/<name>_weights.h5
+    The training roots sync weights into /opt/ml/input/data/weights/<name>.weights.h5
     via the `weights` input channel (see `download_pretrained_weights.py`).
     """
     channel = os.environ.get("SM_CHANNEL_WEIGHTS")
     if not channel:
         return None
-    candidate = os.path.join(channel, f"{model_name}_weights.h5")
+    candidate = os.path.join(channel, f"{model_name}.weights.h5")
     return candidate if os.path.exists(candidate) else None
 
 

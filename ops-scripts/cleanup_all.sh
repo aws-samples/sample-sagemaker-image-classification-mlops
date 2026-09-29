@@ -207,7 +207,10 @@ delete_model_packages() {
 
 delete_job_log_groups() {
     local prefix group
-    for prefix in "/aws/sagemaker/TrainingJobs/${PROJECT_NAME}" "/aws/sagemaker/ProcessingJobs/${PROJECT_NAME}"; do
+    # The endpoint and the image-build project create their own log groups,
+    # which never expire and are not in Terraform state.
+    for prefix in "/aws/sagemaker/TrainingJobs/${PROJECT_NAME}" "/aws/sagemaker/ProcessingJobs/${PROJECT_NAME}" \
+        "/aws/sagemaker/Endpoints/${PROJECT_NAME}" "/aws/codebuild/${PROJECT_NAME}"; do
         aws logs describe-log-groups --log-group-name-prefix "$prefix" \
             --query 'logGroups[].logGroupName' --output text | tr '\t' '\n' | \
         while IFS= read -r group; do
@@ -243,7 +246,9 @@ destroy_stack() {
 # ---------------------------------------------------------------------------
 
 delete_endpoint_resources
-delete_model_packages
+# stack-inference reads the approved model package when it plans a destroy,
+# so with --destroy the packages go only after that stack is gone.
+[ "$RUN_DESTROY" = true ] || delete_model_packages
 delete_job_log_groups
 for bucket in ${BUCKETS[@]+"${BUCKETS[@]}"}; do
     empty_bucket "$bucket"
@@ -267,6 +272,7 @@ if [ "$RUN_DESTROY" = true ]; then
     # Reverse dependency order: stack-inference reads stack-training state.
     destroy_stack stack-cicd
     destroy_stack stack-inference
+    delete_model_packages
     destroy_stack stack-training
     echo ""
     echo "Done. The state bucket was left untouched. When nothing else uses it,"

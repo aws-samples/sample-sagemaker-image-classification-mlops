@@ -555,6 +555,7 @@ Custom CloudWatch metrics cannot be deleted and expire on their own.
 | `BucketNotEmpty` on destroy | Buckets have `force_destroy = false`. Use `make destroy`, or run `./ops-scripts/cleanup_all.sh` and retry the destroy. |
 | No fairness metric in CloudWatch | Expected until confirmed outcomes are uploaded to `ground-truth/` in the monitoring bucket and at least 50 predictions match them. The job's CloudWatch log says why it published nothing. |
 | No drift metric in CloudWatch | Fewer than 30 captured predictions in the window, or no baseline at `monitoring/baselines/output-only/statistics.json` yet: the auto-deploy Lambda writes it when it rolls out a trained package (see [Monitoring and retraining](#monitoring-and-retraining)). |
+| `make deploy-training` fails with `ResourceAlreadyExistsException` for `/aws/sagemaker/ProcessingJobs` or `/aws/sagemaker/TrainingJobs` | SageMaker or an earlier deployment already created these account-wide log groups. Import them and apply again: `terraform -chdir=stack-training import 'module.cloudwatch_monitoring.aws_cloudwatch_log_group.processing_jobs[0]' /aws/sagemaker/ProcessingJobs` (and the same for `training_jobs[0]` with `/aws/sagemaker/TrainingJobs`), with the same `TF_VAR_*` values `make deploy-training` sets. The stack then owns them, so a destroy deletes them. |
 | `make seed-baseline` fails on `import tensorflow` | Install `boto3` and `tensorflow==2.19.0` into the Python that `python3` resolves to. |
 | API returns 403 | Missing or wrong `x-api-key`, or the WAF rate rule blocked your IP. |
 

@@ -10,18 +10,26 @@ split. Tuning on test and then gating on it reports an optimistic number.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Sequence
 
 import numpy as np
 
 # Clinical minimums the ensemble must clear on the test split. Recall has the
 # highest bar because a missed malignant case is the costly error. The pipeline
-# Condition step reads the same values from Terraform (clinical_quality_gate).
-CLINICAL_QUALITY_THRESHOLDS = {
+# passes Terraform's clinical_quality_gate in CLINICAL_QUALITY_GATE, so the
+# threshold search and the Condition step use the same values; these defaults
+# apply only when the variable is absent (local runs and tests).
+_DEFAULT_THRESHOLDS = {
     "accuracy": 0.85,
     "recall": 0.95,
     "auc_roc": 0.90,
     "precision": 0.80,
+}
+CLINICAL_QUALITY_THRESHOLDS = {
+    **_DEFAULT_THRESHOLDS,
+    **{k: float(v) for k, v in json.loads(os.environ.get("CLINICAL_QUALITY_GATE") or "{}").items()},
 }
 
 THRESHOLD_GRID = np.round(np.linspace(0.05, 0.95, 91), 2)

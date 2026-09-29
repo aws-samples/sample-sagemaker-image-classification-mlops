@@ -304,12 +304,12 @@ def _handle_predict(event, request_id):
             )
         if code == "ModelError":
             _emit_error_metric("model_error")
+            # The container rejected or failed this request; a retry will not help.
             return _response(
-                503,
+                502,
                 {
-                    "message": "Model is still initializing. Please try again later.",
+                    "message": "The model could not process this image.",
                     "status": "model_error",
-                    "retry_after": 300,
                     "request_id": request_id,
                 },
             )

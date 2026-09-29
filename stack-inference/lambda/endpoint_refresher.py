@@ -80,7 +80,11 @@ def handler(event, context, sm=None):
     sm.create_endpoint_config(**clone_config_request(source, new_config))
     logger.info("Created endpoint config %s (cloned from %s)", new_config, current_config)
 
-    sm.update_endpoint(EndpointName=endpoint_name, EndpointConfigName=new_config)
+    sm.update_endpoint(
+        EndpointName=endpoint_name,
+        EndpointConfigName=new_config,
+        RetainDeploymentConfig=True,
+    )
     logger.info("Triggered blue/green roll of %s to %s", endpoint_name, new_config)
 
     deleted = []

@@ -282,7 +282,7 @@ variable "auto_trigger_marker_key" {
 
 
 variable "clinical_quality_gate" {
-  description = "Clinical quality gate the ensemble must clear before it can be registered. Recall is highest because a missed malignant case (false negative) is the costly error. Must mirror CLINICAL_QUALITY_THRESHOLDS in scripts/evaluation/model_evaluator.py and scripts/ensemble/ensemble_creator.py."
+  description = "Clinical quality gate the ensemble must clear before it can be registered. Recall is highest because a missed malignant case (false negative) is the costly error. The evaluation and ensemble steps receive the same values (CLINICAL_QUALITY_GATE), so the threshold search targets this recall."
   type = object({
     accuracy  = number
     recall    = number

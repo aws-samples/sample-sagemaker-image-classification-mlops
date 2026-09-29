@@ -296,14 +296,15 @@ def lambda_handler(event, _context):
         data_capture_sampling,
     )
 
-    # UpdateEndpoint uses the endpoint's declared deployment_config (blue/green
-    # + auto-rollback) - see modules/terraform-aws-sagemaker-endpoint/main.tf. We don't pass
-    # a per-call DeploymentConfig here so there's one source of truth.
+    # RetainDeploymentConfig reuses the endpoint's declared deployment_config
+    # (blue/green + auto-rollback, modules/terraform-aws-sagemaker-endpoint/main.tf).
+    # The API default is False, which would update without it.
     logger.info(f"Updating endpoint {endpoint_name} -> {config_name}")
     try:
         sm.update_endpoint(
             EndpointName=endpoint_name,
             EndpointConfigName=config_name,
+            RetainDeploymentConfig=True,
         )
     except Exception:
         # Don't leak the just-created model + config if the update fails;

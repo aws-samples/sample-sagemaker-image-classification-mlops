@@ -88,7 +88,7 @@ def test_handler_rolls_endpoint_and_deletes_only_old_refresh_configs(monkeypatch
         stub.add_response(
             "update_endpoint",
             {"EndpointArn": "arn:aws:sagemaker:us-east-1:111122223333:endpoint/x"},
-            {"EndpointName": ENDPOINT, "EndpointConfigName": new},
+            {"EndpointName": ENDPOINT, "EndpointConfigName": new, "RetainDeploymentConfig": True},
         )
         configs = [
             {"EndpointConfigName": n, "EndpointConfigArn": f"arn:x:{n}", "CreationTime": NOW}

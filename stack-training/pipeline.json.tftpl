@@ -322,10 +322,23 @@ ${jsonencode({
               enable_network_isolation ? [
                 {
                   ChannelName = "weights"
+                  InputMode   = "File"
                   DataSource = {
                     S3DataSource = {
                       S3DataType = "S3Prefix"
                       S3Uri      = "s3://${buckets.scripts}/pretrained-weights/"
+                    }
+                  }
+                },
+                # An isolated container cannot download sagemaker_submit_directory
+                # from S3, so the trainer tarball arrives as a channel instead.
+                {
+                  ChannelName = "code"
+                  InputMode   = "File"
+                  DataSource = {
+                    S3DataSource = {
+                      S3DataType = "S3Prefix"
+                      S3Uri      = "s3://${buckets.scripts}/training/${models[model_key].tar_file}"
                     }
                   }
                 }
@@ -360,7 +373,7 @@ ${jsonencode({
             EnableManagedSpotTraining = enable_managed_spot_training
             HyperParameters = merge({
               sagemaker_program          = models[model_key].script_name
-              sagemaker_submit_directory = "s3://${buckets.scripts}/training/${models[model_key].tar_file}"
+              sagemaker_submit_directory = enable_network_isolation ? "/opt/ml/input/data/code/${models[model_key].tar_file}" : "s3://${buckets.scripts}/training/${models[model_key].tar_file}"
             }, models[model_key].hyperparameters)
             EnableNetworkIsolation = enable_network_isolation
             Environment = {
@@ -469,9 +482,10 @@ ${jsonencode({
             }
             RoleArn = role_arn
             Environment = {
-              PROJECT_NAME       = project_name
-              AWS_DEFAULT_REGION = aws_region
-              MODEL_NAMES        = { Get = "Parameters.ModelNames" }
+              PROJECT_NAME          = project_name
+              AWS_DEFAULT_REGION    = aws_region
+              MODEL_NAMES           = { Get = "Parameters.ModelNames" }
+              CLINICAL_QUALITY_GATE = jsonencode(clinical_quality_gate)
             }
           },
           vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
@@ -586,9 +600,10 @@ ${jsonencode({
             }
             RoleArn = role_arn
             Environment = {
-              PROJECT_NAME       = project_name
-              AWS_DEFAULT_REGION = aws_region
-              MODEL_NAMES        = { Get = "Parameters.ModelNames" }
+              PROJECT_NAME          = project_name
+              AWS_DEFAULT_REGION    = aws_region
+              MODEL_NAMES           = { Get = "Parameters.ModelNames" }
+              CLINICAL_QUALITY_GATE = jsonencode(clinical_quality_gate)
             }
           },
           vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }

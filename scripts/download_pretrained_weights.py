@@ -37,7 +37,7 @@ def download_and_upload_weights(bucket_name):
 
     try:
         for name, model_fn in models.items():
-            s3_key = f"pretrained-weights/{name}_weights.h5"
+            s3_key = f"pretrained-weights/{name}.weights.h5"
 
             # Skip if weights already uploaded - idempotent on repeat CI/CD runs.
             try:
@@ -51,7 +51,7 @@ def download_and_upload_weights(bucket_name):
 
             print(f"Downloading {name} weights...")
             model = model_fn()
-            weights_path = os.path.join(weights_dir, f"{name}_weights.h5")
+            weights_path = os.path.join(weights_dir, f"{name}.weights.h5")
             model.save_weights(weights_path)
 
             print(f"Uploading {name} weights to S3...")
