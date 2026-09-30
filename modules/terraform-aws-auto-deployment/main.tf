@@ -159,6 +159,16 @@ resource "aws_iam_role_policy" "auto_deploy_lambda_policy" {
         Resource = "*"
       }
       ],
+      # The SageMaker deployment guardrails guide asks for
+      # cloudwatch:DescribeAlarms on the auto-rollback alarms that
+      # DeploymentConfig names.
+      length(var.rollback_alarm_arns) == 0 ? [] : [
+        {
+          Effect   = "Allow"
+          Action   = ["cloudwatch:DescribeAlarms"]
+          Resource = var.rollback_alarm_arns
+        }
+      ],
       # The endpoint configs it creates carry the project CMK (KmsKeyId);
       # SageMaker needs a grant from the caller of UpdateEndpoint to attach
       # the encrypted volume.
@@ -297,6 +307,11 @@ resource "aws_lambda_function" "auto_deploy" {
       USE_SERVERLESS_INFERENCE   = tostring(var.use_serverless_inference)
       SERVERLESS_MEMORY_SIZE_MB  = tostring(var.serverless_memory_size_mb)
       SERVERLESS_MAX_CONCURRENCY = tostring(var.serverless_max_concurrency)
+      # Production variant size; canary and linear shifting need at least 2.
+      INITIAL_INSTANCE_COUNT = tostring(var.endpoint_initial_instance_count)
+      # Blue/green policy sent with UpdateEndpoint (canary or linear traffic
+      # shifting plus the auto-rollback alarms). Empty = retain the last one.
+      DEPLOYMENT_CONFIG = var.deployment_config_json
     }
   }
 

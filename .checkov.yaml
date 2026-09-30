@@ -97,8 +97,9 @@ skip-check:
   # ---------------------------------------------------------------------------
 
   # X-Ray IS enabled: the lambda module sets a dynamic "tracing_config" block
-  # (mode=Active) gated on enable_xray_tracing, which both inference functions
-  # pass as true. Checkov does not resolve the dynamic block through the module.
+  # (mode=Active) gated on enable_xray_tracing, which the inference functions
+  # and the upload-quarantine function pass as true. Checkov does not resolve
+  # the dynamic block through the module.
   - CKV_AWS_50     # Lambda X-Ray tracing
 
   # CloudTrail IS integrated with CloudWatch Logs: cloudtrail_budgets.tf sets

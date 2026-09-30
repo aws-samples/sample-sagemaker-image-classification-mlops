@@ -6,7 +6,7 @@ EventBridge-triggered Lambda that repoints a SageMaker endpoint to a newly-appro
 
 1. EventBridge rule listens for `SageMaker Model Package State Change` events with `ModelApprovalStatus=Approved`
 2. The Lambda checks that the package belongs to the expected group, then creates a SageMaker model and endpoint configuration for it through the SageMaker API
-3. The Lambda calls `UpdateEndpoint`; SageMaker applies the endpoint's blue/green deployment and auto-rollback configuration. If the update call fails, the Lambda deletes the model and configuration it created
+3. The Lambda calls `UpdateEndpoint` with `deployment_config_json` as `DeploymentConfig`: the endpoint module's blue/green traffic shifting (canary by default) and auto-rollback alarms, so an approval rolls out under the same policy as the first deployment. With `deployment_config_json` empty it sets `RetainDeploymentConfig` instead, reusing the endpoint's last deployment config. If the update call fails, the Lambda deletes the model and configuration it created
 4. Failed asynchronous invocations go to a KMS-encrypted SQS dead-letter queue, with an alarm on queue depth
 5. A CloudWatch log group (`log_retention_days`) and an alarm that notifies SNS on Lambda errors
 
@@ -14,7 +14,7 @@ The Lambda logs only identifiers (package ARN, artefact URI, model and config na
 
 ## Serving Image
 
-If `serving_image_uri` is set (the patched image, pinned by digest), the Lambda runs the approved package's artefact and environment on that image. Pass the same value to the endpoint module so Terraform-created and auto-deployed models share one image. Data capture mirrors the endpoint module: Output only unless `data_capture_input = true`.
+If `serving_image_uri` is set (the patched image, pinned by digest), the Lambda runs the approved package's artefact and environment on that image. Pass the same value to the endpoint module so Terraform-created and auto-deployed models share one image. Data capture mirrors the endpoint module: Output only unless `data_capture_input = true`. The production variant gets `endpoint_initial_instance_count` instances; keep it equal to the endpoint module's `initial_instance_count` (canary and linear traffic shifting need at least 2).
 
 <!-- BEGIN_TF_DOCS -->
 ## Requirements
@@ -59,13 +59,16 @@ If `serving_image_uri` is set (the patched image, pinned by digest), the Lambda 
 | artifacts\_kms\_key\_arn | KMS key that encrypts the model artefacts and monitoring buckets, for the baseline copy. Null when they use SSE-S3. | `string` | `null` | no |
 | data\_capture\_input | Also capture request payloads in auto-deployed endpoint configs. Must match the endpoint module (default false: Output only). | `bool` | `false` | no |
 | data\_capture\_sampling\_percentage | Percentage of endpoint invocations captured for drift detection. Must match the endpoint module. | `number` | `100` | no |
+| deployment\_config\_json | UpdateEndpoint DeploymentConfig JSON (blue/green traffic routing and auto-rollback alarms), normally the endpoint module's deployment\_config\_json output. The Lambda sends it with every UpdateEndpoint so approvals roll out with the same canary and rollback policy as the endpoint. Empty = RetainDeploymentConfig (reuse the endpoint's last deployment config). | `string` | `""` | no |
 | drift\_baseline\_key | Object key in the monitoring bucket that the drift job reads its baseline scores from. | `string` | `"monitoring/baselines/output-only/statistics.json"` | no |
+| endpoint\_initial\_instance\_count | Instance count of the production variant in the endpoint configs the Lambda creates (real-time mode). Must match the endpoint module: canary and linear traffic shifting need at least 2. | `number` | `1` | no |
 | endpoint\_instance\_type | EC2 instance type for the endpoint production variant | `string` | `"ml.m5.xlarge"` | no |
 | env\_kms\_key\_arn | KMS CMK ARN used to encrypt Lambda environment variables. Null = AWS-managed key (still encrypted). | `string` | `null` | no |
 | log\_kms\_key\_arn | KMS key ARN used to encrypt the CloudWatch log group. Null = no customer-managed encryption (logs still encrypted at rest with AWS-managed key). | `string` | `null` | no |
 | log\_retention\_days | CloudWatch log retention in days for the auto-deployment Lambda | `number` | `14` | no |
 | model\_artifacts\_bucket | Bucket holding the ensemble artefacts. After each deploy the Lambda copies the package's predictions.json (next to model.tar.gz) from here to drift\_baseline\_key in the monitoring bucket. Empty disables the baseline refresh. | `string` | `""` | no |
 | permissions\_boundary\_arn | ARN of the permissions boundary attached to the IAM roles this module creates. null leaves them unbounded. | `string` | `null` | no |
+| rollback\_alarm\_arns | ARNs of the auto-rollback alarms named in deployment\_config\_json. The Lambda role gets cloudwatch:DescribeAlarms on them. Empty = no grant. | `list(string)` | `[]` | no |
 | serverless\_max\_concurrency | Max concurrent invocations per serverless variant when use\_serverless\_inference = true. | `number` | `10` | no |
 | serverless\_memory\_size\_mb | Memory (MB) per serverless worker when use\_serverless\_inference = true. | `number` | `3072` | no |
 | serving\_image\_uri | Inference image every auto-deployed model runs on, pinned by digest. Pass the same value as the endpoint module's serving\_image\_uri so Terraform-created and auto-deployed models share one image. Empty = use the image recorded in the model package. | `string` | `""` | no |

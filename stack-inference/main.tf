@@ -27,7 +27,13 @@ module "sagemaker_endpoint" {
   serverless_memory_size_mb  = var.serverless_memory_size_mb
   serverless_max_concurrency = var.serverless_max_concurrency
 
-  traffic_shift_wait_interval = 60
+  # Blue/green traffic shifting: CANARY by default (canary_size_percent of
+  # the new fleet first, then the rest), with auto-rollback on the error and
+  # latency alarms. The Lambdas below send the same policy on every update.
+  traffic_routing_type        = var.traffic_routing_type
+  canary_size_percent         = var.canary_size_percent
+  linear_step_percent         = var.linear_step_percent
+  traffic_shift_wait_interval = var.traffic_shift_wait_interval
   termination_wait_seconds    = var.termination_wait_seconds
   deployment_max_timeout      = var.deployment_max_timeout
 }
@@ -266,6 +272,14 @@ module "inference_lambda_role" {
           }
         },
         {
+          # The SageMaker deployment guardrails guide asks for
+          # cloudwatch:DescribeAlarms on the auto-rollback alarms that the
+          # refresher's DeploymentConfig names.
+          Effect   = "Allow"
+          Action   = ["cloudwatch:DescribeAlarms"]
+          Resource = module.sagemaker_endpoint.rollback_alarm_arns
+        },
+        {
           # PassRole for the execution role (ExecutionRoleArn) the cloned
           # endpoint config may carry. The refresher attaches no new role.
           Effect = "Allow"
@@ -407,6 +421,7 @@ module "auto_deployment" {
   model_package_group_name         = data.terraform_remote_state.training.outputs.model_package_group_name
   endpoint_name                    = local.endpoint_name
   endpoint_instance_type           = var.endpoint_instance_type
+  endpoint_initial_instance_count  = var.endpoint_initial_instance_count
   data_capture_sampling_percentage = var.data_capture_sampling_percentage
   data_capture_input               = var.data_capture_input
   sagemaker_role_arn               = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
@@ -420,6 +435,11 @@ module "auto_deployment" {
   log_kms_key_arn                  = local.training_outputs.kms_key_arn
   env_kms_key_arn                  = local.training_outputs.kms_key_arn
   volume_kms_key_arn               = local.training_outputs.kms_key_arn
+
+  # Approval-driven rollouts use the endpoint's canary policy and rollback
+  # alarms, not only the first deployment.
+  deployment_config_json = module.sagemaker_endpoint.deployment_config_json
+  rollback_alarm_arns    = module.sagemaker_endpoint.rollback_alarm_arns
 
   # Mirror the serverless flags into the Lambda env so the auto-deployer
   # creates endpoint configs matching the initial Terraform deploy.

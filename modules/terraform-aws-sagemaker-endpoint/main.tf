@@ -155,7 +155,59 @@ resource "aws_sagemaker_endpoint_configuration" "this" {
 # SageMaker Endpoint
 ################################################################################
 
-# Blue/green deployment with auto-rollback on the two alarms below.
+# Blue/green deployment with auto-rollback on the two alarms below. The
+# traffic shift is CANARY by default: canary_size_percent of the new fleet
+# takes traffic for wait_interval seconds, then the rest shifts over. LINEAR
+# shifts linear_step_percent per step; ALL_AT_ONCE shifts in one step.
+# Serverless variants stay on ALL_AT_ONCE: canary and linear sizes are
+# fractions of an instance fleet.
+locals {
+  traffic_routing_type = var.use_serverless_inference ? "ALL_AT_ONCE" : var.traffic_routing_type
+  rollback_alarm_names = [
+    aws_cloudwatch_metric_alarm.endpoint_error_rate.alarm_name,
+    aws_cloudwatch_metric_alarm.endpoint_latency.alarm_name,
+  ]
+
+  # Instances the smallest fleet has during a deployment: auto-scaling can
+  # take the variant down to min_capacity before an update starts.
+  smallest_fleet = min(var.initial_instance_count, var.min_capacity)
+  shift_percent = (
+    local.traffic_routing_type == "CANARY" ? var.canary_size_percent :
+    local.traffic_routing_type == "LINEAR" ? var.linear_step_percent : 100
+  )
+  # Shift steps and the time they take, for the timeout check below.
+  shift_steps  = local.traffic_routing_type == "LINEAR" ? ceil(100 / var.linear_step_percent) : 1
+  total_wait_s = local.shift_steps * var.traffic_shift_wait_interval + var.termination_wait_seconds
+
+  # The same policy in UpdateEndpoint's DeploymentConfig shape. The
+  # auto-deploy and endpoint-refresher Lambdas pass it on every
+  # UpdateEndpoint, so approval-driven and weekly rollouts use this policy
+  # too, not only the endpoint's first deployment.
+  deployment_config = {
+    BlueGreenUpdatePolicy = {
+      TrafficRoutingConfiguration = merge(
+        {
+          Type                  = local.traffic_routing_type
+          WaitIntervalInSeconds = var.traffic_shift_wait_interval
+        },
+        {
+          for key, size in {
+            CanarySize     = { Type = "CAPACITY_PERCENT", Value = var.canary_size_percent }
+            LinearStepSize = { Type = "CAPACITY_PERCENT", Value = var.linear_step_percent }
+          } : key => size
+          if(key == "CanarySize" && local.traffic_routing_type == "CANARY") ||
+          (key == "LinearStepSize" && local.traffic_routing_type == "LINEAR")
+        },
+      )
+      TerminationWaitInSeconds         = var.termination_wait_seconds
+      MaximumExecutionTimeoutInSeconds = var.deployment_max_timeout
+    }
+    AutoRollbackConfiguration = {
+      Alarms = [for name in local.rollback_alarm_names : { AlarmName = name }]
+    }
+  }
+}
+
 resource "aws_sagemaker_endpoint" "this" {
   name                 = var.endpoint_name
   endpoint_config_name = aws_sagemaker_endpoint_configuration.this.name
@@ -163,19 +215,35 @@ resource "aws_sagemaker_endpoint" "this" {
   deployment_config {
     blue_green_update_policy {
       traffic_routing_configuration {
-        type                     = "ALL_AT_ONCE"
+        type                     = local.traffic_routing_type
         wait_interval_in_seconds = var.traffic_shift_wait_interval
+
+        dynamic "canary_size" {
+          for_each = local.traffic_routing_type == "CANARY" ? [1] : []
+          content {
+            type  = "CAPACITY_PERCENT"
+            value = var.canary_size_percent
+          }
+        }
+
+        dynamic "linear_step_size" {
+          for_each = local.traffic_routing_type == "LINEAR" ? [1] : []
+          content {
+            type  = "CAPACITY_PERCENT"
+            value = var.linear_step_percent
+          }
+        }
       }
       termination_wait_in_seconds          = var.termination_wait_seconds
       maximum_execution_timeout_in_seconds = var.deployment_max_timeout
     }
 
     auto_rollback_configuration {
-      alarms {
-        alarm_name = aws_cloudwatch_metric_alarm.endpoint_error_rate.alarm_name
-      }
-      alarms {
-        alarm_name = aws_cloudwatch_metric_alarm.endpoint_latency.alarm_name
+      dynamic "alarms" {
+        for_each = local.rollback_alarm_names
+        content {
+          alarm_name = alarms.value
+        }
       }
     }
   }
@@ -193,8 +261,23 @@ resource "aws_sagemaker_endpoint" "this" {
     # Describe, so Terraform reads it back as absent and tries to re-add it on
     # every apply - which forces a full endpoint REPLACEMENT (and then fails
     # because monitoring schedules are still attached). Ignoring it keeps
-    # re-applies in-place and non-destructive.
+    # re-applies in-place and non-destructive. A changed traffic policy still
+    # reaches an existing endpoint: both Lambdas send local.deployment_config
+    # with every UpdateEndpoint.
     ignore_changes = [endpoint_config_name, deployment_config]
+
+    # SageMaker caps a canary at 50% of the fleet and a linear step at 10-50%.
+    # A percentage is rounded up to whole instances, so one instance is 100%
+    # of its fleet and cannot be split: canary and linear need at least two.
+    precondition {
+      condition     = local.traffic_routing_type == "ALL_AT_ONCE" || ceil(local.smallest_fleet * local.shift_percent / 100) * 2 <= local.smallest_fleet
+      error_message = "${local.traffic_routing_type} traffic shifting sends ${local.shift_percent}% of the new fleet first, rounded up to whole instances, and SageMaker allows at most 50% of the fleet per step. With min(initial_instance_count, min_capacity) = ${local.smallest_fleet} that step is the whole fleet. Use at least 2 instances for both, or traffic_routing_type = \"ALL_AT_ONCE\"."
+    }
+
+    precondition {
+      condition     = var.deployment_max_timeout > local.total_wait_s
+      error_message = "deployment_max_timeout (${var.deployment_max_timeout}s) must exceed the deployment's waits: ${local.shift_steps} x traffic_shift_wait_interval + termination_wait_seconds = ${local.total_wait_s}s."
+    }
   }
 }
 

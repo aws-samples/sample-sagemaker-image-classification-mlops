@@ -8,15 +8,30 @@ SageMaker model, endpoint configuration, endpoint, CloudWatch alarms, and auto-s
 2. Creates a SageMaker Endpoint Configuration (`name_prefix` + `create_before_destroy`) - either real-time (data capture of model Output by default; set `data_capture_input = true` to also store requests) or serverless (scales to zero)
 3. Creates rollback alarms wired to the endpoint's auto-rollback configuration: the larger of `Invocation5XXErrors` and `InvocationModelErrors` (Sum per minute), and `ModelLatency`
 4. Creates the SageMaker endpoint (Terraform-managed) with a blue/green update policy and auto-rollback on the two alarms. `endpoint_config_name` and `deployment_config` are in `ignore_changes`, so the auto-deploy Lambda can repoint the endpoint without Terraform reverting it
-5. Creates an Application Auto Scaling target and target-tracking scaling policy (skipped in serverless mode - serverless scales via `max_concurrency`)
+5. Exposes the same policy as `deployment_config_json` (UpdateEndpoint `DeploymentConfig` shape). Pass it to every Lambda that calls UpdateEndpoint (the auto-deployment module's `deployment_config_json`, the endpoint refresher's `DEPLOYMENT_CONFIG`) so approval-driven and scheduled rollouts use the same traffic shifting and rollback alarms; because `deployment_config` is ignored after creation, this is also how a changed policy reaches an existing endpoint
+6. Creates an Application Auto Scaling target and target-tracking scaling policy (skipped in serverless mode - serverless scales via `max_concurrency`)
 
 `model_package_arn` must be the versioned ARN of an Approved package; a precondition fails the plan otherwise. The sample's placeholder baseline is registered as `PendingManualApproval` and must be approved by a person first.
+
+## Traffic Shifting
+
+`traffic_routing_type` picks how a blue/green update moves traffic to the new (green) fleet:
+
+| Type | What happens | Settings |
+| ---- | ------------ | -------- |
+| `CANARY` (default) | `canary_size_percent` (10) of the green fleet's capacity takes traffic, the alarms watch it for `traffic_shift_wait_interval` seconds (300), then the rest shifts | `canary_size_percent` 1-50 |
+| `LINEAR` | `linear_step_percent` (20) of the green fleet is turned on per step, each followed by a `traffic_shift_wait_interval` bake | `linear_step_percent` 10-50 |
+| `ALL_AT_ONCE` | All traffic shifts in one step | none |
+
+After the last shift SageMaker keeps the old fleet for `termination_wait_seconds`, then terminates it. If either rollback alarm fires during any bake, all traffic returns to the old fleet. Both fleets are billed while an update runs.
+
+Capacity comes in whole instances and SageMaker allows at most 50% of the fleet per canary or linear step, so `CANARY` and `LINEAR` need at least two instances: a precondition checks `min(initial_instance_count, min_capacity) >= 2` (more precisely, that the rounded-up step is at most half of that fleet). With two instances a 10% canary is one instance, half the capacity; a true 10% canary needs ten. A second precondition checks that `deployment_max_timeout` exceeds the total bake and termination waits. Serverless variants always use `ALL_AT_ONCE`.
 
 ## Inference Modes
 
 ### Real-time (default)
 
-`use_serverless_inference = false` (default) - provisioned `ml.m5.xlarge` (or whatever `instance_type` you set) runs 24/7. Full data-capture + drift-detection + auto-scaling support. ~$168/month baseline at 1 instance.
+`use_serverless_inference = false` (default) - provisioned `ml.m5.xlarge` (or whatever `instance_type` you set) runs 24/7. Full data-capture + drift-detection + auto-scaling support. ~$168/month per instance; two instances by default in `stack-inference` for canary traffic shifting.
 
 Best for:
 
@@ -88,14 +103,16 @@ When opting in, the auto-deploy Lambda also switches its endpoint-config creatio
 | model\_package\_group\_name | Name of the SageMaker Model Package Group | `string` | n/a | yes |
 | monitoring\_bucket | S3 bucket name for data capture and monitoring output | `string` | n/a | yes |
 | project\_name | Name of the project | `string` | n/a | yes |
+| canary\_size\_percent | Percentage of the new fleet's capacity that takes traffic during the canary step (CAPACITY\_PERCENT). SageMaker allows at most 50%. Used when traffic\_routing\_type = CANARY. | `number` | `10` | no |
 | data\_capture\_input | Also capture request payloads. Off by default: the monitoring jobs only need model output, and Input capture stores every uploaded image (potential PHI, several MB per request). | `bool` | `false` | no |
 | data\_capture\_sampling\_percentage | Percentage of invocations written to data capture (0-100). Real-time mode only. | `number` | `100` | no |
-| deployment\_max\_timeout | Maximum deployment timeout in seconds (600-14400) | `number` | `3600` | no |
+| deployment\_max\_timeout | Maximum deployment time in seconds (600-28800). Must exceed the total of the traffic shift waits and termination\_wait\_seconds. | `number` | `3600` | no |
 | error\_count\_threshold | Rollback fires when Invocation5XXErrors or InvocationModelErrors (Sum per minute) exceed this for 2 consecutive minutes. | `number` | `3` | no |
 | initial\_instance\_count | Initial number of instances for the endpoint | `number` | `1` | no |
 | initial\_variant\_weight | Initial traffic weight for the primary production variant. With one variant this is always 100% of traffic; exposing it lets callers add a weighted canary variant and shift traffic via update\_endpoint\_weights\_and\_capacities. | `number` | `1` | no |
 | instance\_type | Instance type for the SageMaker endpoint | `string` | `"ml.m5.xlarge"` | no |
 | latency\_threshold | Latency threshold in milliseconds for the CloudWatch alarm | `number` | `30000` | no |
+| linear\_step\_percent | Percentage of the new fleet's capacity turned on per step (CAPACITY\_PERCENT). SageMaker allows 10-50%. Used when traffic\_routing\_type = LINEAR. | `number` | `20` | no |
 | max\_capacity | Maximum number of instances for auto-scaling | `number` | `3` | no |
 | min\_capacity | Minimum number of instances for auto-scaling | `number` | `1` | no |
 | model\_package\_arn | Versioned ARN of the Approved model package the Terraform-managed model serves, for example arn:aws:sagemaker:us-east-1:111122223333:model-package/<group>/1. Later approvals are rolled out by the auto-deploy Lambda, so this only seeds the first deployment. | `string` | `""` | no |
@@ -105,8 +122,9 @@ When opting in, the auto-deploy Lambda also switches its endpoint-config creatio
 | shadow\_model\_name | Name of an existing SageMaker model to run as a shadow variant (Part 3 shadow testing). The shadow receives a copy of production traffic but its predictions are not returned to callers. Null = no shadow variant. Real-time only. | `string` | `null` | no |
 | tags | Tags to apply to all resources | `map(string)` | `{}` | no |
 | target\_concurrent\_requests\_per\_model | Target concurrent in-flight requests per model container. Uses the SageMaker high-resolution metric (10s granularity) for sub-minute scale-out detection. | `number` | `5` | no |
-| termination\_wait\_seconds | Seconds to wait after deployment before terminating old fleet | `number` | `120` | no |
-| traffic\_shift\_wait\_interval | Wait interval in seconds between each linear traffic shift step | `number` | `60` | no |
+| termination\_wait\_seconds | Seconds to wait after the new fleet takes all traffic before the old fleet is terminated (0-3600). The rollback alarms keep watching during this final baking period. | `number` | `120` | no |
+| traffic\_routing\_type | How the blue/green update shifts traffic to the new fleet: CANARY (canary\_size\_percent first, then the rest), LINEAR (linear\_step\_percent per step) or ALL\_AT\_ONCE. CANARY and LINEAR need at least 2 instances (initial\_instance\_count and min\_capacity). Serverless variants always use ALL\_AT\_ONCE. | `string` | `"CANARY"` | no |
+| traffic\_shift\_wait\_interval | Baking period in seconds after each traffic shift step (the canary step, or each linear step) while the rollback alarms watch the new fleet (0-3600). Keep it longer than the alarms need to fire: 2 one-minute periods plus CloudWatch delay. | `number` | `300` | no |
 | use\_serverless\_inference | When true, provision a SageMaker Serverless Inference variant instead of<br/>an instance-based real-time variant. Serverless scales to zero when idle<br/>(large cost savings for low-traffic endpoints like a blog demo) but loses<br/>several features:<br/><br/>  - No DataCaptureConfig on the endpoint config (drift detection cannot<br/>    read captured payloads; your inference handler must log predictions<br/>    itself if drift detection matters).<br/>  - No Application Auto Scaling (scales internally via max\_concurrency).<br/>  - Cold starts of 1-5 seconds after idle periods.<br/>  - Max memory = 6 GB, max concurrent requests per variant = 200.<br/><br/>Default is false to preserve the project's compliance/monitoring story.<br/>Opt in only when the cost win outweighs these tradeoffs. | `bool` | `false` | no |
 | volume\_kms\_key\_arn | KMS key ARN used to encrypt the ML storage volume attached to real-time (instance-based) inference variants. The volume buffers the model artifact and in-flight inference data (potential PHI for a medical model), so it should use the project CMK rather than the AWS-managed default key. Ignored for serverless variants, which do not attach a volume. Null falls back to the default key. | `string` | `null` | no |
 
@@ -115,6 +133,7 @@ When opting in, the auto-deploy Lambda also switches its endpoint-config creatio
 | Name | Description |
 | ---- | ----------- |
 | autoscaling\_target\_resource\_id | Resource ID of the auto-scaling target (null when running in serverless mode) |
+| deployment\_config\_json | The endpoint's blue/green policy (traffic routing and auto-rollback alarms) as UpdateEndpoint DeploymentConfig JSON. Pass it to the Lambdas that call UpdateEndpoint so every rollout uses the same policy. |
 | endpoint\_arn | ARN of the SageMaker endpoint |
 | endpoint\_config\_name | Name of the SageMaker endpoint configuration |
 | endpoint\_name | Name of the SageMaker endpoint |
@@ -123,6 +142,8 @@ When opting in, the auto-deploy Lambda also switches its endpoint-config creatio
 | latency\_alarm\_arn | ARN of the endpoint latency CloudWatch alarm |
 | latency\_alarm\_name | Name of the endpoint latency CloudWatch alarm |
 | model\_name | Name of the SageMaker model |
+| rollback\_alarm\_arns | ARNs of the auto-rollback alarms, for cloudwatch:DescribeAlarms grants |
+| traffic\_routing\_type | Traffic shifting mode the endpoint deploys with (ALL\_AT\_ONCE for serverless variants) |
 <!-- END_TF_DOCS -->
 
 ## File Structure

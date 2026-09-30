@@ -277,6 +277,49 @@ variable "auto_trigger_marker_key" {
 }
 
 ################################################################################
+# Upload quarantine
+################################################################################
+
+variable "enable_upload_quarantine" {
+  description = "Check every object uploaded under training_data_path in the raw-data bucket with a Lambda (allowed extension, opens with Pillow as that format, minimum size) and move failing files to quarantine_prefix with a .reason.json next to each. The pipeline validation step still checks every image."
+  type        = bool
+  default     = true
+}
+
+variable "quarantine_prefix" {
+  description = "Key prefix in the raw-data bucket that failing uploads are moved to. Must end with / and sit outside training_data_path so neither the pipeline trigger nor the preprocessing input reads it."
+  type        = string
+  default     = "quarantine/"
+
+  validation {
+    condition = (
+      endswith(var.quarantine_prefix, "/")
+      && !startswith(var.quarantine_prefix, var.training_data_path)
+      && !startswith(var.training_data_path, var.quarantine_prefix)
+      && !startswith(var.auto_trigger_marker_key, var.quarantine_prefix)
+    )
+    error_message = "quarantine_prefix must end with / and must not overlap training_data_path or auto_trigger_marker_key."
+  }
+}
+
+variable "quarantine_min_image_size_px" {
+  description = "Uploads whose width or height is below this many pixels are quarantined. Matches the validation step's MIN_RESOLUTION default (112)."
+  type        = number
+  default     = 112
+
+  validation {
+    condition     = var.quarantine_min_image_size_px >= 1
+    error_message = "quarantine_min_image_size_px must be at least 1."
+  }
+}
+
+variable "upload_quarantine_reserved_concurrency" {
+  description = "Reserved concurrency for the upload quarantine Lambda. A full dataset upload sends one event per image; the cap keeps it from using the account's whole Lambda concurrency, and throttled events are retried by Lambda's asynchronous queue."
+  type        = number
+  default     = 10
+}
+
+################################################################################
 # Quality Gate
 ################################################################################
 

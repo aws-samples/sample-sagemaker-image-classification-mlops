@@ -29,6 +29,10 @@ enable_auto_trigger          = true
 # after a batch upload).
 auto_trigger_marker_key = "medical_image_data/.batch_complete"
 
+# Move uploads that fail the image checks to quarantine/ (with a .reason.json)
+enable_upload_quarantine     = true
+quarantine_min_image_size_px = 112
+
 # Managed MLflow tracking server. Billed for every hour it runs.
 enable_mlflow = false
 

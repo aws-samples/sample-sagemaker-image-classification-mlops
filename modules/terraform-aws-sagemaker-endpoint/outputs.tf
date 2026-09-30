@@ -53,6 +53,28 @@ output "latency_alarm_name" {
   value       = aws_cloudwatch_metric_alarm.endpoint_latency.alarm_name
 }
 
+output "rollback_alarm_arns" {
+  description = "ARNs of the auto-rollback alarms, for cloudwatch:DescribeAlarms grants"
+  value = [
+    aws_cloudwatch_metric_alarm.endpoint_error_rate.arn,
+    aws_cloudwatch_metric_alarm.endpoint_latency.arn,
+  ]
+}
+
+################################################################################
+# Deployment
+################################################################################
+
+output "deployment_config_json" {
+  description = "The endpoint's blue/green policy (traffic routing and auto-rollback alarms) as UpdateEndpoint DeploymentConfig JSON. Pass it to the Lambdas that call UpdateEndpoint so every rollout uses the same policy."
+  value       = jsonencode(local.deployment_config)
+}
+
+output "traffic_routing_type" {
+  description = "Traffic shifting mode the endpoint deploys with (ALL_AT_ONCE for serverless variants)"
+  value       = local.traffic_routing_type
+}
+
 ################################################################################
 # Auto-Scaling
 ################################################################################

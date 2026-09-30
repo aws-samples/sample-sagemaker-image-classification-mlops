@@ -98,6 +98,13 @@ min_images_per_class    = 50
 enable_auto_trigger     = true
 training_input_mode     = "FastFile"
 
+# Upload quarantine: images under training_data_path that fail the extension,
+# Pillow-open or minimum-size check move to quarantine_prefix with a
+# .reason.json next to each.
+enable_upload_quarantine     = true
+quarantine_prefix            = "quarantine/"
+quarantine_min_image_size_px = 112
+
 # Monitoring
 enable_training_monitoring = true
 log_retention_days         = 30

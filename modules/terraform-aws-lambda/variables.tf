@@ -6,6 +6,12 @@ variable "source_dir" {
   type        = string
 }
 
+variable "archive_output_path" {
+  description = "Where to write the zip built from source_dir. Null = lambda_function.zip in this module's folder. Set it when another stack also uses this module with a different source_dir, so the two stacks never write the same file."
+  type        = string
+  default     = null
+}
+
 variable "function_name" {
   description = "Lambda function name"
   type        = string

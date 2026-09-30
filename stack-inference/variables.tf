@@ -149,9 +149,9 @@ variable "alert_email" {
 ################################################################################
 
 variable "endpoint_min_capacity" {
-  description = "Minimum number of instances for auto-scaling"
+  description = "Minimum number of instances for auto-scaling. 2 by default because canary and linear traffic shifting cannot split a single instance."
   type        = number
-  default     = 1
+  default     = 2
 }
 
 variable "endpoint_max_capacity" {
@@ -170,14 +170,38 @@ variable "target_concurrent_requests_per_model" {
 # Deployment
 ################################################################################
 
+variable "traffic_routing_type" {
+  description = "Blue/green traffic shifting for endpoint updates, including approval-driven and weekly-refresh rollouts: CANARY (canary_size_percent of the new fleet first, then the rest), LINEAR (linear_step_percent per step) or ALL_AT_ONCE. CANARY and LINEAR need endpoint_initial_instance_count and endpoint_min_capacity of at least 2. Serverless endpoints always use ALL_AT_ONCE."
+  type        = string
+  default     = "CANARY"
+}
+
+variable "canary_size_percent" {
+  description = "Percentage of the new fleet that takes traffic during the canary step (1-50). Capacity comes in whole instances, so with 2 instances the canary is 1 instance, half the fleet."
+  type        = number
+  default     = 10
+}
+
+variable "linear_step_percent" {
+  description = "Percentage of the new fleet turned on per LINEAR step (10-50)."
+  type        = number
+  default     = 20
+}
+
+variable "traffic_shift_wait_interval" {
+  description = "Baking period in seconds after each traffic shift step while the rollback alarms watch the new fleet (0-3600). The alarms need about 3 minutes to fire (2 one-minute periods plus CloudWatch delay), so keep it above that."
+  type        = number
+  default     = 300
+}
+
 variable "termination_wait_seconds" {
-  description = "Seconds to wait after deployment before terminating old fleet"
+  description = "Seconds to wait after the new fleet takes all traffic before the old fleet is terminated (0-3600)"
   type        = number
   default     = 120
 }
 
 variable "deployment_max_timeout" {
-  description = "Maximum deployment timeout in seconds (600-14400)"
+  description = "Maximum deployment time in seconds (600-28800). Must exceed the traffic shift waits plus termination_wait_seconds."
   type        = number
   default     = 3600
 }
@@ -193,9 +217,9 @@ variable "endpoint_instance_type" {
 }
 
 variable "endpoint_initial_instance_count" {
-  description = "Initial number of instances for SageMaker endpoint"
+  description = "Instances in the endpoint's production variant, for the Terraform-created and auto-deployed endpoint configs. 2 by default because canary and linear traffic shifting cannot split a single instance; use 1 only with traffic_routing_type = ALL_AT_ONCE."
   type        = number
-  default     = 1
+  default     = 2
 }
 
 variable "model_package_arn" {
@@ -225,7 +249,8 @@ variable "use_serverless_inference" {
     Opt-in flag to deploy the endpoint as a SageMaker Serverless Inference
     variant instead of an always-on instance. Recommended for low-traffic
     demo/blog endpoints: scales to zero when idle and can cut the monthly
-    bill from ~$170 to ~$5-10. Not recommended when drift-detection data
+    bill from ~$340 (two instances) to ~$5-10. Updates then shift all
+    traffic at once (no canary). Not recommended when drift-detection data
     capture or strict p50 latency matter - see the sagemaker-endpoint
     module README for the full tradeoff list.
   EOT

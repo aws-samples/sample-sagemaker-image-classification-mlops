@@ -158,3 +158,17 @@ output "sbom_bucket_arn" {
   description = "ARN of the SBOM S3 bucket. Null when enable_sbom_bucket = false."
   value       = try(module.s3_sbom[0].bucket_arn, null)
 }
+
+################################################################################
+# Upload quarantine
+################################################################################
+
+output "upload_quarantine_function_name" {
+  description = "Lambda that checks each uploaded training image (null when enable_upload_quarantine = false)"
+  value       = var.enable_upload_quarantine ? module.upload_quarantine_lambda[0].function_name : null
+}
+
+output "upload_quarantine_location" {
+  description = "Where failing uploads are moved, with a .reason.json next to each (null when enable_upload_quarantine = false)"
+  value       = var.enable_upload_quarantine ? "s3://${module.s3_raw_data.bucket_id}/${var.quarantine_prefix}" : null
+}

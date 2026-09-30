@@ -10,8 +10,23 @@ SageMaker training infrastructure for the image classification sample: data and 
 4. Creates the Model Package Group and, with `enable_model_card = true` (default), a Model Card
 5. Creates the SageMaker pipeline from `pipeline.json.tftpl`: 9 top-level steps (ValidateDataset, PreprocessData, three training steps, EvaluateAllModels, CreateEnsembleModel, BiasCheck, and the Condition step), whose branches are RegisterEnsembleModel or Fail
 6. Creates an EventBridge rule that starts the pipeline with `RetrainingReason=data_upload` when the `.batch_complete` marker is written to the raw data bucket
-7. Creates CloudWatch log groups, metric filters and a training dashboard, and an AWS Budgets budget (`monthly_budget_usd`, default 200)
-8. Optionally creates a managed MLflow tracking server (`enable_mlflow`, default `false`) and a multi-region CloudTrail trail (`enable_cloudtrail`, default `false`)
+7. With `enable_upload_quarantine = true` (default), creates the upload quarantine Lambda (see [Upload quarantine](#upload-quarantine))
+8. Creates CloudWatch log groups, metric filters and a training dashboard, and an AWS Budgets budget (`monthly_budget_usd`, default 200)
+9. Optionally creates a managed MLflow tracking server (`enable_mlflow`, default `false`) and a multi-region CloudTrail trail (`enable_cloudtrail`, default `false`)
+
+## Upload quarantine
+
+An EventBridge rule on the raw-data bucket's Object Created events under `training_data_path` invokes a Lambda once per uploaded object. EventBridge is the same event source the pipeline trigger uses: S3 allows one notification configuration per bucket, and the bucket's sends everything to EventBridge. The Lambda:
+
+- keeps an object that has an allowed extension (`.jpg`, `.jpeg`, `.png`, the extensions validation and preprocessing read), opens with Pillow as the format that extension names (verified and fully decoded, so truncated files fail), and is at least `quarantine_min_image_size_px` (112, the validation step's hard minimum) on both sides;
+- otherwise copies it to `<quarantine_prefix><original key>` (default `quarantine/`), writes `<quarantine_prefix><original key>.reason.json` with the reason, ETag, size and time, deletes the original, and adds 1 to the `QuarantinedImages` metric (namespace `<project_name>/DataQuality`, dimension `Bucket`);
+- ignores the `.batch_complete` marker, keys outside `training_data_path` and anything already under `quarantine_prefix`.
+
+`quarantine_prefix` must sit outside `training_data_path` (a variable validation checks it), so neither the pipeline trigger nor the validation and preprocessing inputs read quarantined files. The bucket is versioned, so the deleted original stays recoverable as a noncurrent version.
+
+The function uses the `terraform-aws-lambda` module: KMS-encrypted environment and log group (`log_retention_days`), active X-Ray tracing, an SQS dead-letter queue encrypted with the project key plus a queue-depth alarm, reserved concurrency (`upload_quarantine_reserved_concurrency`, 10) and the workload permissions boundary. Its role can read and delete only under `training_data_path`, write only under `quarantine_prefix`, and publish metrics only to its namespace. Pillow comes from a layer built from the same zip and script as the inference Lambda's layer (`ops-scripts/build_lambda_layer.sh`, Pillow 12.3.0); `make layer` builds it, and the apply builds it when missing.
+
+The checks run as files arrive, while the marker starts the pipeline as soon as the upload script writes it, so a large upload can start the pipeline before the Lambda has reached every file. The validation step checks every image again and fails the run on a bad one, so nothing unchecked reaches training. For a clean first run, wait for the Lambda to catch up (its CloudWatch `Invocations` metric flattens) before writing the marker, or rerun the pipeline.
 
 ## Pipeline behaviour
 
@@ -64,6 +79,7 @@ make weights
 | ---- | ------- |
 | aws | ~> 6.0 |
 | random | ~> 3.8 |
+| terraform | n/a |
 
 ## Resources
 
@@ -72,12 +88,16 @@ make weights
 | [aws_budgets_budget.monthly](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/budgets_budget) | resource |
 | [aws_cloudtrail.audit](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudtrail) | resource |
 | [aws_cloudwatch_event_rule.new_data_uploaded](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_rule) | resource |
+| [aws_cloudwatch_event_rule.upload_quarantine](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_rule) | resource |
 | [aws_cloudwatch_event_target.pipeline_trigger](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_target) | resource |
+| [aws_cloudwatch_event_target.upload_quarantine](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_event_target) | resource |
 | [aws_cloudwatch_log_group.cloudtrail](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_log_group) | resource |
+| [aws_cloudwatch_metric_alarm.upload_quarantine_dlq](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
 | [aws_iam_role.cloudtrail_cwl](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
 | [aws_iam_role.eventbridge_sagemaker_role](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
 | [aws_iam_role_policy.cloudtrail_cwl](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) | resource |
 | [aws_iam_role_policy.eventbridge_sagemaker_policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) | resource |
+| [aws_lambda_layer_version.quarantine_pillow](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_layer_version) | resource |
 | [aws_s3_bucket_policy.cloudtrail](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket_policy) | resource |
 | [aws_sagemaker_mlflow_tracking_server.mlflow](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sagemaker_mlflow_tracking_server) | resource |
 | [aws_sagemaker_model_card.medical_image](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sagemaker_model_card) | resource |
@@ -85,9 +105,11 @@ make weights
 | [aws_sagemaker_pipeline.medical_image_pipeline](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sagemaker_pipeline) | resource |
 | [aws_sns_topic.cloudtrail_notifications](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sns_topic) | resource |
 | [aws_sns_topic_policy.cloudtrail_notifications](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sns_topic_policy) | resource |
+| [aws_sqs_queue.upload_quarantine_dlq](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sqs_queue) | resource |
 | [random_id.bucket_suffix](https://registry.terraform.io/providers/hashicorp/random/latest/docs/resources/id) | resource |
 | [random_id.cloudtrail_suffix](https://registry.terraform.io/providers/hashicorp/random/latest/docs/resources/id) | resource |
 | [random_id.sbom_suffix](https://registry.terraform.io/providers/hashicorp/random/latest/docs/resources/id) | resource |
+| [terraform_data.quarantine_layer_build](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
 
 ## Inputs
 
@@ -103,7 +125,7 @@ make weights
 | bucket\_defaults | Default configuration for S3 buckets | <pre>object({<br/>    force_destroy       = bool<br/>    enable_versioning   = bool<br/>    block_public_access = bool<br/>  })</pre> | <pre>{<br/>  "block_public_access": true,<br/>  "enable_versioning": true,<br/>  "force_destroy": false<br/>}</pre> | no |
 | budget\_alert\_emails | Email addresses that receive AWS Budgets alerts at 80% actual and 100% forecasted thresholds. | `list(string)` | `[]` | no |
 | budget\_start\_date | Start of the AWS Budgets period, in the format YYYY-MM-DD\_HH:MM (UTC). | `string` | `"2026-01-01_00:00"` | no |
-| clinical\_quality\_gate | Clinical quality gate the ensemble must clear before it can be registered. Recall is highest because a missed malignant case (false negative) is the costly error. Must mirror CLINICAL\_QUALITY\_THRESHOLDS in scripts/evaluation/model\_evaluator.py and scripts/ensemble/ensemble\_creator.py. | <pre>object({<br/>    accuracy  = number<br/>    recall    = number<br/>    precision = number<br/>    auc_roc   = number<br/>  })</pre> | <pre>{<br/>  "accuracy": 0.85,<br/>  "auc_roc": 0.9,<br/>  "precision": 0.8,<br/>  "recall": 0.95<br/>}</pre> | no |
+| clinical\_quality\_gate | Clinical quality gate the ensemble must clear before it can be registered. Recall is highest because a missed malignant case (false negative) is the costly error. The evaluation and ensemble steps receive the same values (CLINICAL\_QUALITY\_GATE), so the threshold search targets this recall. | <pre>object({<br/>    accuracy  = number<br/>    recall    = number<br/>    precision = number<br/>    auc_roc   = number<br/>  })</pre> | <pre>{<br/>  "accuracy": 0.85,<br/>  "auc_roc": 0.9,<br/>  "precision": 0.8,<br/>  "recall": 0.95<br/>}</pre> | no |
 | cloudtrail\_retention\_days | Days to retain CloudTrail logs in S3 before lifecycle deletion. HIPAA requires 6 years of audit retention - typically achieved by shipping to a SIEM, not keeping everything in S3. | `number` | `400` | no |
 | code\_commit\_sha | Default of the CodeCommitSha pipeline parameter: the Git commit that produced the model, recorded on the model package for audit lineage. Override per execution from CI. | `string` | `"local"` | no |
 | dashboard\_config | Dashboard configuration JSON | `string` | `""` | no |
@@ -123,6 +145,7 @@ make weights
 | enable\_network\_isolation | Run the training jobs with network isolation (no outbound network access from the training container). The trainers then read ImageNet weights from s3://<scripts-bucket>/pretrained-weights/, so run scripts/download\_pretrained\_weights.py once before the first pipeline execution. Processing jobs are not isolated because they install Python dependencies at start-up. | `bool` | `true` | no |
 | enable\_sbom\_bucket | Create a dedicated S3 bucket to receive Syft-generated CycloneDX SBOMs from the patched-image CodeBuild. Low monthly cost; safe to leave on even if you don't wire the patched image yet. | `bool` | `true` | no |
 | enable\_training\_monitoring | Enable training monitoring | `bool` | `true` | no |
+| enable\_upload\_quarantine | Check every object uploaded under training\_data\_path in the raw-data bucket with a Lambda (allowed extension, opens with Pillow as that format, minimum size) and move failing files to quarantine\_prefix with a .reason.json next to each. The pipeline validation step still checks every image. | `bool` | `true` | no |
 | fairness\_gate | Fairness gate the ensemble must clear before registration (Part 4). max\_disparity bounds the larger of demographic-parity difference and equalized-odds difference, computed by scripts/bias/compute\_bias.py with Fairlearn. Must mirror DEFAULT\_THRESHOLD in that script. sensitive\_feature is reported in the bias report; the public datasets used here carry no demographic metadata, so magnification is an honest subgroup proxy - supply a real attribute for clinical use. | <pre>object({<br/>    max_disparity     = number<br/>    sensitive_feature = string<br/>  })</pre> | <pre>{<br/>  "max_disparity": 0.1,<br/>  "sensitive_feature": "magnification"<br/>}</pre> | no |
 | kms\_deletion\_window\_days | KMS key deletion window (days) | `number` | `7` | no |
 | log\_group\_names | Log group names for metric filters | `map(string)` | `{}` | no |
@@ -135,6 +158,8 @@ make weights
 | permissions\_boundary\_arn | ARN of the permissions boundary attached to every IAM role this stack creates (stack-backend-setup output workload\_boundary\_arn). Required when CI/CD CodeBuild applies the stack; null leaves the roles unbounded. | `string` | `null` | no |
 | pipeline\_max\_parallel\_steps | Max concurrent steps a pipeline execution can run. Lets the three model trainers run in parallel. | `number` | `4` | no |
 | preprocessing\_target\_size | Target square resolution (pixels) the preprocessing job resizes every image to before training. 512 preserves fine diagnostic features like microcalcifications; the trainers downsample to their own input\_size from there. | `number` | `512` | no |
+| quarantine\_min\_image\_size\_px | Uploads whose width or height is below this many pixels are quarantined. Matches the validation step's MIN\_RESOLUTION default (112). | `number` | `112` | no |
+| quarantine\_prefix | Key prefix in the raw-data bucket that failing uploads are moved to. Must end with / and sit outside training\_data\_path so neither the pipeline trigger nor the preprocessing input reads it. | `string` | `"quarantine/"` | no |
 | retraining\_reason | Default of the RetrainingReason pipeline parameter (manual, data\_upload, drift\_detected), recorded on the registered model package. The upload trigger passes data\_upload and the drift alarm passes drift\_detected per execution. | `string` | `"manual"` | no |
 | sagemaker\_images | SageMaker container image configurations | <pre>object({<br/>    tensorflow_gpu_tag       = string<br/>    tensorflow_cpu_tag       = string<br/>    tensorflow_inference_tag = string<br/>  })</pre> | <pre>{<br/>  "tensorflow_cpu_tag": "2.19.0-cpu-py312-ubuntu22.04-sagemaker",<br/>  "tensorflow_gpu_tag": "2.19.0-gpu-py312-cu125-ubuntu22.04-sagemaker",<br/>  "tensorflow_inference_tag": "2.19.0-cpu-py312-ubuntu22.04-sagemaker"<br/>}</pre> | no |
 | sbom\_retention\_days | How long SBOM JSON files are kept before S3 expires them. | `number` | `730` | no |
@@ -142,6 +167,7 @@ make weights
 | training\_data\_path | Training data S3 path | `string` | `"medical_image_data/"` | no |
 | training\_input\_mode | SageMaker training input mode | `string` | `"FastFile"` | no |
 | training\_keep\_alive\_seconds | KeepAlivePeriodInSeconds for warm pools. Set to 0 to disable. | `number` | `1800` | no |
+| upload\_quarantine\_reserved\_concurrency | Reserved concurrency for the upload quarantine Lambda. A full dataset upload sends one event per image; the cap keeps it from using the account's whole Lambda concurrency, and throttled events are retried by Lambda's asynchronous queue. | `number` | `10` | no |
 | vpc\_config | Optional VPC for the training and processing jobs. Null runs them in the SageMaker service network. The subnets need a route to Amazon S3 (gateway endpoint), SageMaker API, CloudWatch Logs and ECR (interface endpoints or NAT); processing jobs also pip install packages, which needs a route to PyPI or a mirror. | <pre>object({<br/>    subnet_ids         = list(string)<br/>    security_group_ids = list(string)<br/>  })</pre> | `null` | no |
 
 ## Outputs
@@ -171,6 +197,8 @@ make weights
 | scripts\_bucket | Name of the scripts S3 bucket |
 | training\_dashboard\_url | Training monitoring dashboard URL |
 | training\_log\_groups | Training metrics log group names |
+| upload\_quarantine\_function\_name | Lambda that checks each uploaded training image (null when enable\_upload\_quarantine = false) |
+| upload\_quarantine\_location | Where failing uploads are moved, with a .reason.json next to each (null when enable\_upload\_quarantine = false) |
 <!-- END_TF_DOCS -->
 
 ## File Structure
@@ -182,11 +210,13 @@ stack-training/
 |-- backend.hcl.example       # Template for backend.hcl
 |-- cloudtrail_budgets.tf     # Optional CloudTrail trail and bucket, AWS Budgets budget
 |-- data.tf                   # Caller identity and SageMaker prebuilt image lookups
+|-- lambda/upload_quarantine/ # Upload quarantine Lambda source
 |-- main.tf                   # KMS, S3 buckets, execution role, registry, Model Card, MLflow, pipeline
 |-- monitor.tf                # CloudWatch log groups, metric filters and training dashboard
 |-- outputs.tf                # Buckets, pipeline, registry, IAM, KMS, MLflow, SBOM outputs
 |-- pipeline.json.tftpl       # SageMaker pipeline definition (rendered by templatefile)
 |-- providers.tf              # AWS provider with default_tags
+|-- quarantine.tf             # Upload quarantine Lambda, rule, role, layer and DLQ
 |-- sbom.tf                   # SBOM bucket for the patched inference image builds
 |-- terraform.tfvars          # Values for this environment
 |-- terraform.tfvars.example  # Annotated example values

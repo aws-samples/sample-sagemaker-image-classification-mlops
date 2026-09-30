@@ -41,6 +41,7 @@ Reusable Lambda function module with automatic source code packaging, configurab
 | function\_name | Lambda function name | `string` | n/a | yes |
 | handler | Lambda function handler | `string` | n/a | yes |
 | source\_dir | Path to Lambda source code directory | `string` | n/a | yes |
+| archive\_output\_path | Where to write the zip built from source\_dir. Null = lambda\_function.zip in this module's folder. Set it when another stack also uses this module with a different source\_dir, so the two stacks never write the same file. | `string` | `null` | no |
 | dead\_letter\_target\_arn | ARN of an SQS queue or SNS topic that receives failed async invocation events after Lambda exhausts its retry policy. Null = no DLQ (synchronous/API GW invocations don't need one). | `string` | `null` | no |
 | description | Description of the Lambda function | `string` | `null` | no |
 | enable\_xray\_tracing | Enable Active X-Ray tracing on the Lambda function. Recommended for production - gives end-to-end latency visibility across API Gateway, Lambda and downstream AWS services. | `bool` | `true` | no |

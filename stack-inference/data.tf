@@ -119,6 +119,9 @@ locals {
       environment = {
         ENDPOINT_NAME = local.endpoint_name
         PROJECT_NAME  = var.project_name
+        # Same blue/green policy the auto-deploy Lambda sends (canary by
+        # default), so the weekly roll is also guarded by the rollback alarms.
+        DEPLOYMENT_CONFIG = module.sagemaker_endpoint.deployment_config_json
       }
     }
   }

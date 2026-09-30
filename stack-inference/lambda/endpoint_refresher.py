@@ -10,16 +10,22 @@ Triggered on a schedule by EventBridge. The Lambda:
 2. Clones that config under a new timestamped name. Every field is copied
    except the name, ARN and creation time, so settings added later (VPC,
    async, shadow variants, execution role, serverless config) survive.
-3. Calls UpdateEndpoint; SageMaker performs a blue/green replacement.
+3. Calls UpdateEndpoint; SageMaker performs a blue/green replacement with
+   DEPLOYMENT_CONFIG, the same traffic policy (canary by default) and
+   auto-rollback alarms the auto-deploy Lambda sends.
 4. Deletes refresh configs from earlier runs. The config being replaced is
    kept, because a blue/green rollback returns to it.
 
 Environment variables:
-    ENDPOINT_NAME  (required)  SageMaker endpoint name to refresh.
+    ENDPOINT_NAME      (required)  SageMaker endpoint name to refresh.
+    DEPLOYMENT_CONFIG  (optional)  UpdateEndpoint DeploymentConfig JSON, the
+                       endpoint module's deployment_config_json output. Empty
+                       = RetainDeploymentConfig (reuse the last one).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -38,10 +44,36 @@ def refresh_prefix(endpoint_name: str) -> str:
     return f"{endpoint_name[:40]}-refresh-"
 
 
-def clone_config_request(source: dict, new_name: str) -> dict:
-    """CreateEndpointConfig kwargs that reproduce `source` under `new_name`."""
+def clone_config_request(source: dict, new_name: str, running: dict | None = None) -> dict:
+    """CreateEndpointConfig kwargs that reproduce `source` under `new_name`.
+
+    `running` maps variant name to its current instance count. A variant's
+    InitialInstanceCount is raised to it, because auto scaling may have grown
+    the fleet past the config's count and a canary is rejected on one instance.
+    """
     request = {k: v for k, v in source.items() if k not in _NOT_COPIED}
     request["EndpointConfigName"] = new_name
+    running = running or {}
+    variants = []
+    for variant in request.get("ProductionVariants", []):
+        variant = dict(variant)
+        current = running.get(variant.get("VariantName"))
+        if "InitialInstanceCount" in variant and current:
+            variant["InitialInstanceCount"] = max(variant["InitialInstanceCount"], current)
+        variants.append(variant)
+    if variants:
+        request["ProductionVariants"] = variants
+    return request
+
+
+def update_endpoint_request(endpoint_name: str, config_name: str) -> dict:
+    """UpdateEndpoint kwargs: DEPLOYMENT_CONFIG when set, else retain the last config."""
+    request = {"EndpointName": endpoint_name, "EndpointConfigName": config_name}
+    raw = os.environ.get("DEPLOYMENT_CONFIG", "").strip()
+    if raw:
+        request["DeploymentConfig"] = json.loads(raw)
+    else:
+        request["RetainDeploymentConfig"] = True
     return request
 
 
@@ -75,16 +107,18 @@ def handler(event, context, sm=None):
         )
         return {"skipped": True, "reason": f"endpoint status {status}"}
 
+    # Parsed before anything is created, so a bad value leaves no orphan config.
     new_config = f"{refresh_prefix(endpoint_name)}{int(time.time())}"
+    update_request = update_endpoint_request(endpoint_name, new_config)
     source = sm.describe_endpoint_config(EndpointConfigName=current_config)
-    sm.create_endpoint_config(**clone_config_request(source, new_config))
+    running = {
+        v["VariantName"]: v.get("CurrentInstanceCount", 0)
+        for v in desc.get("ProductionVariants", [])
+    }
+    sm.create_endpoint_config(**clone_config_request(source, new_config, running))
     logger.info("Created endpoint config %s (cloned from %s)", new_config, current_config)
 
-    sm.update_endpoint(
-        EndpointName=endpoint_name,
-        EndpointConfigName=new_config,
-        RetainDeploymentConfig=True,
-    )
+    sm.update_endpoint(**update_request)
     logger.info("Triggered blue/green roll of %s to %s", endpoint_name, new_config)
 
     deleted = []

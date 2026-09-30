@@ -5,14 +5,14 @@ Serving and monitoring for the image classification sample: the SageMaker endpoi
 ## What It Does
 
 1. Builds the patched inference image (one CodeBuild run at first apply, then monthly) in a tag-immutable ECR repository and pins it by digest
-2. Creates the SageMaker model, endpoint configuration and **endpoint**, all Terraform-managed: blue/green deployment with auto-rollback alarms, data capture of model output, and target-tracking auto-scaling (or a serverless variant with `use_serverless_inference = true`)
+2. Creates the SageMaker model, endpoint configuration and **endpoint**, all Terraform-managed: blue/green deployment with canary traffic shifting (`traffic_routing_type`, 10% of the new fleet first by default, two instances) and auto-rollback alarms, data capture of model output, and target-tracking auto-scaling (or a serverless variant with `use_serverless_inference = true`)
 3. Creates the inference Lambda with a Pillow/NumPy layer, built at apply time by `ops-scripts/build_lambda_layer.sh` when `lambda-layers/pillow-numpy-layer.zip` is missing
 4. Creates an API Gateway REST API with `POST /predict` and `GET /results/{id}`, an API key and usage plan, stage throttling, and a regional AWS WAF web ACL
 5. Hosts the static web UI in a private S3 bucket behind CloudFront; the page calls API Gateway directly with the API key
-6. Creates the auto-deploy Lambda: when a package in the group changes to `Approved`, it creates a model and endpoint configuration and updates the endpoint (blue/green, with rollback)
+6. Creates the auto-deploy Lambda: when a package in the group changes to `Approved`, it creates a model and endpoint configuration and updates the endpoint with the same canary policy and rollback alarms (the endpoint module's `deployment_config_json`)
 7. Schedules two Processing jobs with EventBridge Scheduler: PSI drift hourly and Fairlearn fairness daily, each with a CloudWatch alarm
 8. Creates an EventBridge rule that starts the training pipeline with `RetrainingReason=drift_detected` when either alarm fires
-9. Creates SNS alerts, API and endpoint alarms, a composite health alarm, a CloudWatch dashboard and a weekly endpoint refresh
+9. Creates SNS alerts, API and endpoint alarms, a composite health alarm, a CloudWatch dashboard and a weekly endpoint refresh (same canary policy)
 10. Creates a Bedrock guardrail when `enable_bedrock_hybrid_inference = true`, and the optional A2I review flow when `enable_human_review = true` (off by default; A2I is in maintenance mode)
 
 ## How the endpoint is managed
@@ -136,9 +136,10 @@ terraform -chdir=stack-inference output -raw frontend_cloudfront_url
 | api\_waf\_rate\_limit | Requests per client IP in any 5-minute window before the WAF rate-based rule blocks that IP. | `number` | `300` | no |
 | bedrock\_confidence\_threshold | Predictions with confidence below this route to Bedrock for additional reasoning. 0.70 per the blog. | `number` | `0.7` | no |
 | bedrock\_model\_id | Bedrock model id (inference profile) used for low-confidence hybrid reasoning. Nova Pro is multimodal and accepts the base64 image. See https://docs.aws.amazon.com/nova/latest/userguide/modalities-image-examples.html | `string` | `"us.amazon.nova-pro-v1:0"` | no |
+| canary\_size\_percent | Percentage of the new fleet that takes traffic during the canary step (1-50). Capacity comes in whole instances, so with 2 instances the canary is 1 instance, half the fleet. | `number` | `10` | no |
 | data\_capture\_input | Also capture request payloads. Off by default: drift and fairness monitoring read model output only, and Input capture stores every uploaded image. | `bool` | `false` | no |
 | data\_capture\_sampling\_percentage | Percentage of endpoint invocations written to data capture (0-100). Applies to the Terraform-managed and auto-deployed endpoint configs. | `number` | `100` | no |
-| deployment\_max\_timeout | Maximum deployment timeout in seconds (600-14400) | `number` | `3600` | no |
+| deployment\_max\_timeout | Maximum deployment time in seconds (600-28800). Must exceed the traffic shift waits plus termination\_wait\_seconds. | `number` | `3600` | no |
 | dlc\_ecr\_registry | ECR registry hostname for the AWS Deep Learning Containers. Defaults to commercial-region canonical DLC registry. Override for GovCloud/CN: see https://github.com/aws/deep-learning-containers/blob/master/available_images.md | `string` | `""` | no |
 | dlc\_source\_repository | DLC repository name to pull and patch (e.g. tensorflow-inference, pytorch-inference) | `string` | `"tensorflow-inference"` | no |
 | drift\_alarm\_period | Evaluation period (seconds) for the drift alarm. Should be >= the monitoring schedule interval (hourly = 3600) so each scheduled monitor run produces one data point. | `number` | `3600` | no |
@@ -153,10 +154,10 @@ terraform -chdir=stack-inference output -raw frontend_cloudfront_url
 | enable\_fairness\_job | Enable the scheduled fairness Processing job (Part 4). EventBridge Scheduler starts a SageMaker Processing job that joins endpoint data capture with the confirmed diagnostic outcomes clinicians upload, computes demographic parity and equalized odds per subgroup with Fairlearn, and publishes the largest disparity to CloudWatch beside the drift metric. The alarm feeds the same retrain rule. Requires data capture, so it is skipped for serverless endpoints. | `bool` | `true` | no |
 | enable\_human\_review | Opt in to Amazon A2I human review: create the review flow and let the inference Lambda route low-confidence predictions to a reviewer queue. Amazon A2I is in maintenance mode (no longer open to new customers), so this is off by default and only works in accounts that already use A2I. Requires review\_workteam\_arn for the flow definition. | `bool` | `false` | no |
 | enable\_request\_explanations | Allow POST /predict callers to ask for explanations (Part 4) with "explain": true (Grad-CAM heatmap and region Shapley values, computed on the endpoint). Requests without the field are unaffected either way. When false, a request that asks gets "explanations": {"status": "disabled"}. | `bool` | `true` | no |
-| endpoint\_initial\_instance\_count | Initial number of instances for SageMaker endpoint | `number` | `1` | no |
+| endpoint\_initial\_instance\_count | Instances in the endpoint's production variant, for the Terraform-created and auto-deployed endpoint configs. 2 by default because canary and linear traffic shifting cannot split a single instance; use 1 only with traffic\_routing\_type = ALL\_AT\_ONCE. | `number` | `2` | no |
 | endpoint\_instance\_type | Instance type for SageMaker endpoint | `string` | `"ml.m5.xlarge"` | no |
 | endpoint\_max\_capacity | Maximum number of instances for auto-scaling | `number` | `3` | no |
-| endpoint\_min\_capacity | Minimum number of instances for auto-scaling | `number` | `1` | no |
+| endpoint\_min\_capacity | Minimum number of instances for auto-scaling. 2 by default because canary and linear traffic shifting cannot split a single instance. | `number` | `2` | no |
 | explanation\_max\_evaluations | Cap on masked-image ensemble evaluations for the region Shapley estimate in one explained request. 17 is one permutation of the 4x4 regions, 32 an antithetic pair, 64 two pairs. | `number` | `32` | no |
 | explanation\_time\_budget\_ms | Time budget for the explain path on the endpoint, in milliseconds. Region Shapley skips permutations that would overrun it (the first always runs). Keep it well under API Gateway's 29 s integration timeout. | `number` | `5000` | no |
 | fairness\_alarm\_period | Evaluation period (seconds) for the fairness alarm. Should be >= the fairness schedule interval (daily = 86400) so each scheduled run produces one data point. | `number` | `86400` | no |
@@ -170,6 +171,7 @@ terraform -chdir=stack-inference output -raw frontend_cloudfront_url
 | inference\_lambda\_reserved\_concurrency | Reserved concurrent executions for the inference API Lambda. Caps blast-radius of a traffic spike on /predict and prevents starvation of other functions in the account. -1 = unreserved (account default). | `number` | `50` | no |
 | lambda\_memory\_size | Lambda function memory size in MB | `number` | `1024` | no |
 | lambda\_timeout | Lambda function timeout in seconds | `number` | `300` | no |
+| linear\_step\_percent | Percentage of the new fleet turned on per LINEAR step (10-50). | `number` | `20` | no |
 | log\_retention\_days | CloudWatch log retention in days | `number` | `14` | no |
 | max\_image\_bytes | Max size of a base64-encoded image accepted by the /predict endpoint. Images above this size return HTTP 413 without invoking SageMaker. Default 5 MB is generous for 224x224 histopathology. | `number` | `5242880` | no |
 | model\_package\_arn | Versioned ARN of the Approved model package the endpoint starts with (arn:aws:sagemaker:<region>:<account>:model-package/<group>/<version>). Seed and approve a baseline first (CI/CD baseline-model stage or stack-cicd/scripts/create\_baseline\_model.py). Later approvals are rolled out by the auto-deploy Lambda. | `string` | `""` | no |
@@ -181,8 +183,10 @@ terraform -chdir=stack-inference output -raw frontend_cloudfront_url
 | serverless\_memory\_size\_mb | Memory (MB) per serverless inference worker. Valid values: 1024, 2048, 3072, 4096, 5120, 6144. | `number` | `3072` | no |
 | state\_bucket\_region | Region of the Terraform state bucket (stack-backend-setup output state\_bucket\_region). If empty, aws\_region is used. | `string` | `""` | no |
 | target\_concurrent\_requests\_per\_model | Target concurrent in-flight requests per model container. Uses the SageMaker high-resolution metric (10s granularity) for sub-minute scale-out. | `number` | `5` | no |
-| termination\_wait\_seconds | Seconds to wait after deployment before terminating old fleet | `number` | `120` | no |
-| use\_serverless\_inference | Opt-in flag to deploy the endpoint as a SageMaker Serverless Inference<br/>variant instead of an always-on instance. Recommended for low-traffic<br/>demo/blog endpoints: scales to zero when idle and can cut the monthly<br/>bill from ~$170 to ~$5-10. Not recommended when drift-detection data<br/>capture or strict p50 latency matter - see the sagemaker-endpoint<br/>module README for the full tradeoff list. | `bool` | `false` | no |
+| termination\_wait\_seconds | Seconds to wait after the new fleet takes all traffic before the old fleet is terminated (0-3600) | `number` | `120` | no |
+| traffic\_routing\_type | Blue/green traffic shifting for endpoint updates, including approval-driven and weekly-refresh rollouts: CANARY (canary\_size\_percent of the new fleet first, then the rest), LINEAR (linear\_step\_percent per step) or ALL\_AT\_ONCE. CANARY and LINEAR need endpoint\_initial\_instance\_count and endpoint\_min\_capacity of at least 2. Serverless endpoints always use ALL\_AT\_ONCE. | `string` | `"CANARY"` | no |
+| traffic\_shift\_wait\_interval | Baking period in seconds after each traffic shift step while the rollback alarms watch the new fleet (0-3600). The alarms need about 3 minutes to fire (2 one-minute periods plus CloudWatch delay), so keep it above that. | `number` | `300` | no |
+| use\_serverless\_inference | Opt-in flag to deploy the endpoint as a SageMaker Serverless Inference<br/>variant instead of an always-on instance. Recommended for low-traffic<br/>demo/blog endpoints: scales to zero when idle and can cut the monthly<br/>bill from ~$340 (two instances) to ~$5-10. Updates then shift all<br/>traffic at once (no canary). Not recommended when drift-detection data<br/>capture or strict p50 latency matter - see the sagemaker-endpoint<br/>module README for the full tradeoff list. | `bool` | `false` | no |
 
 ## Outputs
 

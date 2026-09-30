@@ -35,7 +35,9 @@ module "s3_raw_data" {
   kms_key_arn         = module.kms.key_arn
   enable_versioning   = var.bucket_defaults.enable_versioning
   block_public_access = var.bucket_defaults.block_public_access
-  enable_eventbridge  = var.enable_auto_trigger
+  # Object Created events feed both the pipeline auto-trigger and the upload
+  # quarantine (quarantine.tf).
+  enable_eventbridge = var.enable_auto_trigger || var.enable_upload_quarantine
 }
 
 module "s3_processed_data" {

@@ -25,7 +25,9 @@ It covers the whole lifecycle:
 - a clinical quality gate and a Fairlearn fairness gate scored on the test
   split, with a failed gate stopping the pipeline,
 - governed deployment: every model registers as `PendingManualApproval`, and a
-  person's approval triggers a blue/green endpoint update with auto-rollback,
+  person's approval triggers a blue/green endpoint update that sends 10% of
+  the new fleet's capacity traffic first (canary) and rolls back
+  automatically on the error and latency alarms,
 - a public API behind AWS WAF and an API key, with optional Amazon Bedrock
   reasoning for low-confidence predictions,
 - scheduled drift (PSI) and fairness monitoring that can start retraining.
@@ -107,46 +109,55 @@ its own state locally and prints the `backend.hcl` the other stacks use.
 Creates a project KMS key, six S3 buckets (raw data, processed data, scripts,
 model artifacts, inference results, monitoring) plus an SBOM bucket by default,
 the SageMaker execution role, the Model Package Group, a Model Card, an AWS
-Budgets budget, CloudWatch dashboards, and the SageMaker pipeline with its
-EventBridge trigger. A managed MLflow tracking server (`enable_mlflow`) and a
+Budgets budget, CloudWatch dashboards, the upload quarantine Lambda, and the
+SageMaker pipeline with its EventBridge trigger. A managed MLflow tracking server (`enable_mlflow`) and a
 multi-region CloudTrail trail (`enable_cloudtrail`) are available but off by
 default.
 
 ![Training pipeline: an upload marker starts SageMaker Pipelines, which validates, preprocesses, trains three models in parallel, evaluates, builds an ensemble, runs a Fairlearn check and either registers the model as pending or fails](docs/diagrams/mlops-training-pipeline.svg)
 
-1. Uploading the `.batch_complete` marker to the data bucket fires the
+1. As each image lands under `medical_image_data/`, the upload quarantine
+   Lambda (`enable_upload_quarantine`, on by default) checks it: an allowed
+   extension (`.jpg`, `.jpeg`, `.png`), opens with Pillow as that format, and
+   at least 112 px on each side (`quarantine_min_image_size_px`). A file that
+   fails is moved to `quarantine/<original key>` with a
+   `<original key>.reason.json` next to it, and the
+   `<project_name>/DataQuality` `QuarantinedImages` metric counts it. The
+   quarantine prefix is outside the prefix the pipeline reads.
+2. Uploading the `.batch_complete` marker to the data bucket fires the
    EventBridge rule, which starts an execution with
    `RetrainingReason=data_upload`.
-2. **Validate data** (Processing job) checks image format, resolution, class
+3. **Validate data** (Processing job) checks image format, resolution, class
    balance and quality.
-3. **Preprocess** resizes images to 512 x 512 and writes train, validation and
+4. **Preprocess** resizes images to 512 x 512 and writes train, validation and
    test splits grouped by patient, so images of one patient never appear in
    more than one split.
-4. **Train** VGG16, DenseNet121 and EfficientNetV2M in parallel training jobs
+5. **Train** VGG16, DenseNet121 and EfficientNetV2M in parallel training jobs
    with two-phase transfer learning. Training images get flips, small shifts
    and rotations, and a random H&E stain jitter, because stain colour differs
    more between patients than between classes and the models otherwise learn
    colour instead of tissue structure. Training jobs run with network
    isolation by default and read ImageNet weights from the scripts bucket.
-5. **Evaluate** tunes each model's threshold on the validation split and
+6. **Evaluate** tunes each model's threshold on the validation split and
    reports its metrics on the test split.
-6. **Ensemble** combines the three models, tunes the ensemble threshold on the
+7. **Ensemble** combines the three models, tunes the ensemble threshold on the
    validation split and scores the test split at that threshold.
-7. **Fairness check** runs Fairlearn over the ensemble's own test predictions
+8. **Fairness check** runs Fairlearn over the ensemble's own test predictions
    at its tuned threshold, per magnification subgroup.
-8. **Condition** requires accuracy >= 0.85, recall >= 0.95, precision >= 0.80,
+9. **Condition** requires accuracy >= 0.85, recall >= 0.95, precision >= 0.80,
    AUC >= 0.90 and a fairness disparity <= 0.10. If every check passes, the
    ensemble is registered as `PendingManualApproval`; otherwise the execution
    ends in a Fail step and nothing is registered.
-9. Evaluation, ensemble and fairness outputs are written under
-   `<prefix>/<pipeline-execution-id>/`, so each model package points at its own
-   weights and reports, and approving an older version deploys that version.
+10. Evaluation, ensemble and fairness outputs are written under
+    `<prefix>/<pipeline-execution-id>/`, so each model package points at its
+    own weights and reports, and approving an older version deploys that
+    version.
 
 ### stack-inference
 
 Creates the patched inference image (built once at apply time, then monthly),
 the SageMaker model, endpoint configuration and endpoint (Terraform-managed,
-with blue/green deployment, auto-rollback alarms and auto-scaling), the
+with blue/green canary deployment, auto-rollback alarms and auto-scaling), the
 inference Lambda and its Pillow/NumPy layer, the API Gateway REST API with a
 usage plan, API key and WAF web ACL, the CloudFront web UI, the auto-deploy
 Lambda, the drift and fairness schedules and alarms, the retraining rule, SNS
@@ -185,7 +196,7 @@ approvals and an AWS CodeConnections connection to your GitHub repository. See
 ```
 .
 |-- stack-backend-setup/   # State bucket, state KMS key, permissions boundary (local state)
-|-- stack-training/        # Buckets, SageMaker pipeline, registry, Model Card, budget
+|-- stack-training/        # Buckets, upload quarantine, SageMaker pipeline, registry, Model Card, budget
 |-- stack-inference/       # Endpoint, Lambda, API Gateway, WAF, CloudFront, monitoring
 |-- stack-cicd/            # Optional CodePipeline and CodeBuild
 |-- modules/               # Reusable Terraform modules (terraform-aws-*)
@@ -215,8 +226,10 @@ approvals and an AWS CodeConnections connection to your GitHub repository. See
   quota in Service Quotas first; new accounts often have 0.
 - SageMaker Processing: `ml.m5.4xlarge`, `ml.m5.large` and `ml.t3.medium` for
   processing job usage.
-- SageMaker hosting: one `ml.m5.xlarge` for endpoint usage (up to three with
-  the default auto-scaling maximum).
+- SageMaker hosting: two `ml.m5.xlarge` for endpoint usage (up to three with
+  the default auto-scaling maximum), plus room for the second fleet during a
+  blue/green update: a rollout runs the old and new fleets side by side, so
+  allow at least five.
 
 **Amazon Bedrock**
 
@@ -342,6 +355,12 @@ uploader writes the `.batch_complete` marker that starts the pipeline.
 ./scripts/data_uploader.sh data/breakhis
 ```
 
+The upload quarantine Lambda checks every file as it lands and moves bad ones
+to `quarantine/` in the raw data bucket, each with a `.reason.json`
+([stack-training README](stack-training/README.md#upload-quarantine)). The
+pipeline's validation step checks the images again, so a file the Lambda has
+not reached when the marker starts the run still fails validation.
+
 Expect the gates to fail on BreakHis with the default models. BreakHis has 82
 patients, so the patient-grouped test split holds 13 of them (4 benign), and a
 single patient the models get wrong moves recall or precision by several
@@ -355,7 +374,7 @@ needs more patients or a stronger model, not lower thresholds.
 When the execution registers a version, check its metrics in the registry and
 approve it with the same `update-model-package` command. The approval event
 triggers the auto-deploy Lambda, which rolls the new version onto the endpoint
-with a blue/green update. Keep the file names: the patient-grouped split and
+with a blue/green canary update. Keep the file names: the patient-grouped split and
 the fairness gate read the BreakHis patient id and magnification from them.
 
 ## Deploy through CI/CD
@@ -518,8 +537,19 @@ and meters callers; it does not authenticate them (see [SECURITY.md](SECURITY.md
 5. The approval state change triggers an EventBridge rule that invokes the
    auto-deploy Lambda.
 6. The Lambda creates a model and endpoint configuration for the approved
-   package and updates the endpoint. SageMaker shifts traffic blue/green and
-   rolls back automatically if the endpoint's 5XX or model-error alarm fires.
+   package and updates the endpoint with the stack's deployment policy.
+   SageMaker starts a new (green) fleet and, by default, routes 10% of its
+   capacity (`canary_size_percent`, rounded up to one of the two instances)
+   to it for `traffic_shift_wait_interval` seconds (300). If neither the
+   error alarm (5XX or model errors) nor the latency alarm fires, the rest
+   of the traffic shifts, the old fleet is kept for
+   `termination_wait_seconds` (120) more and then terminated. An alarm at any
+   point rolls all traffic back to the old fleet. The weekly endpoint refresh
+   uses the same policy. `traffic_routing_type` selects `CANARY` (default),
+   `LINEAR` (`linear_step_percent` per step) or `ALL_AT_ONCE`; canary and
+   linear need at least two instances (`endpoint_initial_instance_count` and
+   `endpoint_min_capacity`, both 2 by default), and serverless endpoints
+   always shift all at once.
 7. Failed asynchronous invocations of the Lambda go to an Amazon SQS
    dead-letter queue, and a queue-depth alarm notifies the SNS alerts topic.
 
@@ -588,7 +618,7 @@ set `vpc_config` in `stack-training`). Estimate your configuration with the
 
 | Resource | Billed | Notes |
 | --- | --- | --- |
-| SageMaker real-time endpoint (`ml.m5.xlarge`, 1 to 3 instances) | Every hour it runs | The main standing cost, about $170 per month for one instance in `us-east-1` (the estimate in the variable descriptions; check your Region). `use_serverless_inference = true` scales to zero but disables data capture and monitoring |
+| SageMaker real-time endpoint (`ml.m5.xlarge`, 2 to 3 instances) | Every hour it runs | The main standing cost, about $170 per instance per month in `us-east-1`, so about $340 for the default two (check your Region). Two is the minimum for canary traffic shifting; with `traffic_routing_type = "ALL_AT_ONCE"` you can run one. Both fleets are billed while a blue/green update runs. `use_serverless_inference = true` scales to zero but disables data capture and monitoring |
 | SageMaker training jobs | Per run | 3 jobs per execution; CPU `ml.c5.2xlarge` in the shipped tfvars, GPU if you change it. Managed Spot is available (`enable_managed_spot_training`) |
 | SageMaker Processing jobs | Per run | 5 per pipeline execution, plus the hourly drift job and daily fairness job (`ml.t3.medium`, capped at 900 s) |
 | AWS WAF | Monthly per web ACL and rule, plus per request | One regional web ACL with three rules (`api_enable_waf`) |
@@ -652,6 +682,8 @@ Custom CloudWatch metrics cannot be deleted and expire on their own.
 | `make deploy-training` fails with `ResourceAlreadyExistsException` for `/aws/sagemaker/ProcessingJobs` or `/aws/sagemaker/TrainingJobs` | SageMaker or an earlier deployment already created these account-wide log groups. Import them and apply again: `terraform -chdir=stack-training import 'module.cloudwatch_monitoring.aws_cloudwatch_log_group.processing_jobs[0]' /aws/sagemaker/ProcessingJobs` (and the same for `training_jobs[0]` with `/aws/sagemaker/TrainingJobs`), with the same `TF_VAR_*` values `make deploy-training` sets. The stack then owns them, so a destroy deletes them. |
 | `make seed-baseline` fails on `import tensorflow` | Install `boto3` and `tensorflow==2.19.0` into the Python that `python3` resolves to. |
 | API returns 403 | Missing or wrong `x-api-key`, or the WAF rate rule blocked your IP. |
+| Uploaded images are missing from `medical_image_data/` | The upload quarantine Lambda moved them. Each one is under `quarantine/<original key>` in the raw data bucket with a `.reason.json` naming the failed check (extension, does not open, wrong format for its extension, or smaller than `quarantine_min_image_size_px`). Fix the file and upload it again. |
+| `make deploy-inference` plan fails with `traffic shifting sends ... of the new fleet first` | Canary and linear traffic shifting need at least two instances. Keep `endpoint_initial_instance_count` and `endpoint_min_capacity` at 2 or more, or set `traffic_routing_type = "ALL_AT_ONCE"` to run one instance. |
 
 ## Security
 

@@ -26,6 +26,12 @@ variable "endpoint_instance_type" {
   default     = "ml.m5.xlarge"
 }
 
+variable "endpoint_initial_instance_count" {
+  description = "Instance count of the production variant in the endpoint configs the Lambda creates (real-time mode). Must match the endpoint module: canary and linear traffic shifting need at least 2."
+  type        = number
+  default     = 1
+}
+
 variable "data_capture_sampling_percentage" {
   description = "Percentage of endpoint invocations captured for drift detection. Must match the endpoint module."
   type        = number
@@ -46,6 +52,27 @@ variable "sagemaker_role_arn" {
 variable "monitoring_bucket" {
   description = "Name of the monitoring S3 bucket for data capture"
   type        = string
+}
+
+################################################################################
+# Deployment policy
+################################################################################
+
+variable "deployment_config_json" {
+  description = "UpdateEndpoint DeploymentConfig JSON (blue/green traffic routing and auto-rollback alarms), normally the endpoint module's deployment_config_json output. The Lambda sends it with every UpdateEndpoint so approvals roll out with the same canary and rollback policy as the endpoint. Empty = RetainDeploymentConfig (reuse the endpoint's last deployment config)."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.deployment_config_json == "" || can(jsondecode(var.deployment_config_json).BlueGreenUpdatePolicy)
+    error_message = "deployment_config_json must be empty or a JSON DeploymentConfig with a BlueGreenUpdatePolicy."
+  }
+}
+
+variable "rollback_alarm_arns" {
+  description = "ARNs of the auto-rollback alarms named in deployment_config_json. The Lambda role gets cloudwatch:DescribeAlarms on them. Empty = no grant."
+  type        = list(string)
+  default     = []
 }
 
 ################################################################################

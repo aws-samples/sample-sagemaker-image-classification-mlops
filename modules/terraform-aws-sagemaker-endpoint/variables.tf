@@ -184,20 +184,68 @@ variable "tags" {
 # Deployment
 ################################################################################
 
-variable "traffic_shift_wait_interval" {
-  description = "Wait interval in seconds between each linear traffic shift step"
+variable "traffic_routing_type" {
+  description = "How the blue/green update shifts traffic to the new fleet: CANARY (canary_size_percent first, then the rest), LINEAR (linear_step_percent per step) or ALL_AT_ONCE. CANARY and LINEAR need at least 2 instances (initial_instance_count and min_capacity). Serverless variants always use ALL_AT_ONCE."
+  type        = string
+  default     = "CANARY"
+
+  validation {
+    condition     = contains(["ALL_AT_ONCE", "CANARY", "LINEAR"], var.traffic_routing_type)
+    error_message = "traffic_routing_type must be ALL_AT_ONCE, CANARY or LINEAR."
+  }
+}
+
+variable "canary_size_percent" {
+  description = "Percentage of the new fleet's capacity that takes traffic during the canary step (CAPACITY_PERCENT). SageMaker allows at most 50%. Used when traffic_routing_type = CANARY."
   type        = number
-  default     = 60
+  default     = 10
+
+  validation {
+    condition     = var.canary_size_percent >= 1 && var.canary_size_percent <= 50 && floor(var.canary_size_percent) == var.canary_size_percent
+    error_message = "canary_size_percent must be a whole number from 1 to 50."
+  }
+}
+
+variable "linear_step_percent" {
+  description = "Percentage of the new fleet's capacity turned on per step (CAPACITY_PERCENT). SageMaker allows 10-50%. Used when traffic_routing_type = LINEAR."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.linear_step_percent >= 10 && var.linear_step_percent <= 50 && floor(var.linear_step_percent) == var.linear_step_percent
+    error_message = "linear_step_percent must be a whole number from 10 to 50."
+  }
+}
+
+variable "traffic_shift_wait_interval" {
+  description = "Baking period in seconds after each traffic shift step (the canary step, or each linear step) while the rollback alarms watch the new fleet (0-3600). Keep it longer than the alarms need to fire: 2 one-minute periods plus CloudWatch delay."
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.traffic_shift_wait_interval >= 0 && var.traffic_shift_wait_interval <= 3600
+    error_message = "traffic_shift_wait_interval must be between 0 and 3600 seconds."
+  }
 }
 
 variable "termination_wait_seconds" {
-  description = "Seconds to wait after deployment before terminating old fleet"
+  description = "Seconds to wait after the new fleet takes all traffic before the old fleet is terminated (0-3600). The rollback alarms keep watching during this final baking period."
   type        = number
   default     = 120
+
+  validation {
+    condition     = var.termination_wait_seconds >= 0 && var.termination_wait_seconds <= 3600
+    error_message = "termination_wait_seconds must be between 0 and 3600 seconds."
+  }
 }
 
 variable "deployment_max_timeout" {
-  description = "Maximum deployment timeout in seconds (600-14400)"
+  description = "Maximum deployment time in seconds (600-28800). Must exceed the total of the traffic shift waits and termination_wait_seconds."
   type        = number
   default     = 3600
+
+  validation {
+    condition     = var.deployment_max_timeout >= 600 && var.deployment_max_timeout <= 28800
+    error_message = "deployment_max_timeout must be between 600 and 28800 seconds."
+  }
 }

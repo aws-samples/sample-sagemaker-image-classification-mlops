@@ -6,11 +6,13 @@
 Auto-deploy handler - creates a new SageMaker endpoint config when a model is
 approved in the Model Registry and points the endpoint at it.
 
-SageMaker runs the blue/green rollout and auto-rollback natively using the
-`deployment_config` already declared on the endpoint (see
-`modules/terraform-aws-sagemaker-endpoint/main.tf`). This Lambda's only job is
-to build the new model + endpoint-config and call UpdateEndpoint; SageMaker
-handles the rest.
+SageMaker runs the blue/green rollout and auto-rollback natively. This
+Lambda builds the new model + endpoint-config and calls UpdateEndpoint with
+DEPLOYMENT_CONFIG: the endpoint module's traffic policy (canary by default)
+and auto-rollback alarms as JSON (the module's deployment_config_json output,
+see `modules/terraform-aws-sagemaker-endpoint/main.tf`). Without
+DEPLOYMENT_CONFIG it falls back to RetainDeploymentConfig, which reuses the
+endpoint's last deployment config.
 
 If SERVING_IMAGE_URI is set, the new model runs on that image (the patched
 image, pinned by digest), the same image the Terraform-managed model uses; the
@@ -46,6 +48,56 @@ DEFAULT_DRIFT_BASELINE_KEY = "monitoring/baselines/output-only/statistics.json"
 # UpdateEndpoint unless the endpoint is InService, so we skip (and let the event
 # retry) rather than create orphaned model/config resources we can't attach.
 _DEPLOYABLE_STATUS = "InService"
+
+_ROUTING_TYPES = {"ALL_AT_ONCE", "CANARY", "LINEAR"}
+
+
+def deployment_config_from_env():
+    """DeploymentConfig from DEPLOYMENT_CONFIG, or None when it is not set.
+
+    Raises ValueError on a config UpdateEndpoint would reject, before any
+    model or endpoint config is created.
+    """
+    raw = os.environ.get("DEPLOYMENT_CONFIG", "").strip()
+    if not raw:
+        return None
+    config = json.loads(raw)
+    routing = config.get("BlueGreenUpdatePolicy", {}).get("TrafficRoutingConfiguration", {})
+    routing_type = routing.get("Type")
+    if routing_type not in _ROUTING_TYPES:
+        raise ValueError(f"DEPLOYMENT_CONFIG has unknown traffic routing type {routing_type!r}")
+    size_key = {"CANARY": "CanarySize", "LINEAR": "LinearStepSize"}.get(routing_type)
+    if size_key and size_key not in routing:
+        raise ValueError(f"DEPLOYMENT_CONFIG {routing_type} routing needs {size_key}")
+    if not config.get("AutoRollbackConfiguration", {}).get("Alarms"):
+        raise ValueError("DEPLOYMENT_CONFIG has no auto-rollback alarms")
+    return config
+
+
+def serverless_deployment_config(config):
+    """ALL_AT_ONCE version of `config` for a serverless variant.
+
+    Canary and linear sizes are fractions of an instance fleet, so the sample
+    keeps serverless endpoints on all-at-once shifting, as the endpoint module
+    does. The rollback alarms and waits are kept.
+    """
+    policy = dict(config["BlueGreenUpdatePolicy"])
+    routing = policy["TrafficRoutingConfiguration"]
+    policy["TrafficRoutingConfiguration"] = {
+        "Type": "ALL_AT_ONCE",
+        "WaitIntervalInSeconds": routing.get("WaitIntervalInSeconds", 0),
+    }
+    return {**config, "BlueGreenUpdatePolicy": policy}
+
+
+def update_endpoint_request(endpoint_name, config_name, deployment_config):
+    """UpdateEndpoint kwargs: the explicit deployment config, else retain the last one."""
+    request = {"EndpointName": endpoint_name, "EndpointConfigName": config_name}
+    if deployment_config is None:
+        request["RetainDeploymentConfig"] = True
+    else:
+        request["DeploymentConfig"] = deployment_config
+    return request
 
 
 def _build_container(model_package_arn):
@@ -192,7 +244,7 @@ def _create_model_and_config(
         production_variant = {
             "VariantName": "AllTraffic",
             "ModelName": model_name,
-            "InitialInstanceCount": 1,
+            "InitialInstanceCount": int(os.environ.get("INITIAL_INSTANCE_COUNT", "1")),
             "InstanceType": instance_type,
             "InitialVariantWeight": 1.0,
         }
@@ -270,6 +322,12 @@ def lambda_handler(event, _context):
     instance_type = os.environ.get("INSTANCE_TYPE", "ml.m5.xlarge")
     data_capture_sampling = int(os.environ.get("DATA_CAPTURE_SAMPLING_PERCENTAGE", "100"))
 
+    # Parse the deployment policy first: a bad value fails here, before the
+    # model and endpoint config exist.
+    deployment_config = deployment_config_from_env()
+    if deployment_config and os.environ.get("USE_SERVERLESS_INFERENCE", "false").lower() == "true":
+        deployment_config = serverless_deployment_config(deployment_config)
+
     # UpdateEndpoint only works on an InService endpoint. If the endpoint is
     # mid-deploy (e.g. a concurrent approval or the weekly refresher is rolling
     # it), don't create resources we can't attach - raise so the event retries
@@ -296,16 +354,17 @@ def lambda_handler(event, _context):
         data_capture_sampling,
     )
 
-    # RetainDeploymentConfig reuses the endpoint's declared deployment_config
-    # (blue/green + auto-rollback, modules/terraform-aws-sagemaker-endpoint/main.tf).
-    # The API default is False, which would update without it.
-    logger.info(f"Updating endpoint {endpoint_name} -> {config_name}")
+    # Send the canary/linear policy and rollback alarms explicitly. Without
+    # either DeploymentConfig or RetainDeploymentConfig=True the update would
+    # run without auto-rollback.
+    routing = (
+        deployment_config["BlueGreenUpdatePolicy"]["TrafficRoutingConfiguration"]["Type"]
+        if deployment_config
+        else "retained"
+    )
+    logger.info(f"Updating endpoint {endpoint_name} -> {config_name} (traffic routing {routing})")
     try:
-        sm.update_endpoint(
-            EndpointName=endpoint_name,
-            EndpointConfigName=config_name,
-            RetainDeploymentConfig=True,
-        )
+        sm.update_endpoint(**update_endpoint_request(endpoint_name, config_name, deployment_config))
     except Exception:
         # Don't leak the just-created model + config if the update fails;
         # otherwise every retry stacks another orphaned pair toward the
