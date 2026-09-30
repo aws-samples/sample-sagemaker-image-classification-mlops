@@ -238,6 +238,12 @@ resource "aws_api_gateway_gateway_response" "cors" {
   response_parameters = {
     "gatewayresponse.header.Access-Control-Allow-Origin" = local.cors_origin_header
   }
+
+  # API Gateway fills in this default template when none is set; declaring it
+  # stops a perpetual diff that changes the deployment trigger mid-apply.
+  response_templates = {
+    "application/json" = "{\"message\":$context.error.messageString}"
+  }
 }
 
 ################################################################################

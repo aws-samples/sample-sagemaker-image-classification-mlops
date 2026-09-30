@@ -26,6 +26,7 @@ from collections.abc import Callable
 
 import tensorflow as tf
 from spot_checkpoint import checkpoint_callback, resume_or_new
+from stain_augment import make_stain_augmenter
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from training_config import CONFIG
@@ -91,7 +92,8 @@ def build_data_generators(train_dir: str, input_size: int, val_dir: str | None =
     The loader resizes with KERAS_INTERPOLATION and normalises with the shared
     imagenet_normalize, the same transform mlops_common.preprocess applies at
     evaluation and serving time. preprocessing_function runs after
-    augmentation, so it replaces `rescale` rather than adding to it.
+    augmentation, so it replaces `rescale` rather than adding to it. Training
+    images get the HED stain jitter first; validation images are left as is.
     """
     aug = CONFIG["augmentation"]
     train_cfg = CONFIG["training"]
@@ -100,13 +102,19 @@ def build_data_generators(train_dir: str, input_size: int, val_dir: str | None =
     if not use_val_channel:
         logger.warning("No validation channel; using validation_split=%s of the train split", split)
 
+    stain = make_stain_augmenter(aug["stain_sigma"], seed=DEFAULT_SEED)
+
+    def train_transform(image):
+        return imagenet_normalize(stain(image))
+
     train_datagen = ImageDataGenerator(
-        preprocessing_function=imagenet_normalize,
+        preprocessing_function=train_transform,
         rotation_range=aug["rotation_range"],
         width_shift_range=aug["width_shift_range"],
         height_shift_range=aug["height_shift_range"],
         brightness_range=aug["brightness_range"],
         horizontal_flip=aug["horizontal_flip"],
+        vertical_flip=aug["vertical_flip"],
         fill_mode=aug["fill_mode"],
         cval=aug.get("cval", 0),
         validation_split=split or 0.0,
@@ -132,7 +140,23 @@ def build_data_generators(train_dir: str, input_size: int, val_dir: str | None =
         val_gen = val_datagen.flow_from_directory(
             train_dir, shuffle=False, subset="validation", **common
         )
+    for gen in (train_gen, val_gen):
+        use_loader_threads(gen)
     return train_gen, val_gen
+
+
+def use_loader_threads(generator) -> None:
+    """Decode and augment batches on every vCPU instead of one.
+
+    A Keras directory iterator loads images on the training thread by default,
+    which left the GPU idle most of each step (5 to 6 s per batch of 32).
+    Threads are enough: PIL decoding and the numpy augmentation release the GIL.
+    """
+    try:
+        generator.workers = max(1, os.cpu_count() or 1)
+        generator.use_multiprocessing = False
+    except AttributeError:
+        logger.warning("This Keras version cannot set loader workers; loading on one thread")
 
 
 def compute_class_weight(labels) -> dict:
@@ -290,11 +314,11 @@ def run_two_phase_fit(
     else:
         phase2_initial_epoch = initial_epoch
 
+    phase1_weights = model.get_weights()
+    phase1_best = min(history1.get("val_loss") or [float("inf")])
+
     # Phase 2: unfreeze the top N base layers, recompile at the lower rate.
-    base.trainable = True
-    if phase2_unfreeze_layers < len(base.layers):
-        for layer in base.layers[:-phase2_unfreeze_layers]:
-            layer.trainable = False
+    unfreeze_top_layers(base, phase2_unfreeze_layers)
     logger.info(
         "=== %s Phase 2 (top %d layers unfrozen, lr=%.2e) epochs %d->%d ===",
         model_name,
@@ -319,7 +343,37 @@ def run_two_phase_fit(
     )
     history2 = _extract_history(h2)
 
+    # EarlyStopping restores the best epoch within each phase only. If fine-tuning
+    # never beat the frozen-backbone head on validation loss, keep the head.
+    phase2_best = min(history2.get("val_loss") or [float("inf")])
+    if history1 and phase1_best < phase2_best:
+        logger.info(
+            "%s Phase 2 best val_loss %.4f is worse than Phase 1 %.4f; keeping Phase 1 weights",
+            model_name,
+            phase2_best,
+            phase1_best,
+        )
+        model.set_weights(phase1_weights)
+
     return _merge_histories(history1, history2) if history1 else history2
+
+
+def unfreeze_top_layers(base, count: int) -> None:
+    """Make the top `count` backbone layers trainable, except BatchNormalization.
+
+    An unfrozen BatchNormalization layer switches to batch statistics and
+    starts overwriting its ImageNet moving averages with batches of 32; in the
+    2026-09 runs that dropped DenseNet121 and EfficientNet training accuracy at
+    the start of Phase 2, which then ended with a higher validation loss than
+    Phase 1. Keeping
+    those layers frozen (the Keras fine-tuning guidance) avoids it.
+    """
+    base.trainable = True
+    top = base.layers[-count:] if 0 < count < len(base.layers) else base.layers
+    top_ids = {id(layer) for layer in top}
+    for layer in base.layers:
+        is_bn = isinstance(layer, tf.keras.layers.BatchNormalization)
+        layer.trainable = id(layer) in top_ids and not is_bn
 
 
 def validate_outputs(model_dir: str, model_name: str) -> bool:

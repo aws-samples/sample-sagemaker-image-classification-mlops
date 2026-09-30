@@ -120,22 +120,26 @@ TRAINING_PARAMS = {
     "mixed_precision": False,
 }
 
-# Data augmentation parameters. Medical-safe values from the blog: each one maps
-# to a real-world imaging variation and must preserve diagnostic features.
-#   rotation_range=15      - slight patient-positioning variation (beyond 15 degrees is
-#                            clinically unrealistic)
+# Data augmentation parameters. Each one maps to a real-world variation and
+# must preserve diagnostic features.
+#   rotation_range=15      - slight rotation of the field of view
 #   width/height_shift=0.05 - minor framing differences
-#   brightness=(0.8, 1.2)  - +/-20% scanner-calibration exposure variation
-#   horizontal_flip=True   - bilateral anatomy (left breast mirrors right)
-#   vertical_flip omitted  - vertically inverted images don't occur in practice
+#   brightness=(0.8, 1.2)  - +/-20% illumination and scanner-calibration variation
+#   horizontal/vertical flip - a microscope field has no up or down, so both
+#                            mirror images are real tissue views
+#   stain_sigma=0.2        - per-image HED stain jitter (stain_augment.py); stain
+#                            intensity varies more between BreakHis patients than
+#                            between classes, so without it the models learn colour
 AUGMENTATION_PARAMS = {
     "rotation_range": 15,
     "width_shift_range": 0.05,
     "height_shift_range": 0.05,
     "brightness_range": (0.8, 1.2),
     "horizontal_flip": True,
+    "vertical_flip": True,
     "fill_mode": "constant",
     "cval": 0,
+    "stain_sigma": 0.2,
 }
 
 # SageMaker metric logging

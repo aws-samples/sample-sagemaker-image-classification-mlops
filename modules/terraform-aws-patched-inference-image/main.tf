@@ -226,10 +226,11 @@ locals {
     RUN python3 -m pip install --break-system-packages --no-cache-dir --upgrade pip setuptools wheel || true
     # Upgrade every outdated third-party package except the TF stack itself
     # (TF is pinned by the DLC and should be left alone to preserve inference
-    # behaviour). This runs best-effort - a dependency that refuses to upgrade
-    # is not a show-stopper.
+    # behaviour). falcon stays at the DLC's version too: the DLC's Python
+    # service still sets res.body, which falcon 4 removed. This runs
+    # best-effort - a dependency that refuses to upgrade is not a show-stopper.
     RUN python3 -m pip list --outdated --format=json 2>/dev/null \
-        | python3 -c "import json,sys,subprocess; pkgs=[p['name'] for p in json.load(sys.stdin) if p['name'] not in ('tensorflow','tensorflow-cpu','tensorflow-gpu','tensorflow-io-gcs-filesystem','tensorflow-metadata','tensorflow-serving-api')]; subprocess.run(['python3','-m','pip','install','--break-system-packages','--no-cache-dir','--upgrade']+pkgs, check=False) if pkgs else None" \
+        | python3 -c "import json,sys,subprocess; pkgs=[p['name'] for p in json.load(sys.stdin) if p['name'] not in ('tensorflow','tensorflow-cpu','tensorflow-gpu','tensorflow-io-gcs-filesystem','tensorflow-metadata','tensorflow-serving-api','falcon')]; subprocess.run(['python3','-m','pip','install','--break-system-packages','--no-cache-dir','--upgrade']+pkgs, check=False) if pkgs else None" \
         || true
     DOCKER_EOF
   EOT

@@ -20,6 +20,7 @@ scripts/
 |   |-- vgg16_trainer.py
 |   |-- densenet121_trainer.py
 |   |-- efficientnet_trainer.py
+|   |-- stain_augment.py    # H&E stain jitter for training images
 |   |-- training_config.py
 |   `-- training_metrics.py
 |-- evaluation/             # Per-model threshold on validation, metrics on test

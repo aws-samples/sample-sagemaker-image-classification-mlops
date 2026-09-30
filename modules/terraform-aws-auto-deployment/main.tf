@@ -162,10 +162,19 @@ resource "aws_iam_role_policy" "auto_deploy_lambda_policy" {
       # The endpoint configs it creates carry the project CMK (KmsKeyId);
       # SageMaker needs a grant from the caller of UpdateEndpoint to attach
       # the encrypted volume.
+      # DescribeKey is a direct call from CreateEndpointConfig, so it cannot
+      # carry the GrantIsForAWSResource condition that scopes CreateGrant.
       var.volume_kms_key_arn == null ? [] : [
         {
           Effect   = "Allow"
-          Action   = ["kms:CreateGrant", "kms:DescribeKey"]
+          Action   = ["kms:DescribeKey"]
+          Resource = var.volume_kms_key_arn
+        }
+      ],
+      var.volume_kms_key_arn == null ? [] : [
+        {
+          Effect   = "Allow"
+          Action   = ["kms:CreateGrant"]
           Resource = var.volume_kms_key_arn
           Condition = {
             Bool = { "kms:GrantIsForAWSResource" = "true" }

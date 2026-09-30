@@ -123,8 +123,11 @@ default.
    test splits grouped by patient, so images of one patient never appear in
    more than one split.
 4. **Train** VGG16, DenseNet121 and EfficientNetV2M in parallel training jobs
-   with two-phase transfer learning. Training jobs run with network isolation
-   by default and read ImageNet weights from the scripts bucket.
+   with two-phase transfer learning. Training images get flips, small shifts
+   and rotations, and a random H&E stain jitter, because stain colour differs
+   more between patients than between classes and the models otherwise learn
+   colour instead of tissue structure. Training jobs run with network
+   isolation by default and read ImageNet weights from the scripts bucket.
 5. **Evaluate** tunes each model's threshold on the validation split and
    reports its metrics on the test split.
 6. **Ensemble** combines the three models, tunes the ensemble threshold on the
@@ -338,6 +341,16 @@ uploader writes the `.batch_complete` marker that starts the pipeline.
 ./ops-scripts/data_download_breakhis.sh data/breakhis
 ./scripts/data_uploader.sh data/breakhis
 ```
+
+Expect the gates to fail on BreakHis with the default models. BreakHis has 82
+patients, so the patient-grouped test split holds 13 of them (4 benign), and a
+single patient the models get wrong moves recall or precision by several
+points. In a September 2026 run the ensemble scored accuracy 0.76, recall 0.90,
+precision 0.76 and AUC 0.79 on the test split (AUC 0.96 on validation), so the
+pipeline stopped at the Fail step and registered nothing. Most errors came
+from three test patients whose stain colour looks like the other class. Treat
+BreakHis as a way to exercise the pipeline; a model that clears the gates
+needs more patients or a stronger model, not lower thresholds.
 
 When the execution registers a version, check its metrics in the registry and
 approve it with the same `update-model-package` command. The approval event

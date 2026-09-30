@@ -73,9 +73,9 @@ put_common fairness
 
 echo "Building training tarballs"
 # Shared modules bundled with every trainer: the architecture script, the
-# common training loop, config, metrics, spot checkpoint helpers and
-# mlops_common (image transform, seeds).
-COMMON_MODULES=(_common.py training_metrics.py training_config.py spot_checkpoint.py)
+# common training loop, config, metrics, spot checkpoint helpers, stain
+# augmentation and mlops_common (image transform, seeds).
+COMMON_MODULES=(_common.py training_metrics.py training_config.py spot_checkpoint.py stain_augment.py)
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 cp -R mlops_common "$STAGE/"
