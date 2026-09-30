@@ -386,7 +386,7 @@ resource "aws_sagemaker_model_card" "medical_image" {
       explanations_for_risk_rating       = "Predictions influence clinical decisions; a missed malignant case (false negative) is high-consequence, hence the recall-weighted clinical quality gate."
     }
     additional_information = {
-      ethical_considerations      = "Fairness monitored via Fairlearn subgroup bias reports; low-confidence cases route to human review."
+      ethical_considerations      = "Fairness is checked with Fairlearn subgroup metrics in the pipeline gate and a scheduled monitoring job; low-confidence predictions are flagged in the API response for clinician review."
       caveats_and_recommendations = "Validate thresholds with your clinical team. Do not deploy without review-board approval (models register as PendingManualApproval)."
     }
   })
