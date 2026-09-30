@@ -87,7 +87,7 @@ resource "aws_scheduler_schedule" "drift_job" {
     input = jsonencode({
       # Job names must be unique per run; <aws.scheduler.scheduled-time> is
       # substituted by the Scheduler at invocation.
-      ProcessingJobName = "${var.project_name}-drift-<aws.scheduler.execution-id>"
+      ProcessingJobName = "${local.scheduled_job_prefix}-drift-<aws.scheduler.execution-id>"
       RoleArn           = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
 
       AppSpecification = {
@@ -259,7 +259,7 @@ resource "aws_scheduler_schedule" "fairness_job" {
     input = jsonencode({
       # Job names must be unique per run; <aws.scheduler.execution-id> is
       # substituted by the Scheduler at invocation.
-      ProcessingJobName = "${var.project_name}-fairness-<aws.scheduler.execution-id>"
+      ProcessingJobName = "${local.scheduled_job_prefix}-fair-<aws.scheduler.execution-id>"
       RoleArn           = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
 
       AppSpecification = {
@@ -517,3 +517,11 @@ resource "aws_bedrock_guardrail" "hybrid" {
     }
   }
 }
+
+locals {
+  # EventBridge Scheduler substitutes <aws.scheduler.execution-id> with a
+  # 36-character UUID, and SageMaker caps ProcessingJobName at 63 characters.
+  # 20 + "-drift-" (7) + 36 = 63, so the scheduled jobs can always be created.
+  scheduled_job_prefix = substr(var.project_name, 0, 20)
+}
+

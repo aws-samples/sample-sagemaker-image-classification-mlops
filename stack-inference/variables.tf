@@ -4,16 +4,6 @@
 variable "project_name" {
   description = "Name of the project. Prefixes every resource name."
   type        = string
-
-  # The scheduled drift and fairness jobs build a ProcessingJobName as
-  # "<project_name>-fairness-<aws.scheduler.execution-id>". SageMaker caps that
-  # name at 63 characters and the Scheduler substitutes a ~16-character id, so a
-  # long project name would only fail when the schedule fires - the apply would
-  # succeed and the job would then silently never run. Fail at plan time instead.
-  validation {
-    condition     = length(var.project_name) <= 38
-    error_message = "project_name must be 38 characters or fewer: it is prefixed onto the scheduled fairness job's ProcessingJobName, which SageMaker caps at 63 characters after EventBridge Scheduler substitutes a ~16-character execution id."
-  }
 }
 
 variable "environment" {
