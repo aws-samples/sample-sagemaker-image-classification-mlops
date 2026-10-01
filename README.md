@@ -57,7 +57,11 @@ and refresh the endpoint weekly.
 
 ## Architecture
 
-![Overall architecture: data and training, serving, monitoring and CI/CD groups inside the AWS Cloud, with KMS, CloudTrail and IAM across all stacks](docs/diagrams/mlops-architecture.svg)
+![Healthcare MLOps architecture: images from an on-premises hospital PACS land in a raw S3 bucket, an EventBridge event runs a validation Lambda, and validated data feeds SageMaker Processing, Training and Model Evaluation under SageMaker Pipelines; a quality gate registers the model in the Model Registry for clinical review, approved models serve from SageMaker endpoints behind API Gateway, and monitoring jobs, CloudWatch alarms and an EventBridge rule start automated retraining, with IAM, KMS, CloudTrail, VPC and Cognito in a security band](docs/diagrams/mlops-architecture.svg)
+
+Hospital PACS is shown as the upstream image source (the sample takes JPEG or
+PNG uploads to S3), the validation Lambda is the upload quarantine Lambda, and
+Amazon VPC, Amazon Cognito and AWS CloudTrail are optional settings.
 
 1. A data batch lands in the image data bucket. When the upload finishes, a
    `.batch_complete` marker object makes an Amazon EventBridge rule start the
@@ -114,7 +118,7 @@ SageMaker pipeline with its EventBridge trigger. A managed MLflow tracking serve
 multi-region CloudTrail trail (`enable_cloudtrail`) are available but off by
 default.
 
-![Training pipeline: an upload marker starts SageMaker Pipelines, which validates, preprocesses, trains three models in parallel, evaluates, builds an ensemble, runs a Fairlearn check and either registers the model as pending or fails](docs/diagrams/mlops-training-pipeline.svg)
+![Training pipeline: a separate EventBridge rule sends each upload to a quarantine Lambda that sets aside bad images, and an upload marker starts SageMaker Pipelines, which validates, preprocesses, trains three models in parallel, evaluates, builds an ensemble, runs a Fairlearn check and either registers the model as pending or fails](docs/diagrams/mlops-training-pipeline.svg)
 
 1. As each image lands under `medical_image_data/`, the upload quarantine
    Lambda (`enable_upload_quarantine`, on by default) checks it: an allowed
@@ -526,7 +530,11 @@ and meters callers; it does not authenticate them (see [SECURITY.md](SECURITY.md
 
 ## Monitoring and retraining
 
-![Retraining loop: a drift or fairness alarm makes an EventBridge rule start the pipeline with RetrainingReason, the new version waits in the registry for a reviewer, and the approval triggers the auto-deploy Lambda that runs a blue/green update with rollback](docs/diagrams/mlops-retraining-loop.svg)
+![Closed-loop monitoring and retraining: in the Detect group the SageMaker endpoint captures data to S3, a scheduled processing job analyzes it and sends a PSI metric to a CloudWatch alarm; in the Respond group the alarm makes EventBridge trigger the SageMaker pipeline, the pipeline registers a new model in the Model Registry, and the model is deployed back to the endpoint](docs/diagrams/mlops-retraining-loop.svg)
+
+The figure leaves out the review step: a reviewer approves the new version in
+the Model Registry before the auto-deploy Lambda rolls it out, and the
+fairness alarm starts retraining the same way as the drift alarm.
 
 1. A drift or fairness alarm in CloudWatch changes state to ALARM.
 2. An EventBridge rule starts the SageMaker pipeline with
@@ -583,6 +591,12 @@ exist. The drift and fairness jobs need data capture, so they are skipped when
 `use_serverless_inference = true`.
 
 ## Responsible AI
+
+![Bias pipeline: preprocess, train, evaluate against accuracy gates, then a bias check against a fairness gate; a model that passes both is registered in the Model Registry as PendingManualApproval with accuracy and fairness metrics, an accuracy failure is rejected, and a fairness failure leaves a bias report in S3](docs/diagrams/mlops-fairness-gates.svg)
+
+In the pipeline one condition step applies both gates after the fairness
+check, and a failing execution ends in a Fail step with its evaluation and
+fairness reports kept under its execution prefix.
 
 - **Fairness gate in the pipeline.** Fairlearn scores the ensemble that would
   be registered, at its tuned threshold, per subgroup. BreakHis carries no
