@@ -118,7 +118,7 @@ SageMaker pipeline with its EventBridge trigger. A managed MLflow tracking serve
 multi-region CloudTrail trail (`enable_cloudtrail`) are available but off by
 default.
 
-![Training pipeline: a separate EventBridge rule sends each upload to a quarantine Lambda that sets aside bad images, and an upload marker starts SageMaker Pipelines, which validates, preprocesses, trains three models in parallel, evaluates, builds an ensemble, runs a Fairlearn check and either registers the model as pending or fails](docs/diagrams/mlops-training-pipeline.svg)
+![Training pipeline: in the raw data bucket, a separate EventBridge rule sends each upload to a quarantine Lambda that moves bad images to a quarantine prefix, and an upload marker starts SageMaker Pipelines, which validates, preprocesses into the processed data bucket, trains three models in parallel, evaluates, builds an ensemble, runs a fairness check and, through one condition step, either registers the model as needing approval or fails; step code comes from the scripts bucket and outputs go to the model artifacts bucket](docs/diagrams/mlops-training-pipeline.svg)
 
 1. As each image lands under `medical_image_data/`, the upload quarantine
    Lambda (`enable_upload_quarantine`, on by default) checks it: an allowed
@@ -168,7 +168,7 @@ Lambda, the drift and fairness schedules and alarms, the retraining rule, SNS
 alerts, a CloudWatch dashboard, a weekly endpoint refresh, and the Bedrock
 guardrail when hybrid inference is on.
 
-![Inference and monitoring: the browser loads the web UI from CloudFront and posts images through WAF to API Gateway with an API key; Lambda invokes the endpoint and Bedrock; captured data feeds scheduled PSI and Fairlearn jobs that publish to CloudWatch and SNS](docs/diagrams/mlops-inference-monitoring.svg)
+![Inference and monitoring: the browser loads the web UI from CloudFront and its S3 bucket, and posts images through WAF to API Gateway with an API key; a Lambda function invokes the SageMaker endpoint and, optionally, Bedrock with a guardrail for low-confidence cases; captured data in S3 feeds drift and fairness Processing jobs started by EventBridge Scheduler, which publish metrics to CloudWatch alarms that notify SNS; an approved model in the Model Registry (through an EventBridge rule and an auto-deploy Lambda) and a weekly refresher Lambda both update the endpoint as a canary, and the CloudWatch alarms roll it back](docs/diagrams/mlops-inference-monitoring.svg)
 
 1. The browser loads the static web UI from CloudFront, which reads it from a
    private S3 bucket.
@@ -383,7 +383,7 @@ the fairness gate read the BreakHis patient id and magnification from them.
 
 ## Deploy through CI/CD
 
-![CI/CD deployment: a push to GitHub starts CodePipeline, whose CodeBuild stages deploy training, register the baseline, upload scripts and weights, and, after manual approval, deploy inference, with state in the KMS-encrypted state bucket](docs/diagrams/mlops-cicd.svg)
+![CI/CD deployment: a push to GitHub starts CodePipeline through a source connection, with source artifacts in an S3 bucket; CodeBuild stages deploy training, register the baseline in the Model Registry, upload scripts and weights to the scripts bucket, and, after a manual approval in the inference deploy stage, deploy inference, with Terraform state for both deploys in the KMS-encrypted state bucket](docs/diagrams/mlops-cicd.svg)
 
 1. A push to the tracked branch of your GitHub repository starts the pipeline
    through AWS CodeConnections.
