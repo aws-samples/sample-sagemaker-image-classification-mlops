@@ -176,7 +176,7 @@ resource "aws_iam_role_policy" "drift_job_scheduler" {
         # Scoped to this project's drift jobs by name prefix.
         Effect   = "Allow"
         Action   = ["sagemaker:CreateProcessingJob"]
-        Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:processing-job/${var.project_name}-drift-*"
+        Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:processing-job/${local.scheduled_job_prefix}-drift-*"
       },
       {
         # Hand the SageMaker execution role to SageMaker only.
@@ -365,7 +365,7 @@ resource "aws_iam_role_policy" "fairness_job_scheduler" {
         # Scoped to this project's fairness jobs by name prefix.
         Effect   = "Allow"
         Action   = ["sagemaker:CreateProcessingJob"]
-        Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:processing-job/${var.project_name}-fairness-*"
+        Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:processing-job/${local.scheduled_job_prefix}-fair-*"
       },
       {
         # Hand the SageMaker execution role to SageMaker only.
