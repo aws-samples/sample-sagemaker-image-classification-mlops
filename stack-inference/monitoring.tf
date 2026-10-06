@@ -59,6 +59,36 @@ resource "aws_cloudwatch_metric_alarm" "prediction_drift_psi" {
   tags = { Purpose = "DriftDetection" }
 }
 
+# Dead-letter queue for both monitoring schedules.
+resource "aws_sqs_queue" "scheduler_dlq" {
+  count = (local.drift_job_count + local.fairness_job_count) > 0 ? 1 : 0
+
+  name                      = "${var.project_name}-monitoring-schedule-dlq"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+
+  tags = { Purpose = "MonitoringScheduleDLQ" }
+}
+
+resource "aws_cloudwatch_metric_alarm" "scheduler_dlq_visible" {
+  count = length(aws_sqs_queue.scheduler_dlq)
+
+  alarm_name          = "${var.project_name}-monitoring-schedule-dlq-visible"
+  alarm_description   = "A scheduled drift or fairness job failed to start; the message holds the error."
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  dimensions          = { QueueName = aws_sqs_queue.scheduler_dlq[0].name }
+  alarm_actions       = [module.sns_alerts.sns_topic_arn]
+
+  tags = { Purpose = "MonitoringScheduleDLQ" }
+}
+
 # Schedule the drift Processing job. EventBridge Scheduler calls
 # sagemaker:CreateProcessingJob directly as a universal target, so no Lambda sits
 # in the path. Cadence should not outpace the lookback window.
@@ -84,8 +114,16 @@ resource "aws_scheduler_schedule" "drift_job" {
     arn      = "arn:aws:scheduler:::aws-sdk:sagemaker:createProcessingJob"
     role_arn = aws_iam_role.drift_job_scheduler[0].arn
 
-    input = jsonencode({
-      # Job names must be unique per run; <aws.scheduler.scheduled-time> is
+    # Failed invocations land here with the error code and message, which the
+    # Scheduler reports nowhere else.
+    dead_letter_config {
+      arn = aws_sqs_queue.scheduler_dlq[0].arn
+    }
+
+    # jsonencode escapes < and > as \u003c and \u003e, which hides the
+    # <aws.scheduler.execution-id> keyword from the Scheduler; undo that.
+    input = replace(replace(jsonencode({
+      # Job names must be unique per run; <aws.scheduler.execution-id> is
       # substituted by the Scheduler at invocation.
       ProcessingJobName = "${local.scheduled_job_prefix}-drift-<aws.scheduler.execution-id>"
       RoleArn           = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
@@ -139,7 +177,7 @@ resource "aws_scheduler_schedule" "drift_job" {
         EnableInterContainerTrafficEncryption = true
         EnableNetworkIsolation                = false
       }
-    })
+    }), "\\u003c", "<"), "\\u003e", ">")
   }
 }
 
@@ -187,6 +225,28 @@ resource "aws_iam_role_policy" "drift_job_scheduler" {
         Condition = {
           StringEquals = { "iam:PassedToService" = "sagemaker.amazonaws.com" }
         }
+      },
+      {
+        # Decrypt: the Scheduler reads the CMK-encrypted target payload with
+        # this role. DescribeKey: CreateProcessingJob with VolumeKmsKeyId checks
+        # the caller's access; it is a direct call, so it cannot carry the
+        # GrantIsForAWSResource condition that scopes CreateGrant.
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:DescribeKey"]
+        Resource = local.training_outputs.kms_key_arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:CreateGrant"]
+        Resource = local.training_outputs.kms_key_arn
+        Condition = {
+          Bool = { "kms:GrantIsForAWSResource" = "true" }
+        }
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.scheduler_dlq[0].arn
       }
     ]
   })
@@ -256,7 +316,15 @@ resource "aws_scheduler_schedule" "fairness_job" {
     arn      = "arn:aws:scheduler:::aws-sdk:sagemaker:createProcessingJob"
     role_arn = aws_iam_role.fairness_job_scheduler[0].arn
 
-    input = jsonencode({
+    # Failed invocations land here with the error code and message, which the
+    # Scheduler reports nowhere else.
+    dead_letter_config {
+      arn = aws_sqs_queue.scheduler_dlq[0].arn
+    }
+
+    # jsonencode escapes < and > as \u003c and \u003e, which hides the
+    # <aws.scheduler.execution-id> keyword from the Scheduler; undo that.
+    input = replace(replace(jsonencode({
       # Job names must be unique per run; <aws.scheduler.execution-id> is
       # substituted by the Scheduler at invocation.
       ProcessingJobName = "${local.scheduled_job_prefix}-fair-<aws.scheduler.execution-id>"
@@ -328,7 +396,7 @@ resource "aws_scheduler_schedule" "fairness_job" {
         # Fairlearn is pip-installed at job start, so the container needs egress.
         EnableNetworkIsolation = false
       }
-    })
+    }), "\\u003c", "<"), "\\u003e", ">")
   }
 }
 
@@ -376,6 +444,28 @@ resource "aws_iam_role_policy" "fairness_job_scheduler" {
         Condition = {
           StringEquals = { "iam:PassedToService" = "sagemaker.amazonaws.com" }
         }
+      },
+      {
+        # Decrypt: the Scheduler reads the CMK-encrypted target payload with
+        # this role. DescribeKey: CreateProcessingJob with VolumeKmsKeyId checks
+        # the caller's access; it is a direct call, so it cannot carry the
+        # GrantIsForAWSResource condition that scopes CreateGrant.
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:DescribeKey"]
+        Resource = local.training_outputs.kms_key_arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:CreateGrant"]
+        Resource = local.training_outputs.kms_key_arn
+        Condition = {
+          Bool = { "kms:GrantIsForAWSResource" = "true" }
+        }
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.scheduler_dlq[0].arn
       }
     ]
   })
@@ -524,4 +614,3 @@ locals {
   # 20 + "-drift-" (7) + 36 = 63, so the scheduled jobs can always be created.
   scheduled_job_prefix = substr(var.project_name, 0, 20)
 }
-
