@@ -168,6 +168,12 @@ resource "aws_cloudfront_distribution" "frontend" {
     minimum_protocol_version = "TLSv1.2_2021"
   }
 
+  lifecycle {
+    # With the default certificate CloudFront stores TLSv1 whatever is set,
+    # so without this every plan shows a change that applies as a no-op.
+    ignore_changes = [viewer_certificate[0].minimum_protocol_version]
+  }
+
   # Access logs - delivered to the monitoring bucket under a dedicated
   # prefix. Only enabled when var.access_log_bucket_domain is set by the
   # caller; we don't want the module to fail if the caller hasn't wired
