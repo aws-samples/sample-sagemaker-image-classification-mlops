@@ -15,7 +15,7 @@ locals {
   upload_quarantine_name = "${var.project_name}-upload-quarantine"
 
   # The Pillow + NumPy layer zip that stack-inference also uses, built by the
-  # same script with the same pinned versions (Pillow 12.3.0 for python3.13).
+  # same script with the same pinned versions (Pillow 13.0.0 for python3.13).
   # `make layer` builds it before `make deploy-training`; otherwise the apply
   # builds it when missing (needs bash, zip and uv or pip).
   quarantine_layer_zip    = "${path.module}/../stack-inference/lambda-layers/pillow-numpy-layer.zip"

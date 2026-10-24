@@ -15,7 +15,7 @@ BUILD_DIR="/tmp/lambda-layer-build"
 
 # Versions pinned to match Lambda runtime and CodeBuild buildspec
 PYTHON_VERSION="3.13"
-PILLOW_VERSION="12.3.0"
+PILLOW_VERSION="13.0.0"
 NUMPY_VERSION="2.4.4"
 
 echo "=========================================="
