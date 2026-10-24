@@ -57,7 +57,7 @@ and refresh the endpoint weekly.
 
 ## Architecture
 
-![Healthcare MLOps architecture: images from an on-premises hospital PACS land in a raw S3 bucket, an EventBridge event runs a validation Lambda, and validated data feeds SageMaker Processing, Training and Model Evaluation under SageMaker Pipelines; a quality gate registers the model in the Model Registry for clinical review, approved models serve from SageMaker endpoints behind API Gateway, and monitoring jobs, CloudWatch alarms and an EventBridge rule start automated retraining, with IAM, KMS, CloudTrail, VPC and Cognito in a security band](docs/diagrams/mlops-architecture.svg)
+![Healthcare MLOps architecture: images from an on-premises hospital PACS arrive over an encrypted transfer in an S3 landing zone; EventBridge sends each image to a validation Lambda and starts SageMaker Pipelines, which runs Preprocess, Train three models and Evaluate and ensemble; the result is registered in the Model Registry, a clinical review board outside the cloud approves it, and the approved model is canary-deployed to the SageMaker endpoint behind API Gateway; a drift job reads the endpoint's captured data and sends a drift score to a CloudWatch alarm, which makes an EventBridge rule start retraining](docs/diagrams/mlops-architecture.svg)
 
 Hospital PACS is shown as the upstream image source (the sample takes JPEG or
 PNG uploads to S3), the validation Lambda is the upload quarantine Lambda, and
@@ -530,7 +530,7 @@ and meters callers; it does not authenticate them (see [SECURITY.md](SECURITY.md
 
 ## Monitoring and retraining
 
-![Closed-loop monitoring and retraining: in the Detect group the SageMaker endpoint captures data to S3, a scheduled processing job analyzes it and sends a PSI metric to a CloudWatch alarm; in the Respond group the alarm makes EventBridge trigger the SageMaker pipeline, the pipeline registers a new model in the Model Registry, and the model is deployed back to the endpoint](docs/diagrams/mlops-retraining-loop.svg)
+![Closed-loop monitoring and retraining: in the Detect group the SageMaker endpoint captures data to S3 and a drift job, started by EventBridge Scheduler, sends a PSI metric to a CloudWatch alarm; in the Respond group the alarm makes an EventBridge rule start SageMaker Pipelines, which registers a candidate in the Model Registry as pending approval; a clinical review board approves it, and an auto-deploy Lambda canary-deploys the approved model back to the endpoint](docs/diagrams/mlops-retraining-loop.svg)
 
 The figure leaves out the review step: a reviewer approves the new version in
 the Model Registry before the auto-deploy Lambda rolls it out, and the
@@ -592,7 +592,7 @@ exist. The drift and fairness jobs need data capture, so they are skipped when
 
 ## Responsible AI
 
-![Bias pipeline: preprocess, train, evaluate against accuracy gates, then a bias check against a fairness gate; a model that passes both is registered in the Model Registry as PendingManualApproval with accuracy and fairness metrics, an accuracy failure is rejected, and a fairness failure leaves a bias report in S3](docs/diagrams/mlops-fairness-gates.svg)
+![Bias pipeline in SageMaker Pipelines: preprocess, train three models, evaluate and ensemble, then a bias check that always writes its report to S3; one quality gate checks accuracy and fairness together, registering a passing model in the Model Registry as pending approval and sending a failing run to a fail step](docs/diagrams/mlops-fairness-gates.svg)
 
 In the pipeline one condition step applies both gates after the fairness
 check, and a failing execution ends in a Fail step with its evaluation and
