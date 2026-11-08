@@ -11,7 +11,13 @@ CODE_DIR="/opt/ml/processing/input/code"
 # Without this the fairness gate fails at import time: the TensorFlow DLC does
 # not ship Fairlearn.
 # No fallback: a failed install must fail the step, not run an unpinned version.
-pip install -q -r "${CODE_DIR}/requirements.txt"
+# Inside the training VPC there is no route to PyPI, so install from the
+# wheelhouse scripts/script_uploader.sh uploads next to this script.
+if [ -d "${CODE_DIR}/wheels" ]; then
+    pip install -q --no-index --find-links "${CODE_DIR}/wheels" -r "${CODE_DIR}/requirements.txt"
+else
+    pip install -q -r "${CODE_DIR}/requirements.txt"
+fi
 
 # All flags arrive as ContainerArguments and are forwarded verbatim.
 exec python3 "${CODE_DIR}/compute_bias.py" "$@"

@@ -23,7 +23,12 @@ def safe_extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo, dest: str
         raise ValueError(f"Link member not allowed in archive: {member.name}")
     if not member.isreg():
         raise ValueError(f"Non-regular member not allowed in archive: {member.name}")
-    tar.extract(member, dest)
+    if hasattr(tarfile, "data_filter"):
+        tar.extract(member, dest, filter="data")
+    else:
+        # Python without extraction filters (before 3.12 and the 3.8-3.11
+        # security backports): the checks above are the whole defence.
+        tar.extract(member, dest)
     return target
 
 

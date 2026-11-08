@@ -7,22 +7,22 @@ The ensemble package puts this file at code/inference.py. The container serves
 every member SavedModel (<name>_model/1) in TensorFlow Serving and calls
 ``handler()`` for each /invocations request. The handler calls each member over
 the local TensorFlow Serving REST API and combines the scores with the weights
-in ensemble_config.json. It uses only the standard library and ``requests``
-(which the container ships), because the handler process has no TensorFlow.
+in ensemble_config.json. It uses the standard library, ``requests`` and, for
+region Shapley, ``numpy`` (both ship in the serving image), because the handler
+process has no TensorFlow.
 
 Request: ``{"instances": [image]}`` where image is the (224, 224, 3) normalised
 array, plus an optional ``"explain"`` object (see ``explain()``).
 
-Response without ``explain`` (unchanged from earlier packages):
-``{"predictions": [[p]], "predicted_class": [[0|1]], "threshold_used": t}``.
-With ``explain`` the same keys plus ``"explanations"``.
+Response: ``{"predictions": [[p]], "predicted_class": [[0|1]],
+"threshold_used": t, "class_names": [negative, positive]}`` where p is the
+positive-class probability; with ``explain`` also ``"explanations"``.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import random
 import time
 from collections import deque
 from urllib.parse import urlsplit
@@ -186,13 +186,16 @@ def _coalition_mask(members, grid):
 
 def plan_permutations(n_players, max_evals, seed):
     """Antithetic permutation pairs that fit in max_evals ensemble evaluations."""
+    # Imported here so that predictions and Grad-CAM still work on a serving
+    # image without NumPy.
+    import numpy as np
+
     per_perm = n_players - 1
     count = max(1, (max_evals - 2) // per_perm)
-    rng = random.Random(seed)
+    rng = np.random.default_rng(seed)
     perms = []
     while len(perms) < count:
-        perm = list(range(n_players))
-        rng.shuffle(perm)
+        perm = rng.permutation(n_players).tolist()
         perms.append(perm)
         if len(perms) < count:
             perms.append(perm[::-1])
@@ -200,10 +203,10 @@ def plan_permutations(n_players, max_evals, seed):
 
 
 def region_shapley(image_json, config, call, max_evals, seed, deadline, grid=REGION_GRID):
-    """Region Shapley values for the ensemble malignant probability, by permutation sampling.
+    """Region Shapley values for the ensemble positive-class probability, by permutation sampling.
 
     Players are the grid x grid regions; a region outside the coalition is set
-    to the baseline (the ImageNet mean colour). Each complete permutation's
+    to the baseline (the per-channel mean colour). Each complete permutation's
     marginal contributions telescope to f(full) - f(empty), so the values sum
     to that difference exactly (up to rounding) however many permutations run.
     One permutation is scored per batch (the first batch also scores the
@@ -258,10 +261,10 @@ def region_shapley(image_json, config, call, max_evals, seed, deadline, grid=REG
     values = [v / used for v in phi]
     return {
         "method": "region Shapley values estimated by antithetic permutation sampling",
-        "target": "malignant probability",
+        "target": "positive-class probability",
         "grid_size": grid,
         "values": [[round(values[r * grid + c], 4) for c in range(grid)] for r in range(grid)],
-        "baseline": "ImageNet mean colour (0 after normalisation)",
+        "baseline": "per-channel mean colour (0 after normalisation)",
         "baseline_score": round(f_empty, 4),
         "full_score": round(f_full, 4),
         "sum": round(sum(values), 4),
@@ -285,6 +288,8 @@ def _explain_options(raw):
         raise ValueError(f"explain.max_evals must be at least {REGION_GRID * REGION_GRID + 1}")
     budget = min(int(raw.get("time_budget_ms", DEFAULT_TIME_BUDGET_MS)), MAX_TIME_BUDGET_MS)
     seed = int(raw.get("seed", DEFAULT_SEED))
+    if seed < 0:
+        raise ValueError("explain.seed must be a non-negative integer")
     return methods, max_evals, budget, seed
 
 
@@ -292,7 +297,7 @@ def explain(image_json, config, predicted_class, options, call):
     """Explanations for the predicted class. A method whose signature is missing reports why."""
     methods, max_evals, budget_ms, seed = options
     started = time.monotonic()
-    target = "malignant" if predicted_class == 1 else "benign"
+    target = "positive" if predicted_class == 1 else "negative"
     out = {}
     if GRADCAM in methods:
         t0 = time.monotonic()
@@ -333,6 +338,8 @@ def run(request, config, call):
         "predicted_class": [[predicted_class]],
         "threshold_used": threshold,
     }
+    if config.get("class_names"):
+        response["class_names"] = list(config["class_names"])
     if request.get("explain"):
         options = _explain_options(request["explain"])
         response["explanations"] = explain(image_json, config, predicted_class, options, call)

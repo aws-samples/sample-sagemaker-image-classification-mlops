@@ -1,13 +1,13 @@
 # sagemaker-endpoint
 
-SageMaker model, endpoint configuration, endpoint, CloudWatch alarms, and auto-scaling for real-time inference. Optionally switches to **Serverless Inference** for low-traffic endpoints.
+Amazon SageMaker AI model, endpoint configuration, endpoint, Amazon CloudWatch alarms, and auto-scaling for real-time inference. Optionally switches to **Serverless Inference** for low-traffic endpoints.
 
 ## What It Does
 
 1. Creates a SageMaker Model from the Approved package passed as `model_package_arn`. With `serving_image_uri` set (the patched image, pinned by digest) it reads the package's artefact and environment through the `awscc_sagemaker_model_package` data source and runs them on that image; otherwise it references the package directly. The auto-deployment module builds its models the same way, so both paths serve one image.
 2. Creates a SageMaker Endpoint Configuration (`name_prefix` + `create_before_destroy`) - either real-time (data capture of model Output by default; set `data_capture_input = true` to also store requests) or serverless (scales to zero)
 3. Creates rollback alarms wired to the endpoint's auto-rollback configuration: the larger of `Invocation5XXErrors` and `InvocationModelErrors` (Sum per minute), and `ModelLatency`
-4. Creates the SageMaker endpoint (Terraform-managed) with a blue/green update policy and auto-rollback on the two alarms. `endpoint_config_name` and `deployment_config` are in `ignore_changes`, so the auto-deploy Lambda can repoint the endpoint without Terraform reverting it
+4. Creates the SageMaker endpoint (Terraform-managed) with a blue/green update policy and auto-rollback on the two alarms. `endpoint_config_name` and `deployment_config` are in `ignore_changes`, so the auto-deploy AWS Lambda function can repoint the endpoint without Terraform reverting it
 5. Exposes the same policy as `deployment_config_json` (UpdateEndpoint `DeploymentConfig` shape). Pass it to every Lambda that calls UpdateEndpoint (the auto-deployment module's `deployment_config_json`, the endpoint refresher's `DEPLOYMENT_CONFIG`) so approval-driven and scheduled rollouts use the same traffic shifting and rollback alarms; because `deployment_config` is ignored after creation, this is also how a changed policy reaches an existing endpoint
 6. Creates an Application Auto Scaling target and target-tracking scaling policy (skipped in serverless mode - serverless scales via `max_concurrency`)
 
@@ -37,7 +37,7 @@ Best for:
 
 - Production workloads with steady traffic
 - Use cases requiring strict p50 latency (< 200ms)
-- Regulated / clinical deployments where data-capture audit is required
+- Regulated deployments where data-capture audit is required
 - Any case where data capture or drift detection matters
 
 ### Serverless (opt-in)
@@ -46,7 +46,7 @@ Set `use_serverless_inference = true` - SageMaker provisions workers per request
 
 **You lose**:
 
-- **Data capture**: serverless variants do not support `DataCaptureConfig`, so the scheduled drift job is skipped when serverless is enabled (see `stack-inference/monitoring.tf`). If you need drift detection in serverless mode, log predictions from your inference handler into S3 yourself.
+- **Data capture**: serverless variants do not support `DataCaptureConfig`, so the scheduled drift job is skipped when serverless is enabled (see `stack-inference/monitoring.tf`). If you need drift detection in serverless mode, log predictions from your inference handler into Amazon S3 yourself.
 - **Weekly endpoint OS refresh**: no long-lived host to refresh; serverless workers are short-lived by design.
 - **Application Auto Scaling**: not supported on serverless variants. Tuning happens via `serverless_max_concurrency`.
 - **p50 latency guarantees**: cold starts are 1-5 seconds after idle periods. The first request after an idle window pays this tax; subsequent requests in the same window are fast.
@@ -104,9 +104,10 @@ When opting in, the auto-deploy Lambda also switches its endpoint-config creatio
 | monitoring\_bucket | S3 bucket name for data capture and monitoring output | `string` | n/a | yes |
 | project\_name | Name of the project | `string` | n/a | yes |
 | canary\_size\_percent | Percentage of the new fleet's capacity that takes traffic during the canary step (CAPACITY\_PERCENT). SageMaker allows at most 50%. Used when traffic\_routing\_type = CANARY. | `number` | `10` | no |
-| data\_capture\_input | Also capture request payloads. Off by default: the monitoring jobs only need model output, and Input capture stores every uploaded image (potential PHI, several MB per request). | `bool` | `false` | no |
+| data\_capture\_input | Also capture request payloads. Off by default: the monitoring jobs only need model output, and Input capture stores every uploaded image (possibly sensitive, several MB per request). | `bool` | `false` | no |
 | data\_capture\_sampling\_percentage | Percentage of invocations written to data capture (0-100). Real-time mode only. | `number` | `100` | no |
 | deployment\_max\_timeout | Maximum deployment time in seconds (600-28800). Must exceed the total of the traffic shift waits and termination\_wait\_seconds. | `number` | `3600` | no |
+| enable\_network\_isolation | Run the inference container with network isolation. The ensemble handler only calls the local TensorFlow Serving REST API, so it needs no outbound network. | `bool` | `true` | no |
 | error\_count\_threshold | Rollback fires when Invocation5XXErrors or InvocationModelErrors (Sum per minute) exceed this for 2 consecutive minutes. | `number` | `3` | no |
 | initial\_instance\_count | Initial number of instances for the endpoint | `number` | `1` | no |
 | initial\_variant\_weight | Initial traffic weight for the primary production variant. With one variant this is always 100% of traffic; exposing it lets callers add a weighted canary variant and shift traffic via update\_endpoint\_weights\_and\_capacities. | `number` | `1` | no |
@@ -126,7 +127,7 @@ When opting in, the auto-deploy Lambda also switches its endpoint-config creatio
 | traffic\_routing\_type | How the blue/green update shifts traffic to the new fleet: CANARY (canary\_size\_percent first, then the rest), LINEAR (linear\_step\_percent per step) or ALL\_AT\_ONCE. CANARY and LINEAR need at least 2 instances (initial\_instance\_count and min\_capacity). Serverless variants always use ALL\_AT\_ONCE. | `string` | `"CANARY"` | no |
 | traffic\_shift\_wait\_interval | Baking period in seconds after each traffic shift step (the canary step, or each linear step) while the rollback alarms watch the new fleet (0-3600). Keep it longer than the alarms need to fire: 2 one-minute periods plus CloudWatch delay. | `number` | `300` | no |
 | use\_serverless\_inference | When true, provision a SageMaker Serverless Inference variant instead of<br/>an instance-based real-time variant. Serverless scales to zero when idle<br/>(large cost savings for low-traffic endpoints like a blog demo) but loses<br/>several features:<br/><br/>  - No DataCaptureConfig on the endpoint config (drift detection cannot<br/>    read captured payloads; your inference handler must log predictions<br/>    itself if drift detection matters).<br/>  - No Application Auto Scaling (scales internally via max\_concurrency).<br/>  - Cold starts of 1-5 seconds after idle periods.<br/>  - Max memory = 6 GB, max concurrent requests per variant = 200.<br/><br/>Default is false to preserve the project's compliance/monitoring story.<br/>Opt in only when the cost win outweighs these tradeoffs. | `bool` | `false` | no |
-| volume\_kms\_key\_arn | KMS key ARN used to encrypt the ML storage volume attached to real-time (instance-based) inference variants. The volume buffers the model artifact and in-flight inference data (potential PHI for a medical model), so it should use the project CMK rather than the AWS-managed default key. Ignored for serverless variants, which do not attach a volume. Null falls back to the default key. | `string` | `null` | no |
+| volume\_kms\_key\_arn | KMS key ARN used to encrypt the ML storage volume attached to real-time (instance-based) inference variants. The volume buffers the model artifact and in-flight inference data, so it should use the project CMK rather than the AWS-managed default key. Ignored for serverless variants, which do not attach a volume. Null falls back to the default key. | `string` | `null` | no |
 
 ## Outputs
 

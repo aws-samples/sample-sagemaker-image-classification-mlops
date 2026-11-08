@@ -1,12 +1,20 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-# KICS: private static-asset bucket read only through CloudFront OAC; no S3 access logging in the sample (CKV_AWS_18)
+# KICS: private static-asset bucket read only through CloudFront OAC; server access logging is the separate aws_s3_bucket_logging resource (access_log_bucket)
 # kics-scan ignore-line
 resource "aws_s3_bucket" "frontend" {
   bucket        = var.bucket_name
   force_destroy = var.force_destroy
   tags          = var.tags
+}
+
+resource "aws_s3_bucket_ownership_controls" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
 }
 
 # Block all public access - the bucket is private; CloudFront OAC is the
@@ -27,9 +35,8 @@ resource "aws_s3_bucket_versioning" "frontend" {
   }
 }
 
-# KMS encryption. Null = AWS-managed key (AES256); pass a CMK ARN for tighter
-# key control. Static frontend content is low-sensitivity but we still want
-# encryption-at-rest by policy.
+# KMS encryption. Null = SSE-S3 (AES256); the stack passes the project CMK,
+# which CloudFront reads through origin access control.
 resource "aws_s3_bucket_server_side_encryption_configuration" "frontend" {
   bucket = aws_s3_bucket.frontend.id
   rule {
@@ -64,6 +71,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "frontend" {
   depends_on = [aws_s3_bucket_versioning.frontend]
 }
 
+resource "aws_s3_bucket_logging" "frontend" {
+  count = var.access_log_bucket != null ? 1 : 0
+
+  bucket        = aws_s3_bucket.frontend.id
+  target_bucket = var.access_log_bucket
+  target_prefix = "${aws_s3_bucket.frontend.id}/"
+}
+
 ################################################################################
 # CloudFront
 ################################################################################
@@ -75,6 +90,59 @@ resource "aws_cloudfront_origin_access_control" "frontend" {
   origin_access_control_origin_type = "s3"
   signing_behavior                  = "always"
   signing_protocol                  = "sigv4"
+}
+
+locals {
+  # Exactly what the page loads: its own stylesheet and script, images the
+  # visitor picks (blob: URLs), and fetch calls to connect_src only. The page
+  # has no inline script, style element or style attribute.
+  content_security_policy = join("; ", [
+    "default-src 'none'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src blob:",
+    "connect-src ${length(var.connect_src) > 0 ? join(" ", var.connect_src) : "'none'"}",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'self'",
+  ])
+}
+
+# The headers of the AWS managed SecurityHeadersPolicy
+# (67f7725c-6f97-4210-82d7-5512b31e9d03), with a stricter HSTS header
+# (includeSubDomains, preload, override) and a Content-Security-Policy.
+resource "aws_cloudfront_response_headers_policy" "security_headers" {
+  name    = "${var.bucket_name}-security-headers"
+  comment = "Security headers for the ${var.bucket_name} frontend"
+
+  security_headers_config {
+    content_security_policy {
+      content_security_policy = local.content_security_policy
+      override                = true
+    }
+    content_type_options {
+      override = true
+    }
+    frame_options {
+      frame_option = "SAMEORIGIN"
+      override     = false
+    }
+    referrer_policy {
+      referrer_policy = "strict-origin-when-cross-origin"
+      override        = false
+    }
+    strict_transport_security {
+      access_control_max_age_sec = 31536000
+      include_subdomains         = true
+      preload                    = true
+      override                   = true
+    }
+    xss_protection {
+      protection = true
+      mode_block = true
+      override   = false
+    }
+  }
 }
 
 # S3 bucket policy: CloudFront access only, SSL-only transport
@@ -116,9 +184,11 @@ resource "aws_s3_bucket_policy" "frontend" {
 }
 
 # CloudFront distribution
-# KICS: static demo UI; the API it calls has WAF. Access logs are on when access_log_bucket_domain is set
+# KICS: static demo UI; the API it calls has WAF. Access logs use standard logging (v2), the log delivery resources below, which KICS does not read
 # kics-scan ignore-line
 resource "aws_cloudfront_distribution" "frontend" {
+  #checkov:skip=CKV_AWS_86:Access logs use standard logging (v2), the aws_cloudwatch_log_delivery resources in this module
+  #checkov:skip=CKV_AWS_174:The minimum viewer TLS version can be set only with a custom certificate, which needs a custom domain; the default *.cloudfront.net certificate keeps TLSv1 (SECURITY.md Known limitations)
   origin {
     domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
     origin_id                = "S3-${aws_s3_bucket.frontend.id}"
@@ -139,7 +209,8 @@ resource "aws_cloudfront_distribution" "frontend" {
     # CachingOptimized managed policy - supersedes the deprecated
     # forwarded_values block. No query strings, no cookies, gzip + brotli.
     # https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html
-    cache_policy_id = "658327ea-f89d-4fab-a63d-7e88639e58f6"
+    cache_policy_id            = "658327ea-f89d-4fab-a63d-7e88639e58f6"
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.security_headers.id
   }
 
   custom_error_response {
@@ -160,11 +231,10 @@ resource "aws_cloudfront_distribution" "frontend" {
     # KICS: same reason as the block above
     # kics-scan ignore-line
     cloudfront_default_certificate = true
-    # Pin to TLSv1.2_2021 so weak ciphers (TLSv1.0/1.1) are disabled for
-    # viewers. Note: when using the default *.cloudfront.net cert, AWS
-    # ignores `minimum_protocol_version` but we set it anyway so the
-    # policy intent is explicit and the field appears correct when the
-    # caller switches to `acm_certificate_arn`.
+    # With the default *.cloudfront.net certificate the minimum viewer TLS
+    # version cannot be set: CloudFront uses the TLSv1 security policy and
+    # ignores this value. It takes effect only with a custom certificate
+    # (acm_certificate_arn with ssl_support_method = "sni-only").
     minimum_protocol_version = "TLSv1.2_2021"
   }
 
@@ -174,31 +244,86 @@ resource "aws_cloudfront_distribution" "frontend" {
     ignore_changes = [viewer_certificate[0].minimum_protocol_version]
   }
 
-  # Access logs - delivered to the monitoring bucket under a dedicated
-  # prefix. Only enabled when var.access_log_bucket_domain is set by the
-  # caller; we don't want the module to fail if the caller hasn't wired
-  # a logging bucket up yet.
-  dynamic "logging_config" {
-    for_each = var.access_log_bucket_domain != "" ? [1] : []
-    content {
-      bucket          = var.access_log_bucket_domain
-      include_cookies = false
-      prefix          = "cloudfront-access-logs/"
-    }
-  }
-
   tags = var.tags
+}
+
+################################################################################
+# Access logs (CloudFront standard logging v2)
+################################################################################
+
+# CloudFront delivers standard logs (v2) through CloudWatch Logs log delivery.
+# For a distribution the source, destination and delivery are created in
+# us-east-1 whatever the Region of the bucket. The logs go to
+# cloudfront/ in access_log_bucket; this delivery writes as the bucket owner,
+# so it works with S3 Object Ownership BucketOwnerEnforced, and the bucket
+# policy must let delivery.logs.amazonaws.com put objects under cloudfront/.
+locals {
+  # Delivery names take letters, digits, _ and - only, up to 60 characters.
+  access_log_name = "${substr(replace(var.bucket_name, ".", "-"), 0, 50)}-cf-logs"
+}
+
+resource "aws_cloudwatch_log_delivery_source" "access_logs" {
+  count = var.access_log_bucket != null ? 1 : 0
+
+  region       = "us-east-1"
+  name         = local.access_log_name
+  log_type     = "ACCESS_LOGS"
+  resource_arn = aws_cloudfront_distribution.frontend.arn
+  tags         = var.tags
+}
+
+resource "aws_cloudwatch_log_delivery_destination" "access_logs" {
+  count = var.access_log_bucket != null ? 1 : 0
+
+  region        = "us-east-1"
+  name          = local.access_log_name
+  output_format = "w3c"
+  tags          = var.tags
+
+  delivery_destination_configuration {
+    destination_resource_arn = "arn:aws:s3:::${var.access_log_bucket}/cloudfront"
+  }
+}
+
+resource "aws_cloudwatch_log_delivery" "access_logs" {
+  count = var.access_log_bucket != null ? 1 : 0
+
+  region                   = "us-east-1"
+  delivery_source_name     = aws_cloudwatch_log_delivery_source.access_logs[0].name
+  delivery_destination_arn = aws_cloudwatch_log_delivery_destination.access_logs[0].arn
+  tags                     = var.tags
 }
 
 ################################################################################
 # Static Content
 ################################################################################
 
-# Generate HTML from template and upload to S3
-resource "aws_s3_object" "index_html" {
-  bucket       = aws_s3_bucket.frontend.id
-  key          = "index.html"
-  content      = templatefile(var.html_template_path, var.template_vars)
-  content_type = "text/html"
-  etag         = md5(templatefile(var.html_template_path, var.template_vars))
+# The page, its stylesheet and its script, rendered with template_vars. With
+# SSE-KMS the object ETag is not an MD5, so source_hash tracks the content.
+# no-cache keeps CloudFront (minimum TTL 1 s) and browsers on the current
+# copy after a deploy.
+locals {
+  site_files = merge(
+    { "index.html" = { content = templatefile(var.html_template_path, var.template_vars), type = "text/html" } },
+    { for key, path in var.asset_templates : key => {
+      content = templatefile(path, var.template_vars)
+      type    = endswith(key, ".css") ? "text/css" : "text/javascript"
+    } },
+  )
+}
+
+resource "aws_s3_object" "site" {
+  for_each = local.site_files
+
+  bucket        = aws_s3_bucket.frontend.id
+  key           = each.key
+  content       = each.value.content
+  content_type  = each.value.type
+  cache_control = "no-cache"
+  source_hash   = md5(each.value.content)
+}
+
+moved {
+  from = aws_s3_object.index_html
+  to   = aws_s3_object.site["index.html"]
 }

@@ -41,7 +41,7 @@ LATEST_APPROVED = aws sagemaker list-model-packages --region "$(TRAIN_REGION)" \
 	--query 'ModelPackageSummaryList[0].ModelPackageArn' --output text | sed 's/^None$$//'
 
 .PHONY: help bootstrap backend-config layer deploy-training upload-scripts \
-	weights seed-baseline check-approved deploy-inference deploy-cicd deploy-all \
+	seed-baseline check-approved deploy-inference deploy-cicd deploy-all \
 	destroy fmt validate lint test check-backend-config
 
 help: ## Show the available targets
@@ -70,19 +70,13 @@ layer: ## Build the Pillow and NumPy Lambda layer zip
 	./ops-scripts/build_lambda_layer.sh
 
 deploy-training: check-backend-config ## Plan and apply stack-training
+	@./ops-scripts/build_lambda_layer.sh --check || [ $$? -eq 2 ] || { echo "Run 'make layer' to build the Lambda layer zip from the pinned versions" >&2; exit 1; }
 	cd stack-training && $(TF_INIT)
 	cd stack-training && $(TF_ENV) terraform plan -input=false -out=tfplan
 	cd stack-training && $(TF_ENV) terraform apply -input=false tfplan && rm -f tfplan
 
 upload-scripts: ## Upload the pipeline scripts to the scripts bucket
 	cd scripts && SCRIPTS_BUCKET="$$(terraform -chdir=$(ROOT)/stack-training output -raw scripts_bucket)" ./script_uploader.sh
-
-weights: ## Upload the ImageNet weights when network isolation is on (needs TensorFlow)
-	@if [ "$$($(TRAIN_OUTPUT) network_isolation_enabled)" = "true" ]; then \
-		python3 scripts/download_pretrained_weights.py "$$($(TRAIN_OUTPUT) scripts_bucket)"; \
-	else \
-		echo "network isolation is off: the trainers download the weights themselves"; \
-	fi
 
 seed-baseline: upload-scripts ## Upload scripts and register the baseline model
 	MODEL_PACKAGE_GROUP_NAME="$$(terraform -chdir=stack-training output -raw model_package_group_name)" \
@@ -98,24 +92,23 @@ check-approved: ## Fail with a hint when the model package group has no Approved
 	fi
 
 deploy-inference: check-backend-config check-approved ## Plan and apply stack-inference on the newest Approved package (TF_VAR_model_package_arn overrides)
-	@test -f stack-inference/lambda-layers/pillow-numpy-layer.zip || { echo "Lambda layer zip missing: run 'make layer'" >&2; exit 1; }
+	@./ops-scripts/build_lambda_layer.sh --check || { echo "Run 'make layer' to build the Lambda layer zip from the pinned versions" >&2; exit 1; }
 	cd stack-inference && $(TF_INIT)
 	cd stack-inference && ARN="$${TF_VAR_model_package_arn:-$$($(LATEST_APPROVED))}" && \
 		echo "Deploying model package $$ARN" && \
 		$(TF_ENV) TF_VAR_model_package_arn="$$ARN" terraform plan -input=false -out=tfplan
 	cd stack-inference && $(TF_ENV) terraform apply -input=false tfplan && rm -f tfplan
 
-deploy-cicd: check-backend-config ## Plan and apply the optional stack-cicd
+deploy-cicd: check-backend-config ## Plan and apply the optional stack-cicd (existing deployments: run bootstrap first)
 	cd stack-cicd && $(TF_INIT)
 	cd stack-cicd && terraform plan -input=false -out=tfplan
 	cd stack-cicd && terraform apply -input=false tfplan && rm -f tfplan
 
-deploy-all: ## bootstrap, backend-config, layer, deploy-training, weights, seed-baseline, deploy-inference
+deploy-all: ## bootstrap, backend-config, layer, deploy-training, seed-baseline, deploy-inference
 	$(MAKE) bootstrap
 	$(MAKE) backend-config
 	$(MAKE) layer
 	$(MAKE) deploy-training
-	$(MAKE) weights
 	$(MAKE) seed-baseline
 	$(MAKE) deploy-inference
 

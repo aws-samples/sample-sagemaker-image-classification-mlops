@@ -1,6 +1,6 @@
 # api-gateway
 
-REST API Gateway with Lambda proxy integration, CORS support, and binary media types for image uploads.
+Amazon API Gateway REST API with AWS Lambda proxy integration, CORS support, and binary media types for image uploads.
 
 ## What It Does
 
@@ -9,8 +9,8 @@ REST API Gateway with Lambda proxy integration, CORS support, and binary media t
 3. Creates `/results/{id}` resource with GET method and Lambda proxy integration
 4. Configures CORS for one allowed origin (`cors_allowed_origin`), including gateway responses so 403/429 reach the browser
 5. Requires an API key (`require_api_key`, default `true`) attached to a usage plan with per-key throttle and quota
-6. Associates a regional AWS WAF web ACL (`enable_waf`, default `true`): AWS managed common rule set (body size rule set to count, because `/predict` carries a base64 image), known-bad-inputs rule set and a per-IP rate-based rule; WAF logs go to CloudWatch with `x-api-key` redacted
-7. Deploys the API to a named stage with access logs, X-Ray and stage throttling; the deployment is re-created when methods or integrations change
+6. Associates a regional AWS WAF web ACL (`enable_waf`, default `true`): AWS managed common rule set (body size rule set to count, because `/predict` carries a base64 image), known-bad-inputs rule set and a per-IP rate-based rule; WAF logs go to Amazon CloudWatch Logs with `x-api-key` redacted
+7. Deploys the API to a named stage with access logs, AWS X-Ray tracing and stage throttling; the deployment is re-created when methods or integrations change
 
 The API key meters and limits callers, but it ships in the static frontend, so it is not authentication. To authenticate users set `authorization_type = "AWS_IAM"` (SigV4, `execute-api:Invoke`) or `authorization_type = "COGNITO_USER_POOLS"` with `cognito_user_pool_arns`.
 
@@ -80,7 +80,7 @@ The API key meters and limits callers, but it ships in the static frontend, so i
 | enable\_waf | Associate a regional AWS WAF web ACL with the stage: AWS managed common and known-bad-inputs rule sets plus a per-IP rate-based rule. WAF logs go to a CloudWatch log group with the x-api-key header redacted. | `bool` | `true` | no |
 | enable\_xray\_tracing | Enable AWS X-Ray tracing on the API Gateway stage. Lets you see end-to-end latency from API GW through Lambda to SageMaker. | `bool` | `true` | no |
 | log\_kms\_key\_arn | Optional KMS key ARN for encrypting the access log group | `string` | `null` | no |
-| log\_retention\_days | Retention in days for the API Gateway access log group | `number` | `90` | no |
+| log\_retention\_days | Retention in days for the API Gateway access log group | `number` | `365` | no |
 | permissions\_boundary\_arn | ARN of the permissions boundary attached to the IAM roles this module creates. null leaves them unbounded. | `string` | `null` | no |
 | require\_api\_key | Require the x-api-key header on POST /predict and GET /results/{id}. Creates one API key attached to the usage plan (the usage plan is created whenever this is true). The key is output as api\_key\_value (sensitive). | `bool` | `true` | no |
 | tags | Tags to apply to resources | `map(string)` | `{}` | no |

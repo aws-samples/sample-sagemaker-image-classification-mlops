@@ -4,9 +4,10 @@
 """Helpers shared by the pipeline steps, the scheduled monitoring jobs and the
 inference Lambda.
 
-One copy of each rule that must agree everywhere: the image transform, the
-data-capture decoding, score extraction from an endpoint response, the
-clinical and fairness gates, safe tar extraction and bounded S3 listing.
+One copy of each rule that must agree everywhere: the dataset layout and
+group split, the image transform, the data-capture decoding, score extraction
+from an endpoint response, the quality and fairness gates, safe tar extraction
+and bounded S3 listing.
 
 scripts/script_uploader.sh uploads this package next to every step script and
 bundles it into the training tarballs. The inference Lambda ships a

@@ -8,7 +8,10 @@ module "s3_sbom" {
   bucket_name       = "${var.project_name}-sbom-${random_id.sbom_suffix[0].hex}"
   kms_key_arn       = module.kms.key_arn
   enable_versioning = true
-  force_destroy     = false
+  force_destroy     = var.bucket_defaults.force_destroy
+
+  logging_target_bucket = local.access_log_bucket
+  enable_access_logging = var.enable_s3_access_logging
 
   lifecycle_rules = [{
     id = "sbom-retention"

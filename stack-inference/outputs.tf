@@ -17,6 +17,16 @@ output "api_key_value" {
   sensitive   = true
 }
 
+output "cognito_user_pool_id" {
+  description = "ID of the stack's Cognito user pool for application users (null unless api_authorization_type = \"COGNITO_USER_POOLS\" and no existing pool is given)"
+  value       = local.create_user_pool ? aws_cognito_user_pool.app_users[0].id : null
+}
+
+output "cognito_app_client_id" {
+  description = "ID of the Cognito app client that signs users in for the API (null when the stack creates no user pool)"
+  value       = local.create_user_pool ? aws_cognito_user_pool_client.app[0].id : null
+}
+
 output "api_web_acl_arn" {
   description = "ARN of the WAF web ACL on the API stage"
   value       = module.api_gateway.web_acl_arn

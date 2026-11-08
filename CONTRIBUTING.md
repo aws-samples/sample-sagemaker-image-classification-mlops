@@ -63,7 +63,7 @@ installs ruff, pytest and the test dependencies. `validate` needs no credentials
 remote state bucket.
 
 If you edit `scripts/mlops_common/`, run `scripts/sync_mlops_common.sh` to refresh the inference
-Lambda's copy; a test fails when the two differ.
+AWS Lambda function's copy; a test fails when the two differ.
 
 If you add or rename a Terraform variable, output, or resource, refresh the generated
 documentation tables rather than hand-editing them. Each stack and module README has a
@@ -73,7 +73,7 @@ documentation tables rather than hand-editing them. Each stack and module README
 terraform-docs -c .terraform-docs.yml <directory>
 ```
 
-Please keep unrelated formatting churn out of the diff. When a change alters cost, IAM
+Please keep unrelated formatting churn out of the diff. When a change alters cost, AWS Identity and Access Management (IAM)
 permissions, or the responsible-AI safeguards, call that out explicitly in the pull request
 description.
 

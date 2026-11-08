@@ -33,16 +33,19 @@ variable "aws_region" {
 }
 
 variable "permissions_boundary_arn" {
-  description = "ARN of the permissions boundary attached to every IAM role this stack creates (stack-backend-setup output workload_boundary_arn). Required when CI/CD CodeBuild applies the stack; null leaves the roles unbounded."
+  description = "ARN of the permissions boundary attached to every IAM role this stack creates (stack-backend-setup output workload_boundary_arn). Required: make and the CI/CD stages pass it as TF_VAR_permissions_boundary_arn."
   type        = string
-  default     = null
+
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:policy/", var.permissions_boundary_arn))
+    error_message = "permissions_boundary_arn must be the IAM policy ARN of the workload boundary (stack-backend-setup output workload_boundary_arn)."
+  }
 }
 
 ################################################################################
 # Pipeline Steps
 ################################################################################
 
-# Pipeline steps configuration
 variable "pipeline_steps" {
   description = "Configuration for pipeline processing steps"
   type = map(object({
@@ -61,11 +64,21 @@ variable "pipeline_steps" {
 # KMS
 ################################################################################
 
-# KMS Configuration
 variable "kms_deletion_window_days" {
-  description = "KMS key deletion window (days)"
+  description = "Waiting period in days before the project KMS key is deleted (7 to 30)."
   type        = number
-  default     = 7
+  default     = 30
+}
+
+variable "kms_key_administrators" {
+  description = "IAM role or user ARNs that administer the project KMS key. Empty keeps the account root as administrator, so the key can never become unmanageable; list existing principals only (the deploy role and a break-glass role)."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for a in var.kms_key_administrators : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/.+$", a))])
+    error_message = "kms_key_administrators entries must be IAM role or user ARNs."
+  }
 }
 
 variable "enable_kms_key_rotation" {
@@ -78,21 +91,35 @@ variable "enable_kms_key_rotation" {
 # Data
 ################################################################################
 
-# Data paths
 variable "training_data_path" {
-  description = "Training data S3 path"
+  description = "Prefix in the raw-data bucket that holds the images, one folder per label: <prefix><label>/<file>."
   type        = string
-  default     = "medical_image_data/"
+  default     = "images/"
 }
 
-# Training input mode
+variable "positive_class" {
+  description = "Label folder name of the positive class (the class recall is measured on). Empty means the second class folder in alphabetical order. Passed to the pipeline steps as POSITIVE_CLASS."
+  type        = string
+  default     = ""
+}
+
+variable "backbone_weights_s3_uri" {
+  description = "Optional S3 URI of your own backbone weights: a prefix holding one <model>.weights.h5 per model, or a single .h5 file. The training jobs may read every object whose key starts with the URI's key (the S3Prefix channel downloads them all). Add the bucket and that prefix to boundary_extra_s3_arns in stack-backend-setup. Empty trains from random initialisation."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.backbone_weights_s3_uri == "" || can(regex("^s3://[^/]+/.+$", var.backbone_weights_s3_uri))
+    error_message = "backbone_weights_s3_uri must be empty or an s3://bucket/key URI."
+  }
+}
+
 variable "training_input_mode" {
   description = "SageMaker training input mode"
   type        = string
   default     = "FastFile"
 }
 
-# Data configuration
 variable "data_config" {
   description = "Data processing configuration"
   type = object({
@@ -115,7 +142,6 @@ variable "data_config" {
 # Monitoring
 ################################################################################
 
-# Monitoring configuration
 variable "enable_training_monitoring" {
   description = "Enable training monitoring"
   type        = bool
@@ -123,9 +149,9 @@ variable "enable_training_monitoring" {
 }
 
 variable "log_retention_days" {
-  description = "CloudWatch log retention days"
+  description = "CloudWatch log retention in days."
   type        = number
-  default     = 30
+  default     = 365
 }
 
 variable "log_groups" {
@@ -164,7 +190,6 @@ variable "metric_namespaces" {
 # Training Models
 ################################################################################
 
-# Training models configuration
 variable "models" {
   description = "Configuration for all training models"
   type = map(object({
@@ -217,7 +242,6 @@ variable "pipeline_max_parallel_steps" {
 # S3 Buckets
 ################################################################################
 
-# Bucket configuration defaults
 variable "bucket_defaults" {
   description = "Default configuration for S3 buckets"
   type = object({
@@ -225,11 +249,11 @@ variable "bucket_defaults" {
     enable_versioning   = bool
     block_public_access = bool
   })
-  # force_destroy stays false so terraform destroy cannot delete training
-  # data, model artifacts or audit logs. Set it to true for a throwaway
-  # environment you want to tear down in one step.
+  # force_destroy is true so terraform destroy empties and deletes every
+  # bucket of this stack (training data, model artifacts, audit logs) in one
+  # step. Set it to false to keep the buckets and their data on destroy.
   default = {
-    force_destroy       = false
+    force_destroy       = true
     enable_versioning   = true
     block_public_access = true
   }
@@ -239,7 +263,6 @@ variable "bucket_defaults" {
 # SageMaker Images
 ################################################################################
 
-# SageMaker container images
 variable "sagemaker_images" {
   description = "SageMaker container image configurations"
   type = object({
@@ -254,9 +277,12 @@ variable "sagemaker_images" {
     # modules/patched-inference-image) layers additional CVE fixes on top
     # of the inference image for endpoint hosts.
     # Catalog: https://aws.github.io/deep-learning-containers/
+    # Model packages register on the patched Amazon Linux 2023 serving image
+    # that stack-inference builds from; TensorFlow Serving 2.20 loads the
+    # models the 2.19 training images save.
     tensorflow_gpu_tag       = "2.19.0-gpu-py312-cu125-ubuntu22.04-sagemaker"
     tensorflow_cpu_tag       = "2.19.0-cpu-py312-ubuntu22.04-sagemaker"
-    tensorflow_inference_tag = "2.19.0-cpu-py312-ubuntu22.04-sagemaker"
+    tensorflow_inference_tag = "2.20-cpu-py312-amzn2023-sagemaker"
   }
 }
 
@@ -273,7 +299,7 @@ variable "enable_auto_trigger" {
 variable "auto_trigger_marker_key" {
   description = "Object key prefix in the raw-data bucket whose creation starts the pipeline. scripts/data_uploader.sh writes this marker after a batch upload completes."
   type        = string
-  default     = "medical_image_data/.batch_complete"
+  default     = "images/.batch_complete"
 }
 
 ################################################################################
@@ -292,12 +318,12 @@ variable "quarantine_prefix" {
   default     = "quarantine/"
 
   validation {
-    condition = (
-      endswith(var.quarantine_prefix, "/")
-      && !startswith(var.quarantine_prefix, var.training_data_path)
-      && !startswith(var.training_data_path, var.quarantine_prefix)
-      && !startswith(var.auto_trigger_marker_key, var.quarantine_prefix)
-    )
+    condition = alltrue([
+      endswith(var.quarantine_prefix, "/"),
+      !startswith(var.quarantine_prefix, var.training_data_path),
+      !startswith(var.training_data_path, var.quarantine_prefix),
+      !startswith(var.auto_trigger_marker_key, var.quarantine_prefix),
+    ])
     error_message = "quarantine_prefix must end with / and must not overlap training_data_path or auto_trigger_marker_key."
   }
 }
@@ -324,8 +350,8 @@ variable "upload_quarantine_reserved_concurrency" {
 ################################################################################
 
 
-variable "clinical_quality_gate" {
-  description = "Clinical quality gate the ensemble must clear before it can be registered. Recall is highest because a missed malignant case (false negative) is the costly error. The evaluation and ensemble steps receive the same values (CLINICAL_QUALITY_GATE), so the threshold search targets this recall."
+variable "quality_gate" {
+  description = "Defaults of the AccuracyThreshold, RecallThreshold, PrecisionThreshold and AucThreshold pipeline parameters: the bars the ensemble must clear before it is registered. Recall is highest because a missed positive (false negative) is the costly error. The Condition step, the evaluation and ensemble steps (QUALITY_GATE) and the model package metadata read the parameter values, so a bar can be moved per execution."
   type = object({
     accuracy  = number
     recall    = number
@@ -341,14 +367,14 @@ variable "clinical_quality_gate" {
 }
 
 variable "fairness_gate" {
-  description = "Fairness gate the ensemble must clear before registration (Part 4). max_disparity bounds the larger of demographic-parity difference and equalized-odds difference, computed by scripts/bias/compute_bias.py with Fairlearn. Must mirror DEFAULT_THRESHOLD in that script. sensitive_feature is reported in the bias report; the public datasets used here carry no demographic metadata, so magnification is an honest subgroup proxy - supply a real attribute for clinical use."
+  description = "Fairness gate the ensemble must clear before registration. max_disparity bounds the larger of demographic-parity difference and equalized-odds difference, computed by scripts/bias/compute_bias.py with Fairlearn. Must mirror DEFAULT_THRESHOLD in that script. sensitive_feature names the subgroup attribute reported in the bias report; use an attribute your data carries."
   type = object({
     max_disparity     = number
     sensitive_feature = string
   })
   default = {
     max_disparity     = 0.10
-    sensitive_feature = "magnification"
+    sensitive_feature = "subgroup"
   }
 }
 
@@ -359,9 +385,53 @@ variable "allow_not_evaluable" {
 }
 
 variable "preprocessing_target_size" {
-  description = "Target square resolution (pixels) the preprocessing job resizes every image to before training. 512 preserves fine diagnostic features like microcalcifications; the trainers downsample to their own input_size from there."
+  description = "Target square resolution (pixels) the preprocessing job resizes every image to; the trainers downsample to their own input_size from there."
   type        = number
   default     = 512
+}
+
+variable "inference_results_retention_days" {
+  description = "Days the inference-results bucket keeps the uploaded images and predictions under predictions/, and noncurrent object versions, before S3 expires them."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.inference_results_retention_days >= 1
+    error_message = "inference_results_retention_days must be at least 1."
+  }
+}
+
+variable "processed_data_retention_days" {
+  description = "Days the processed-data bucket keeps each pipeline execution's validation report and train/validation/test splits (under executions/<execution-id>/) before S3 expires them."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.processed_data_retention_days >= 1
+    error_message = "processed_data_retention_days must be at least 1."
+  }
+}
+
+variable "baseline_cnn" {
+  description = "Optional training step for a small CNN trained from scratch (scripts/training/simple_cnn_trainer.py), the baseline the transfer-learning members are compared against. It trains on the same splits, also scores the test split (test_metrics.json in its model artifact), and is never part of the ensemble or registered. Upload the tarball with scripts/script_uploader.sh first."
+  type = object({
+    enabled         = bool
+    instance_type   = string
+    volume_size     = number
+    max_runtime     = number
+    hyperparameters = map(string)
+  })
+  default = {
+    enabled       = false
+    instance_type = "ml.c5.2xlarge"
+    volume_size   = 50
+    max_runtime   = 7200
+    hyperparameters = {
+      TRAINING_EPOCHS        = "30"
+      TRAINING_BATCH_SIZE    = "32"
+      TRAINING_LEARNING_RATE = "0.001"
+    }
+  }
 }
 
 variable "retraining_reason" {
@@ -375,13 +445,42 @@ variable "retraining_reason" {
 ################################################################################
 
 variable "enable_network_isolation" {
-  description = "Run the training jobs with network isolation (no outbound network access from the training container). The trainers then read ImageNet weights from s3://<scripts-bucket>/pretrained-weights/, so run scripts/download_pretrained_weights.py once before the first pipeline execution. Processing jobs are not isolated because they install Python dependencies at start-up."
+  description = "Run the training jobs with network isolation (no outbound network access from the training container); backbone_weights_s3_uri still reaches them as an input channel. Processing jobs are not isolated: they reach Amazon S3 through the training VPC (training_vpc_enabled)."
+  type        = bool
+  default     = true
+}
+
+variable "training_vpc_enabled" {
+  description = "Run every Processing and Training job of the pipeline in a VPC this stack creates (network.tf): private subnets in two Availability Zones, no internet gateway, no NAT gateway, an S3 gateway endpoint limited to the project buckets, and a security group whose only egress is HTTPS to S3. The processing steps then install their pinned packages from the wheelhouse scripts/script_uploader.sh uploads. Ignored when vpc_config is set; false runs the jobs in the SageMaker service network as before."
+  type        = bool
+  default     = true
+}
+
+variable "training_vpc_cidr" {
+  description = "IPv4 CIDR of the training VPC (training_vpc_enabled). It is split into two private subnets; each job instance takes up to two addresses."
+  type        = string
+  default     = "10.42.0.0/24"
+
+  validation {
+    condition     = can(cidrhost(var.training_vpc_cidr, 0)) && tonumber(split("/", var.training_vpc_cidr)[1]) <= 26
+    error_message = "training_vpc_cidr must be an IPv4 CIDR block of /26 or larger."
+  }
+}
+
+variable "training_vpc_monitoring_endpoint" {
+  description = "Add a CloudWatch metrics (com.amazonaws.<region>.monitoring) interface endpoint to the training VPC so the scheduled drift and fairness jobs can run in it and still publish their metrics. Interface endpoints are billed per Availability Zone hour (two AZs here)."
+  type        = bool
+  default     = true
+}
+
+variable "training_vpc_flow_logs" {
+  description = "Send VPC flow logs (accepted and rejected) of the training VPC to a CloudWatch log group encrypted with the project key, kept for log_retention_days."
   type        = bool
   default     = true
 }
 
 variable "vpc_config" {
-  description = "Optional VPC for the training and processing jobs. Null runs them in the SageMaker service network. The subnets need a route to Amazon S3 (gateway endpoint), SageMaker API, CloudWatch Logs and ECR (interface endpoints or NAT); processing jobs also pip install packages, which needs a route to PyPI or a mirror."
+  description = "Optional VPC of your own for the training and processing jobs; it takes precedence over training_vpc_enabled. The subnets need a route to Amazon S3 (gateway endpoint), and the processing steps install their packages from the wheelhouse in the scripts bucket, or from PyPI when it is reachable."
   type = object({
     subnet_ids         = list(string)
     security_group_ids = list(string)
@@ -398,13 +497,14 @@ variable "vpc_config" {
 # Audit & Compliance
 ################################################################################
 
-# Off by default: most accounts are already covered by an organization trail,
-# and a second multi-region trail duplicates cost. Enable it only in an
-# account that no organization trail covers.
+# On by default so every API call is audited: management events account-wide
+# plus data events for the project buckets and Lambda functions. In an account
+# an organization trail already covers, the management events are recorded
+# twice; turn this off there and add the data events to that trail instead.
 variable "enable_cloudtrail" {
-  description = "Create a multi-region CloudTrail trail with log-file integrity validation for this account. Leave false when an organization trail already records this account's API activity."
+  description = "Create a multi-region CloudTrail trail with log-file integrity validation that records management events and data events (S3 object-level calls on the project buckets, invocations of the project Lambda functions). Set false when an organization trail already records this account."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "enable_cloudtrail_sns" {
@@ -413,8 +513,26 @@ variable "enable_cloudtrail_sns" {
   default     = false
 }
 
+variable "enable_s3_access_logging" {
+  description = "Create an access-log bucket (SSE-S3, which S3 server access logging requires) and send every project bucket's server access logs to it."
+  type        = bool
+  default     = true
+}
+
+variable "access_log_retention_days" {
+  description = "Days the access-log bucket keeps S3 server access logs."
+  type        = number
+  default     = 365
+}
+
+variable "audit_bucket_force_destroy" {
+  description = "Let terraform destroy delete the CloudTrail log bucket with its logs. Default false keeps the audit logs; empty the bucket (or set true) before destroying the stack."
+  type        = bool
+  default     = false
+}
+
 variable "cloudtrail_retention_days" {
-  description = "Days to retain CloudTrail logs in S3 before lifecycle deletion. HIPAA requires 6 years of audit retention - typically achieved by shipping to a SIEM, not keeping everything in S3."
+  description = "Days to retain CloudTrail logs in S3 before lifecycle deletion. Ship to a SIEM or archive if your audit policy needs longer."
   type        = number
   default     = 400
 }
@@ -473,7 +591,7 @@ variable "sbom_retention_days" {
 }
 
 variable "min_images_per_class" {
-  description = "Minimum images required per class (benign/malignant) for the validation step to pass. Production default is 100; lower it for small test datasets."
+  description = "Minimum images required per class for the validation step to pass. Lower it for small test datasets."
   type        = number
   default     = 100
 }
@@ -499,27 +617,32 @@ variable "code_commit_sha" {
 ################################################################################
 
 variable "enable_model_card" {
-  description = "Create a SageMaker Model Card documenting intended use, risk rating, and clinical context for the model package group (Part 2/4)."
+  description = "Create a SageMaker Model Card documenting intended use and risk rating for the model package group."
   type        = bool
   default     = true
 }
 
 variable "model_card_risk_rating" {
-  description = "Risk rating recorded on the Model Card. High for clinical decision-support models."
+  description = "Risk rating recorded on the Model Card (Low, Medium, High or Unknown)."
   type        = string
   default     = "High"
 }
 
 variable "enable_debugger" {
-  description = "Attach SageMaker Debugger built-in rules (Overfit, LossNotDecreasing) to the training steps (Part 2). Off by default; the CloudWatch training metrics (and MLflow when enable_mlflow = true) cover the same need."
+  description = "Attach SageMaker Debugger built-in rules (Overfit, LossNotDecreasing) to the training steps. Off by default; the CloudWatch training metrics (and MLflow when enable_mlflow = true) cover the same need. Amazon SageMaker Debugger is no longer open to new customers; existing customers can continue to use it."
   type        = bool
   default     = false
 }
 
 variable "debugger_rule_image" {
-  description = "Region-specific SageMaker Debugger rule-evaluator image. us-east-1 default; see https://docs.aws.amazon.com/sagemaker/latest/dg/debugger-docker-images-rules.html"
+  description = "SageMaker Debugger rule-evaluator image URI for your Region, pinned to a version tag (see https://docs.aws.amazon.com/sagemaker/latest/dg/debugger-docker-images-rules.html). Required when enable_debugger = true."
   type        = string
-  default     = "503895931360.dkr.ecr.us-east-1.amazonaws.com/sagemaker-debugger-rules:latest"
+  default     = null
+
+  validation {
+    condition     = !var.enable_debugger || (var.debugger_rule_image != null && !endswith(coalesce(var.debugger_rule_image, ":latest"), ":latest"))
+    error_message = "Set debugger_rule_image to a version-tagged image URI when enable_debugger = true."
+  }
 }
 
 variable "enable_mlflow" {
@@ -529,7 +652,7 @@ variable "enable_mlflow" {
 }
 
 variable "enable_experiments" {
-  description = "Associate each training step with a SageMaker Experiment trial component via ExperimentConfig (Part 2)."
+  description = "Associate each training step with a SageMaker Experiment trial component via ExperimentConfig."
   type        = bool
   default     = true
 }

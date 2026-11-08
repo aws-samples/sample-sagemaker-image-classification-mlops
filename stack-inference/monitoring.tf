@@ -7,6 +7,19 @@ locals {
   drift_job_count    = (var.enable_drift_job && !var.use_serverless_inference) ? 1 : 0
   fairness_job_count = (var.enable_fairness_job && !var.use_serverless_inference) ? 1 : 0
 
+  # Both jobs run in the training stack's job VPC when it has one, reaching S3
+  # and CloudWatch metrics through its endpoints, and install their packages
+  # from the wheelhouse in the scripts bucket. Network isolation stays off
+  # because the scripts call S3 and CloudWatch themselves.
+  scheduled_job_vpc_config = try(data.terraform_remote_state.training.outputs.job_vpc_config, null)
+  scheduled_job_network_config = merge(
+    {
+      EnableInterContainerTrafficEncryption = true
+      EnableNetworkIsolation                = false
+    },
+    local.scheduled_job_vpc_config == null ? {} : { VpcConfig = local.scheduled_job_vpc_config },
+  )
+
   # Namespace/metrics the scheduled jobs publish to and their alarms read from.
   # Fairness shares the drift namespace so both signals graph side by side.
   drift_metric_namespace = "${var.project_name}/DriftDetection"
@@ -65,9 +78,26 @@ resource "aws_sqs_queue" "scheduler_dlq" {
 
   name                      = "${var.project_name}-monitoring-schedule-dlq"
   message_retention_seconds = 1209600
-  sqs_managed_sse_enabled   = true
+  kms_master_key_id         = local.training_outputs.kms_key_arn
 
   tags = { Purpose = "MonitoringScheduleDLQ" }
+}
+
+resource "aws_sqs_queue_policy" "scheduler_dlq" {
+  count = length(aws_sqs_queue.scheduler_dlq)
+
+  queue_url = aws_sqs_queue.scheduler_dlq[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "sqs:*"
+      Resource  = aws_sqs_queue.scheduler_dlq[0].arn
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }]
+  })
 }
 
 resource "aws_cloudwatch_metric_alarm" "scheduler_dlq_visible" {
@@ -173,10 +203,7 @@ resource "aws_scheduler_schedule" "drift_job" {
         AWS_DEFAULT_REGION = var.aws_region
       }
 
-      NetworkConfig = {
-        EnableInterContainerTrafficEncryption = true
-        EnableNetworkIsolation                = false
-      }
+      NetworkConfig = local.scheduled_job_network_config
     }), "\\u003c", "<"), "\\u003e", ">")
   }
 }
@@ -187,6 +214,7 @@ resource "aws_iam_role" "drift_job_scheduler" {
   count = local.drift_job_count
 
   name                 = "${var.project_name}-drift-job-scheduler"
+  description          = "Lets EventBridge Scheduler start the ${var.project_name} drift Processing job"
   permissions_boundary = var.permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -195,7 +223,8 @@ resource "aws_iam_role" "drift_job_scheduler" {
       Action    = "sts:AssumeRole"
       Principal = { Service = "scheduler.amazonaws.com" }
       Condition = {
-        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        StringEquals    = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        ArnLikeIfExists = { "aws:SourceArn" = "arn:aws:scheduler:${var.aws_region}:${data.aws_caller_identity.current.account_id}:schedule/default/${var.project_name}-*" }
       }
     }]
   })
@@ -219,7 +248,7 @@ resource "aws_iam_role_policy" "drift_job_scheduler" {
       {
         # Hand the SageMaker execution role to SageMaker only.
         Effect = "Allow"
-        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure - PassRole on the one SageMaker execution role, to sagemaker.amazonaws.com only
+        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure, terraform.lang.security.iam.no-iam-resource-exposure - PassRole on the one SageMaker execution role, to sagemaker.amazonaws.com only
         Action   = ["iam:PassRole"]
         Resource = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
         Condition = {
@@ -228,20 +257,13 @@ resource "aws_iam_role_policy" "drift_job_scheduler" {
       },
       {
         # Decrypt: the Scheduler reads the CMK-encrypted target payload with
-        # this role. DescribeKey: CreateProcessingJob with VolumeKmsKeyId checks
-        # the caller's access; it is a direct call, so it cannot carry the
-        # GrantIsForAWSResource condition that scopes CreateGrant.
+        # this role, and with GenerateDataKey sends failed runs to the
+        # CMK-encrypted dead-letter queue. DescribeKey: CreateProcessingJob
+        # checks the caller's access to VolumeKmsKeyId. No CreateGrant: the
+        # caller needs it only when the execution role passed lacks it.
         Effect   = "Allow"
-        Action   = ["kms:Decrypt", "kms:DescribeKey"]
+        Action   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
         Resource = local.training_outputs.kms_key_arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["kms:CreateGrant"]
-        Resource = local.training_outputs.kms_key_arn
-        Condition = {
-          Bool = { "kms:GrantIsForAWSResource" = "true" }
-        }
       },
       {
         Effect   = "Allow"
@@ -258,10 +280,10 @@ resource "aws_iam_role_policy" "drift_job_scheduler" {
 #
 # The BiasCheck step in stack-training proves a model was fair on the test split
 # before it registered. It cannot see a population shift after deployment: a
-# hospital network adding a site with a different demographic mix can raise the
-# false-negative rate for that group while aggregate accuracy looks unchanged.
-# This job re-measures the same Fairlearn metrics on live traffic, using the
-# confirmed diagnostic outcomes clinicians upload as ground truth.
+# new image source with a different subgroup mix can raise the false-negative
+# rate for that group while aggregate accuracy looks unchanged. This job
+# re-measures the same Fairlearn metrics on live traffic, using the confirmed
+# labels uploaded under fairness_ground_truth_prefix as ground truth.
 
 # Alarm on the live disparity. Held to the same threshold the model registered
 # under, and wired into the same retrain rule as drift.
@@ -269,7 +291,7 @@ resource "aws_cloudwatch_metric_alarm" "fairness_disparity" {
   count = local.fairness_job_count
 
   alarm_name          = "${var.project_name}-fairness-disparity"
-  alarm_description   = "Demographic-parity or equalized-odds difference across subgroups exceeded ${var.fairness_disparity_threshold} on live traffic, computed by the scheduled fairness Processing job from endpoint data capture joined with clinician-confirmed outcomes. Triggers automated retraining (human approval still required before redeploy)."
+  alarm_description   = "Demographic-parity or equalized-odds difference across subgroups exceeded ${var.fairness_disparity_threshold} on live traffic, computed by the scheduled fairness Processing job from endpoint data capture joined with confirmed labels. Triggers automated retraining (human approval still required before redeploy)."
   namespace           = local.drift_metric_namespace
   metric_name         = local.fairness_metric_name
   statistic           = "Maximum"
@@ -391,11 +413,7 @@ resource "aws_scheduler_schedule" "fairness_job" {
         AWS_DEFAULT_REGION = var.aws_region
       }
 
-      NetworkConfig = {
-        EnableInterContainerTrafficEncryption = true
-        # Fairlearn is pip-installed at job start, so the container needs egress.
-        EnableNetworkIsolation = false
-      }
+      NetworkConfig = local.scheduled_job_network_config
     }), "\\u003c", "<"), "\\u003e", ">")
   }
 }
@@ -406,6 +424,7 @@ resource "aws_iam_role" "fairness_job_scheduler" {
   count = local.fairness_job_count
 
   name                 = "${var.project_name}-fairness-job-scheduler"
+  description          = "Lets EventBridge Scheduler start the ${var.project_name} fairness Processing job"
   permissions_boundary = var.permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -414,7 +433,8 @@ resource "aws_iam_role" "fairness_job_scheduler" {
       Action    = "sts:AssumeRole"
       Principal = { Service = "scheduler.amazonaws.com" }
       Condition = {
-        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        StringEquals    = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        ArnLikeIfExists = { "aws:SourceArn" = "arn:aws:scheduler:${var.aws_region}:${data.aws_caller_identity.current.account_id}:schedule/default/${var.project_name}-*" }
       }
     }]
   })
@@ -438,7 +458,7 @@ resource "aws_iam_role_policy" "fairness_job_scheduler" {
       {
         # Hand the SageMaker execution role to SageMaker only.
         Effect = "Allow"
-        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure - PassRole on the one SageMaker execution role, to sagemaker.amazonaws.com only
+        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure, terraform.lang.security.iam.no-iam-resource-exposure - PassRole on the one SageMaker execution role, to sagemaker.amazonaws.com only
         Action   = ["iam:PassRole"]
         Resource = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
         Condition = {
@@ -447,20 +467,13 @@ resource "aws_iam_role_policy" "fairness_job_scheduler" {
       },
       {
         # Decrypt: the Scheduler reads the CMK-encrypted target payload with
-        # this role. DescribeKey: CreateProcessingJob with VolumeKmsKeyId checks
-        # the caller's access; it is a direct call, so it cannot carry the
-        # GrantIsForAWSResource condition that scopes CreateGrant.
+        # this role, and with GenerateDataKey sends failed runs to the
+        # CMK-encrypted dead-letter queue. DescribeKey: CreateProcessingJob
+        # checks the caller's access to VolumeKmsKeyId. No CreateGrant: the
+        # caller needs it only when the execution role passed lacks it.
         Effect   = "Allow"
-        Action   = ["kms:Decrypt", "kms:DescribeKey"]
+        Action   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
         Resource = local.training_outputs.kms_key_arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["kms:CreateGrant"]
-        Resource = local.training_outputs.kms_key_arn
-        Condition = {
-          Bool = { "kms:GrantIsForAWSResource" = "true" }
-        }
       },
       {
         Effect   = "Allow"
@@ -514,6 +527,7 @@ resource "aws_iam_role" "drift_retrain" {
   count = local.drift_retrain_count
 
   name                 = "${var.project_name}-drift-retrain-events-role"
+  description          = "Lets the ${var.project_name} EventBridge monitoring-alarm rule start the training pipeline"
   permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
@@ -522,6 +536,10 @@ resource "aws_iam_role" "drift_retrain" {
       Action    = "sts:AssumeRole"
       Effect    = "Allow"
       Principal = { Service = "events.amazonaws.com" }
+      Condition = {
+        StringEqualsIfExists = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        ArnLikeIfExists      = { "aws:SourceArn" = "arn:aws:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:rule/${var.project_name}-*" }
+      }
     }]
   })
 }
@@ -559,43 +577,77 @@ module "a2i_review" {
   workteam_arn       = var.review_workteam_arn
   output_s3_uri      = "s3://${local.training_outputs.monitoring_bucket}/human-review"
   execution_role_arn = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
+  kms_key_arn        = local.training_outputs.kms_key_arn
 }
 
 ################################################################################
 # Bedrock Guardrail (responsible-AI safeguard on the hybrid FM output)
 ################################################################################
 #
-# Constrains the foundation-model responses used for low-confidence hybrid
-# inference (Part 4): blocks PII leakage and out-of-scope/unsafe content in the
-# generated reasoning. Created only when hybrid inference is enabled. Native
-# resource: https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrock_guardrail
+# Filters the image and prompt sent to the foundation model for low-confidence
+# hybrid inference (Part 4) and the reasoning it returns: harmful content in
+# both directions, personal names anonymised. Encrypted with the project CMK.
+# Created only when hybrid inference is enabled. Native resource:
+# https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrock_guardrail
 resource "aws_bedrock_guardrail" "hybrid" {
   count = var.enable_bedrock_hybrid_inference ? 1 : 0
 
   name                      = "${var.project_name}-hybrid-guardrail"
-  description               = "Safeguards FM reasoning on low-confidence medical predictions"
+  description               = "Filters the image and prompt sent for low-confidence predictions and the reasoning returned"
   blocked_input_messaging   = "This request cannot be processed by the assistant."
   blocked_outputs_messaging = "The generated response was withheld by the content guardrail."
+  kms_key_arn               = local.training_outputs.kms_key_arn
 
+  # HATE, INSULTS, SEXUAL and VIOLENCE also check the uploaded image; the
+  # Bedrock image filter guide lists MISCONDUCT and PROMPT_ATTACK as text only
+  # outside four Regions. PROMPT_ATTACK applies to input only, and only to
+  # input inside guardrail input tags.
   content_policy_config {
     filters_config {
-      type            = "HATE"
-      input_strength  = "HIGH"
-      output_strength = "HIGH"
+      type              = "HATE"
+      input_strength    = "HIGH"
+      output_strength   = "HIGH"
+      input_modalities  = local.guardrail_image_input
+      output_modalities = ["TEXT"]
     }
     filters_config {
-      type            = "VIOLENCE"
-      input_strength  = "MEDIUM"
-      output_strength = "MEDIUM"
+      type              = "INSULTS"
+      input_strength    = "HIGH"
+      output_strength   = "HIGH"
+      input_modalities  = local.guardrail_image_input
+      output_modalities = ["TEXT"]
     }
     filters_config {
-      type            = "MISCONDUCT"
-      input_strength  = "HIGH"
-      output_strength = "HIGH"
+      type              = "SEXUAL"
+      input_strength    = "HIGH"
+      output_strength   = "HIGH"
+      input_modalities  = local.guardrail_image_input
+      output_modalities = ["TEXT"]
+    }
+    filters_config {
+      type              = "VIOLENCE"
+      input_strength    = "MEDIUM"
+      output_strength   = "MEDIUM"
+      input_modalities  = local.guardrail_image_input
+      output_modalities = ["TEXT"]
+    }
+    filters_config {
+      type              = "MISCONDUCT"
+      input_strength    = "HIGH"
+      output_strength   = "HIGH"
+      input_modalities  = ["TEXT"]
+      output_modalities = ["TEXT"]
+    }
+    filters_config {
+      type              = "PROMPT_ATTACK"
+      input_strength    = "HIGH"
+      output_strength   = "NONE"
+      input_modalities  = ["TEXT"]
+      output_modalities = ["TEXT"]
     }
   }
 
-  # Anonymize any patient-identifying text the FM might surface in its reasoning.
+  # Anonymize any personal names the FM might surface in its reasoning.
   sensitive_information_policy_config {
     pii_entities_config {
       type           = "NAME"
@@ -608,9 +660,26 @@ resource "aws_bedrock_guardrail" "hybrid" {
   }
 }
 
+# The function names a published version: DRAFT changes with every edit of
+# the guardrail. Each change publishes a new version before the function moves
+# to it and the old one is deleted.
+resource "aws_bedrock_guardrail_version" "hybrid" {
+  count = var.enable_bedrock_hybrid_inference ? 1 : 0
+
+  guardrail_arn = aws_bedrock_guardrail.hybrid[0].guardrail_arn
+  description   = "Version the ${var.project_name} inference function applies"
+
+  lifecycle {
+    create_before_destroy = true
+    replace_triggered_by  = [aws_bedrock_guardrail.hybrid[count.index]]
+  }
+}
+
 locals {
   # EventBridge Scheduler substitutes <aws.scheduler.execution-id> with a
   # 36-character UUID, and SageMaker caps ProcessingJobName at 63 characters.
   # 20 + "-drift-" (7) + 36 = 63, so the scheduled jobs can always be created.
   scheduled_job_prefix = substr(var.project_name, 0, 20)
+
+  guardrail_image_input = var.bedrock_guardrail_image_filters ? ["TEXT", "IMAGE"] : ["TEXT"]
 }

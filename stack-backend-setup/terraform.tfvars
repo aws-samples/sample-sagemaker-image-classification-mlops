@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-project_name = "medical-image-classification"
+project_name = "image-classification"
 environment  = "dev"
 aws_region   = "us-east-1"
 

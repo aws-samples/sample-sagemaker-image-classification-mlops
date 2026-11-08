@@ -2,7 +2,8 @@
 # image (Python 3.9, scikit-learn 1.4), which already carries boto3, numpy,
 # pandas and scikit-learn, so only Fairlearn is added. fairlearn 0.13.0 is the
 # newest release that supports Python 3.9 and scikit-learn 1.4; the in-pipeline
-# gate (scripts/bias) uses 0.14.0 in the TensorFlow image. The two metrics
-# used, demographic_parity_difference and equalized_odds_difference, are
-# computed the same way in both releases.
+# gate (scripts/bias) uses 0.14.0 in the TensorFlow image. The metrics used,
+# demographic_parity_difference, equalized_odds_difference and a MetricFrame
+# over true_positive_rate (equal opportunity), are computed the same way in
+# both releases.
 fairlearn==0.13.0

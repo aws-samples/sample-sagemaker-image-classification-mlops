@@ -18,9 +18,9 @@ quarantine = load_module(
 )
 
 BUCKET = "example-raw-data"
-PREFIX = "medical_image_data/"
+PREFIX = "images/"
 QUARANTINE = "quarantine/"
-MARKER = "medical_image_data/.batch_complete"
+MARKER = "images/.batch_complete"
 NAMESPACE = "example/DataQuality"
 
 
@@ -33,6 +33,7 @@ def _image(size=(224, 224), fmt="PNG") -> bytes:
 @pytest.fixture
 def s3(monkeypatch):
     for key, value in {
+        "RAW_DATA_BUCKET": BUCKET,
         "IMAGE_PREFIX": PREFIX,
         "QUARANTINE_PREFIX": QUARANTINE,
         "MARKER_KEY": MARKER,
@@ -74,7 +75,7 @@ def _quarantined_count():
 
 
 def test_good_image_is_kept(s3):
-    key = f"{PREFIX}breast_benign/SOB_B_A-14-22549AB-40-001.png"
+    key = f"{PREFIX}class_a/g001__img_001.png"
     result = _upload(s3, key, _image())
     assert result["status"] == "kept"
     assert _keys(s3) == [key]
@@ -82,12 +83,12 @@ def test_good_image_is_kept(s3):
 
 
 def test_good_jpeg_is_kept(s3):
-    key = f"{PREFIX}breast_malignant/SOB_M_DC-14-2523-40-001.jpg"
+    key = f"{PREFIX}class_b/g002__img_001.jpg"
     assert _upload(s3, key, _image(fmt="JPEG"))["status"] == "kept"
 
 
 def test_corrupt_image_is_quarantined(s3):
-    key = f"{PREFIX}breast_benign/corrupt.png"
+    key = f"{PREFIX}class_a/corrupt.png"
     truncated = _image()[:200]
     result = _upload(s3, key, truncated)
     assert result["status"] == "quarantined"
@@ -100,28 +101,28 @@ def test_corrupt_image_is_quarantined(s3):
 
 
 def test_too_small_image_is_quarantined(s3):
-    key = f"{PREFIX}breast_malignant/tiny.png"
+    key = f"{PREFIX}class_b/tiny.png"
     result = _upload(s3, key, _image(size=(64, 300)))
     assert result["status"] == "quarantined"
     assert "64x300 px is below the 112 px minimum" in _reason(s3, key)["reason"]
-    assert f"{PREFIX}breast_malignant/tiny.png" not in _keys(s3)
+    assert f"{PREFIX}class_b/tiny.png" not in _keys(s3)
 
 
 def test_non_image_is_quarantined(s3):
-    key = f"{PREFIX}breast_benign/notes.txt"
+    key = f"{PREFIX}class_a/notes.txt"
     result = _upload(s3, key, b"not an image")
     assert result["status"] == "quarantined"
     assert "extension '.txt' is not one of" in _reason(s3, key)["reason"]
 
 
 def test_non_image_with_image_extension_is_quarantined(s3):
-    key = f"{PREFIX}breast_benign/fake.png"
+    key = f"{PREFIX}class_a/fake.png"
     assert _upload(s3, key, b"%PDF-1.7 not a png")["status"] == "quarantined"
     assert "does not open as an image" in _reason(s3, key)["reason"]
 
 
 def test_wrong_format_for_extension_is_quarantined(s3):
-    key = f"{PREFIX}breast_benign/really-a-jpeg.png"
+    key = f"{PREFIX}class_a/really-a-jpeg.png"
     assert _upload(s3, key, _image(fmt="JPEG"))["status"] == "quarantined"
     assert "content is JPEG" in _reason(s3, key)["reason"]
 
@@ -140,3 +141,17 @@ def test_object_already_gone_is_not_an_error(s3):
 
 def test_allowed_extensions_match_the_pipeline():
     assert set(quarantine.ALLOWED_FORMATS) == set(IMAGE_EXTENSIONS)
+
+
+def test_events_for_another_bucket_are_ignored(s3):
+    event = {"detail": {"bucket": {"name": "someone-else"}, "object": {"key": f"{PREFIX}a.png"}}}
+    assert quarantine.lambda_handler(event, None)["reason"] == "unexpected bucket"
+
+
+def test_no_expected_bucket_fails_closed(s3, monkeypatch):
+    monkeypatch.delenv("RAW_DATA_BUCKET")
+    key = f"{PREFIX}class_a/notes.txt"
+    s3.put_object(Bucket=BUCKET, Key=key, Body=b"x")
+    event = {"detail": {"bucket": {"name": BUCKET}, "object": {"key": key}}}
+    assert quarantine.lambda_handler(event, None)["status"] == "ignored"
+    assert key in _keys(s3)

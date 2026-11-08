@@ -37,12 +37,12 @@ output "monitoring_bucket" {
 
 output "sagemaker_pipeline_name" {
   description = "Name of the SageMaker pipeline"
-  value       = aws_sagemaker_pipeline.medical_image_pipeline.pipeline_name
+  value       = aws_sagemaker_pipeline.image_pipeline.pipeline_name
 }
 
 output "sagemaker_pipeline_arn" {
   description = "ARN of the SageMaker pipeline"
-  value       = aws_sagemaker_pipeline.medical_image_pipeline.arn
+  value       = aws_sagemaker_pipeline.image_pipeline.arn
 }
 
 ################################################################################
@@ -84,11 +84,21 @@ output "mlflow_tracking_server_url" {
 
 output "model_package_group_name" {
   description = "Name of the model package group"
-  value       = aws_sagemaker_model_package_group.medical_image_models.model_package_group_name
+  value       = aws_sagemaker_model_package_group.image_models.model_package_group_name
+}
+
+output "access_log_bucket" {
+  description = "Bucket that receives S3 server access logs (null when enable_s3_access_logging = false)"
+  value       = local.access_log_bucket
+}
+
+output "training_data_path" {
+  description = "Prefix in the raw-data bucket that holds the images (<prefix><label>/<file>)"
+  value       = var.training_data_path
 }
 
 output "network_isolation_enabled" {
-  description = "Whether the training jobs run with network isolation. When true, the ImageNet weights must be in s3://<scripts-bucket>/pretrained-weights/ (make weights)."
+  description = "Whether the training jobs run with network isolation (no outbound network from the training containers)."
   value       = var.enable_network_isolation
 }
 
@@ -97,8 +107,13 @@ output "network_isolation_enabled" {
 ################################################################################
 
 output "sagemaker_execution_role_arn" {
-  description = "ARN of the SageMaker execution role"
+  description = "ARN of the SageMaker execution role: the pipeline role, and the role of the endpoint model, the scheduled monitoring jobs, the A2I flow and the MLflow tracking server"
   value       = module.sagemaker_execution_role.role_arn
+}
+
+output "sagemaker_job_role_arn" {
+  description = "ARN of the role the pipeline's Processing and Training jobs run with"
+  value       = module.sagemaker_job_role.role_arn
 }
 
 ################################################################################
@@ -171,4 +186,27 @@ output "upload_quarantine_function_name" {
 output "upload_quarantine_location" {
   description = "Where failing uploads are moved, with a .reason.json next to each (null when enable_upload_quarantine = false)"
   value       = var.enable_upload_quarantine ? "s3://${module.s3_raw_data.bucket_id}/${var.quarantine_prefix}" : null
+}
+
+################################################################################
+# Network
+################################################################################
+
+output "training_vpc_id" {
+  description = "ID of the training VPC (null when training_vpc_enabled = false or vpc_config is set)"
+  value       = try(aws_vpc.training[0].id, null)
+}
+
+output "job_vpc_config" {
+  description = "VpcConfig (Subnets, SecurityGroupIds) every pipeline job runs with: the training VPC, or vpc_config when set. Null when the jobs run without a VPC."
+  value       = local.pipeline_vpc_config
+}
+
+################################################################################
+# Audit
+################################################################################
+
+output "cloudtrail_trail_arn" {
+  description = "ARN of the audit trail (null when enable_cloudtrail = false)"
+  value       = try(aws_cloudtrail.audit[0].arn, null)
 }

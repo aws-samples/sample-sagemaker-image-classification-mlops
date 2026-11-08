@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import sys
 import time
 from datetime import UTC, datetime
@@ -16,10 +17,18 @@ from PIL import Image
 # The step's code directory holds mlops_common next to this file; a local
 # checkout has it one level up, in scripts/.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mlops_common.breakhis import groups_overlap, patient_grouped_split
-from mlops_common.constants import DEFAULT_SEED, IMAGE_EXTENSIONS
+from mlops_common.constants import DEFAULT_SEED
+from mlops_common.dataset_layout import (
+    describe_image,
+    discover_classes,
+    grouped_split,
+    groups_overlap,
+    list_images,
+    read_manifest,
+    write_classes,
+    write_manifest,
+)
 from mlops_common.preprocess import STORAGE_SIZE, standardize
-from mlops_common.s3io import delete_prefix
 from mlops_common.seeds import set_seeds
 
 logging.basicConfig(
@@ -32,47 +41,96 @@ logger = logging.getLogger(__name__)
 DEFAULT_TARGET_SIZE = STORAGE_SIZE
 VAL_FRACTION = 0.15
 TEST_FRACTION = 0.15
+SPLITS = ("train", "validation", "test")
+SPLIT_METRIC_NAMES = {"train": "Training", "validation": "Validation", "test": "Test"}
+
+# Written by the validation step (scripts/validation/data_validator.py).
+EXCLUSION_MANIFEST = "exclusion_manifest.json"
+IMAGE_INVENTORY = "image_inventory.json"
+RESOURCE_CONFIG = "/opt/ml/config/resourceconfig.json"
 
 
-def clear_processed_data_s3(bucket):
-    """Delete train/, validation/ and test/ in the named processed-data bucket.
+def cluster_hosts(resource_config=RESOURCE_CONFIG):
+    """(this host, all hosts) of the processing job; a single local host outside SageMaker."""
+    try:
+        with open(resource_config) as f:
+            config = json.load(f)
+        return config["current_host"], sorted(config["hosts"])
+    except (OSError, KeyError, ValueError):
+        host = socket.gethostname()
+        return host, [host]
 
-    The bucket comes from PROCESSED_DATA_BUCKET; without it nothing is deleted.
-    Stale images from an earlier run would otherwise mix into this run's splits.
+
+def load_validation_report(report_dir):
+    """(inventory or None, excluded entries) from the validation step's output.
+
+    The inventory (``class_names`` and ``images``) lists every readable image
+    the validation step saw, across all shards, with its group id and
+    attributes; the exclusion manifest lists the images it kept out of
+    training, each with a reason.
     """
-    if not bucket:
-        logger.warning("PROCESSED_DATA_BUCKET not set - skipping S3 cleanup of old splits")
-        return
-    import boto3
-
-    s3 = boto3.client("s3")
-    for prefix in ("train/", "validation/", "test/"):
-        try:
-            count = delete_prefix(s3, bucket, prefix)
-            logger.info("Cleared %d objects from s3://%s/%s", count, bucket, prefix)
-        except Exception as e:
-            logger.warning("Failed to clear s3://%s/%s: %s", bucket, prefix, e)
+    inventory = None
+    excluded = []
+    if report_dir:
+        inv_path = os.path.join(report_dir, IMAGE_INVENTORY)
+        if os.path.exists(inv_path):
+            with open(inv_path) as f:
+                inventory = json.load(f)
+        man_path = os.path.join(report_dir, EXCLUSION_MANIFEST)
+        if os.path.exists(man_path):
+            with open(man_path) as f:
+                excluded = json.load(f)["excluded"]
+    return inventory, excluded
 
 
 def resize_image(src_path, dst_path, target_size):
     """Resize one image to (target_size, target_size) RGB and save it.
 
     Resolution standardisation only, with the shared resample filter.
-    Normalisation (/255 then ImageNet mean/std) happens at train, eval and
-    inference time; baking it in here would double-normalise.
+    Normalisation happens at train, eval and inference time; baking it in here
+    would double-normalise.
     """
     with Image.open(src_path) as img:
         standardize(img, target_size).save(dst_path)
 
 
-def _list_images(class_dir):
-    return sorted(f for f in os.listdir(class_dir) if f.lower().endswith(IMAGE_EXTENSIONS))
+def _local_inventory(input_path):
+    """Inventory of the local images when there is no validation report (one instance)."""
+    class_names = discover_classes(input_path)
+    manifest = read_manifest(input_path)
+    images = []
+    for label, name in enumerate(class_names):
+        for f in list_images(os.path.join(input_path, name)):
+            file = f"{name}/{f}"
+            images.append({"file": file, "label": label, **describe_image(file, manifest)})
+    return {"class_names": list(class_names), "images": images}
 
 
-def preprocess_images(input_path, output_path, target_size=DEFAULT_TARGET_SIZE):
-    """Standardise images and split them into train/validation/test by patient."""
+def _make_dirs(path):
+    for attempt in range(3):
+        try:
+            os.makedirs(path, exist_ok=True)
+            return
+        except OSError as e:
+            if attempt == 2:
+                raise
+            logger.warning("Directory creation attempt %d failed: %s. Retrying...", attempt + 1, e)
+            time.sleep(2)
 
-    # Validate input parameters
+
+def preprocess_images(
+    input_path, output_path, target_size=DEFAULT_TARGET_SIZE, validation_report_path=None
+):
+    """Standardise images and split them into train/validation/test by group.
+
+    With several instances each one holds only its share of the raw images
+    (ShardedByS3Key). The split is therefore computed from the validation
+    step's inventory of every image, never from the local files, so every
+    instance puts a group in the same split; each instance then writes only
+    the images it holds. Images in the exclusion manifest are skipped and
+    logged. The first instance also writes classes.json and manifest.csv into
+    every split, for the training, evaluation and ensemble steps.
+    """
     if not input_path or not output_path:
         logger.error("Input path and output path are required")
         return False
@@ -83,7 +141,7 @@ def preprocess_images(input_path, output_path, target_size=DEFAULT_TARGET_SIZE):
 
     try:
         os.makedirs(output_path, exist_ok=True)
-    except Exception as e:
+    except OSError as e:
         logger.error(f"Cannot create output directory: {e}")
         return False
 
@@ -92,202 +150,205 @@ def preprocess_images(input_path, output_path, target_size=DEFAULT_TARGET_SIZE):
     logger.info(f"Output path: {output_path}")
 
     set_seeds(DEFAULT_SEED)
-    clear_processed_data_s3(os.environ.get("PROCESSED_DATA_BUCKET", ""))
 
-    # Check input structure
-    benign_dir = os.path.join(input_path, "breast_benign")
-    malignant_dir = os.path.join(input_path, "breast_malignant")
+    host, hosts = cluster_hosts()
+    first_host = host == hosts[0]
 
-    if not os.path.exists(benign_dir) or not os.path.exists(malignant_dir):
-        logger.error(f"Expected directories not found: {benign_dir}, {malignant_dir}")
+    inventory, excluded = load_validation_report(validation_report_path)
+    if inventory is None:
+        if len(hosts) > 1:
+            logger.error(
+                "%s not found under %s: with %d instances the split needs the validation "
+                "step's inventory of every image",
+                IMAGE_INVENTORY,
+                validation_report_path,
+                len(hosts),
+            )
+            return False
+        try:
+            inventory = _local_inventory(input_path)
+        except ValueError as e:
+            logger.error("Cannot read the dataset layout: %s", e)
+            return False
+
+    class_names = tuple(inventory["class_names"])
+    images = {str(i["file"]): i for i in inventory["images"]}
+    groups = {file: image.get("group") for file, image in images.items()}
+
+    # A share may hold images of one class only, so a missing class directory
+    # is an empty one; the whole-dataset class check below uses the inventory.
+    local_items = {
+        (f"{name}/{f}", label)
+        for label, name in enumerate(class_names)
+        for f in list_images(os.path.join(input_path, name))
+    }
+    if not local_items:
+        logger.error("No images under %s for the classes %s", input_path, class_names)
         return False
+    logger.info(
+        "Host %s (%d of %d): %d images in this share",
+        host,
+        hosts.index(host) + 1 if host in hosts else 1,
+        len(hosts),
+        len(local_items),
+    )
 
-    benign_files = _list_images(benign_dir)
-    malignant_files = _list_images(malignant_dir)
+    # Every image the validation step excluded is left out of all three splits.
+    excluded_keys = {(str(e["file"]), int(e["label"])) for e in excluded}
+    for entry in excluded:
+        logger.info("Excluded by validation: %s (%s)", entry["file"], entry["reason"])
+    inventory_items = {(file, int(image["label"])) for file, image in images.items()}
+    all_items = sorted(inventory_items - excluded_keys)
+    unvalidated = sorted(local_items - inventory_items - excluded_keys)
+    for file, _ in unvalidated:
+        logger.warning(
+            "Skipped %s: not in the validation inventory (uploaded after validation ran)", file
+        )
 
-    logger.info(f"Found {len(benign_files)} benign images")
-    logger.info(f"Found {len(malignant_files)} malignant images")
-
-    if len(benign_files) == 0 or len(malignant_files) == 0:
-        logger.error("No images found in one or both categories")
+    if not any(label == 0 for _, label in all_items) or not any(
+        label == 1 for _, label in all_items
+    ):
+        logger.error("No images found in one or both classes")
         return False
 
     # Clear and create output directories with retry logic
-    train_dir = os.path.join(output_path, "train")
-    val_dir = os.path.join(output_path, "validation")
-    test_dir = os.path.join(output_path, "test")
-
-    # Remove existing directories if they exist
-    for split_dir in [train_dir, val_dir, test_dir]:
+    split_dirs = {split: os.path.join(output_path, split) for split in SPLITS}
+    for split_dir in split_dirs.values():
         if os.path.exists(split_dir):
             shutil.rmtree(split_dir, ignore_errors=True)
             logger.info(f"Cleared local directory: {split_dir}")
+    for split_dir in split_dirs.values():
+        for name in class_names:
+            _make_dirs(os.path.join(split_dir, name))
 
-    # Create fresh directories with retry logic for filesystem delays
-    for split_dir in [train_dir, val_dir, test_dir]:
-        for attempt in range(3):
-            try:
-                os.makedirs(os.path.join(split_dir, "breast_benign"), exist_ok=True)
-                os.makedirs(os.path.join(split_dir, "breast_malignant"), exist_ok=True)
-                logger.info(f"Created directory: {split_dir}")
-                break
-            except OSError as e:
-                if attempt < 2:
-                    logger.warning(
-                        f"Directory creation attempt {attempt + 1} failed: {e}. Retrying..."
-                    )
-                    time.sleep(2)
-                    continue
-                else:
-                    logger.error(f"Failed to create directory after 3 attempts: {e}")
-                    raise e
-
-    # Patient-grouped split: every image of one patient lands in one split, so
-    # near-duplicate tiles cannot leak from train into validation or test.
-    items = [(f, 0) for f in benign_files] + [(f, 1) for f in malignant_files]
-    train_items, val_items, test_items = patient_grouped_split(
-        items, VAL_FRACTION, TEST_FRACTION, DEFAULT_SEED
+    # Group split: every image of one group lands in one split, so near-
+    # duplicate images cannot leak from train into validation or test. It is a
+    # deterministic function of the full inventory, so every instance computes
+    # the same assignment.
+    train_items, val_items, test_items = grouped_split(
+        all_items, VAL_FRACTION, TEST_FRACTION, DEFAULT_SEED, groups
     )
-    overlap = groups_overlap(train_items, val_items, test_items)
+    overlap = groups_overlap(train_items, val_items, test_items, groups=groups)
     if overlap:
-        logger.error("Patient groups in more than one split: %s", overlap[:10])
+        logger.error("Groups in more than one split: %s", overlap[:10])
         return False
-    logger.info("No patient appears in more than one split")
+    logger.info("No group appears in more than one split")
+    split_items = dict(zip(SPLITS, (train_items, val_items, test_items)))
 
-    def by_class(split_items, label):
-        return [f for f, lab in split_items if lab == label]
+    def count(items, label):
+        return sum(1 for _, lab in items if lab == label)
 
-    benign_train, benign_val, benign_test = (
-        by_class(x, 0) for x in (train_items, val_items, test_items)
-    )
-    malignant_train, malignant_val, malignant_test = (
-        by_class(x, 1) for x in (train_items, val_items, test_items)
-    )
-    for name, tr, va, te in (
-        ("benign", benign_train, benign_val, benign_test),
-        ("malignant", malignant_train, malignant_val, malignant_test),
-    ):
-        logger.info("%s: %d train, %d val, %d test", name, len(tr), len(va), len(te))
+    # Whole-dataset sizes, the same on every instance.
+    split_sizes = {
+        split: {name: count(items, label) for label, name in enumerate(class_names)}
+        for split, items in split_items.items()
+    }
+    for split, sizes in split_sizes.items():
+        logger.info("%s split: %s", split, sizes)
+    empty = [s for s, sizes in split_sizes.items() if not all(sizes.values())]
+    totals = {split: sum(sizes.values()) for split, sizes in split_sizes.items()}
+    if empty or totals["train"] < 20 or totals["validation"] < 10 or totals["test"] < 10:
+        logger.error("Insufficient data after split: %s, splits missing a class: %s", totals, empty)
+        return False
 
     # Resolution standardization: every image is resized to a fixed square
     # (target_size x target_size) RGB before being written to the split dirs.
+    # This instance writes only the images it holds.
     logger.info(f"Standardizing all images to {target_size}x{target_size} RGB")
-
-    def copy_files(file_list, source_dir, dest_dir, class_name):
-        count = 0
-        for filename in file_list:
-            src = os.path.join(source_dir, filename)
-            dst = os.path.join(dest_dir, f"breast_{class_name}", filename)
+    failed = []
+    written = {}
+    for split, items in split_items.items():
+        written[split] = dict.fromkeys(class_names, 0)
+        for file, label in items:
+            if (file, label) not in local_items:
+                continue
+            src = os.path.join(input_path, file)
+            dst = os.path.join(split_dirs[split], file)
             try:
                 resize_image(src, dst, target_size)
-                count += 1
-                # Progress logged via existing system
-            except Exception as e:
-                logger.warning(f"Failed to process {src}: {e}")
-        return count
+                written[split][class_names[label]] += 1
+            except (OSError, ValueError, Image.DecompressionBombError) as e:
+                logger.error(f"Failed to process {src}: {e}")
+                failed.append(src)
 
-    # Copy training files
-    train_benign_count = copy_files(benign_train, benign_dir, train_dir, "benign")
-    train_malignant_count = copy_files(malignant_train, malignant_dir, train_dir, "malignant")
+    logger.info("=== Preprocessing Complete on %s ===", host)
+    for split, counts in written.items():
+        logger.info("%s: wrote %s", split, counts)
+    if failed:
+        logger.error("%d image(s) could not be standardised: %s", len(failed), failed[:10])
+        return False
 
-    # Copy validation files
-    val_benign_count = copy_files(benign_val, benign_dir, val_dir, "benign")
-    val_malignant_count = copy_files(malignant_val, malignant_dir, val_dir, "malignant")
+    negative, positive = class_names
+    if first_host:
+        for split, items in split_items.items():
+            write_classes(split_dirs[split], class_names)
+            write_manifest(
+                split_dirs[split],
+                (
+                    {
+                        "file": file,
+                        "label": class_names[label],
+                        "group": images[file].get("group"),
+                        "attributes": images[file].get("attributes"),
+                    }
+                    for file, label in items
+                ),
+            )
 
-    # Copy test files
-    test_benign_count = copy_files(benign_test, benign_dir, test_dir, "benign")
-    test_malignant_count = copy_files(malignant_test, malignant_dir, test_dir, "malignant")
+        # CloudWatch metric filters read these lines. They describe the whole
+        # dataset, so only the first instance logs them.
+        metrics = {
+            "TotalProcessedImages": sum(totals.values()),
+            "ExcludedImageCount": len(excluded),
+        }
+        for split, prefix in SPLIT_METRIC_NAMES.items():
+            metrics[f"{prefix}ImageCount"] = totals[split]
+            metrics[f"{prefix}NegativeCount"] = split_sizes[split][negative]
+            metrics[f"{prefix}PositiveCount"] = split_sizes[split][positive]
+        for name, value in metrics.items():
+            logger.info(json.dumps({"metric_name": name, "metric_value": value}))
 
-    # Calculate totals
-    total_train = train_benign_count + train_malignant_count
-    total_val = val_benign_count + val_malignant_count
-    total_test = test_benign_count + test_malignant_count
-
-    logger.info("=== Preprocessing Complete ===")
-    logger.info(f"Training: {train_benign_count} benign, {train_malignant_count} malignant")
-    logger.info(f"Validation: {val_benign_count} benign, {val_malignant_count} malignant")
-    logger.info(f"Test: {test_benign_count} benign, {test_malignant_count} malignant")
-
-    # Log metrics for CloudWatch metric filters in CamelCase
-    logger.info(json.dumps({"metric_name": "TrainingImageCount", "metric_value": total_train}))
-    logger.info(json.dumps({"metric_name": "ValidationImageCount", "metric_value": total_val}))
-    logger.info(json.dumps({"metric_name": "TestImageCount", "metric_value": total_test}))
-    logger.info(
-        json.dumps(
-            {
-                "metric_name": "TotalProcessedImages",
-                "metric_value": total_train + total_val + total_test,
-            }
+        logger.info(
+            json.dumps(
+                {
+                    "dataset_version": f"v{datetime.now(UTC).strftime('%Y%m%d.%H%M')}",
+                    "total_images": sum(totals.values()),
+                    "train_images": totals["train"],
+                    "val_images": totals["validation"],
+                    "test_images": totals["test"],
+                    "class_names": list(class_names),
+                    "positive_class": positive,
+                    "excluded_images": len(excluded),
+                    "retraining_reason": os.environ.get("RETRAINING_REASON", "manual"),
+                    "status": "Success",
+                }
+            )
         )
-    )
-    logger.info(
-        json.dumps({"metric_name": "TrainingBenignCount", "metric_value": train_benign_count})
-    )
-    logger.info(
-        json.dumps({"metric_name": "TrainingMalignantCount", "metric_value": train_malignant_count})
-    )
-    logger.info(
-        json.dumps({"metric_name": "ValidationBenignCount", "metric_value": val_benign_count})
-    )
-    logger.info(
-        json.dumps({"metric_name": "ValidationMalignantCount", "metric_value": val_malignant_count})
-    )
-    logger.info(json.dumps({"metric_name": "TestBenignCount", "metric_value": test_benign_count}))
-    logger.info(
-        json.dumps({"metric_name": "TestMalignantCount", "metric_value": test_malignant_count})
-    )
-
-    # Dataset History Record for Table
-    dataset_version = f"v{datetime.now(UTC).strftime('%Y%m%d.%H%M')}"
-    total_images = total_train + total_val + total_test
-    total_benign = train_benign_count + val_benign_count + test_benign_count
-    total_malignant = train_malignant_count + val_malignant_count + test_malignant_count
-
-    dataset_history = {
-        "dataset_version": dataset_version,
-        "total_images": total_images,
-        "train_images": total_train,
-        "val_images": total_val,
-        "test_images": total_test,
-        "benign_images": total_benign,
-        "malignant_images": total_malignant,
-        "retraining_reason": os.environ.get("RETRAINING_REASON", "manual"),
-        "status": "Success",
-    }
-
-    logger.info(json.dumps(dataset_history))
-
-    # Keep human-readable logs too
-    logger.info(f"Training Images: {total_train}")
-    logger.info(f"Validation Images: {total_val}")
-    logger.info(f"Test Images: {total_test}")
 
     logger.info(
-        "Preprocessing complete: %d images, patient-grouped split (about 70/15/15 by "
-        "patient), seed %d",
-        len(benign_files) + len(malignant_files),
+        "Preprocessing complete: %d images in the dataset, %d excluded by validation, "
+        "%d not validated; group split (about 70/15/15 by group), seed %d",
+        len(all_items),
+        len(excluded),
+        len(unvalidated),
         DEFAULT_SEED,
     )
 
-    if total_train < 20 or total_val < 10 or total_test < 10:
-        logger.error(
-            f"Insufficient data after split: train={total_train}, val={total_val}, test={total_test}"
-        )
-        return False
-
-    # Create summary file
     summary = {
-        "train": {"benign": train_benign_count, "malignant": train_malignant_count},
-        "validation": {"benign": val_benign_count, "malignant": val_malignant_count},
-        "test": {"benign": test_benign_count, "malignant": test_malignant_count},
+        "host": host,
+        "hosts": hosts,
+        "class_names": list(class_names),
+        "dataset": split_sizes,
+        "written_by_this_host": written,
+        "excluded_by_validation": len(excluded),
+        "not_validated": [file for file, _ in unvalidated],
         "status": "success",
-        "total_processed": total_train + total_val + total_test,
     }
 
     try:
         with open(os.path.join(output_path, "preprocessing_summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
-    except Exception as e:
+    except OSError as e:
         logger.error(f"Failed to create summary file: {e}")
         return False
 
@@ -304,62 +365,42 @@ if __name__ == "__main__":
         default=DEFAULT_TARGET_SIZE,
         help="Square edge length (px) to resize every image to",
     )
-    # Accepted so an older pipeline definition that still passes the flag keeps
-    # working; class imbalance is handled by class weights in the trainers.
-    parser.add_argument("--apply-smote", action="store_true", help=argparse.SUPPRESS)
-
+    parser.add_argument(
+        "--validation-report-path",
+        help="Validation step output with image_inventory.json and exclusion_manifest.json",
+    )
     args = parser.parse_args()
 
     logger.info("=== Data Preprocessing Started ===")
 
     try:
-        if args.apply_smote:
-            logger.warning("--apply-smote is ignored: the trainers use class weights instead")
-        success = preprocess_images(args.input_path, args.output_path, target_size=args.target_size)
-        if success:
-            logger.info("Preprocessing completed successfully")
-
-            # Validate outputs were created
-            required_outputs = [
+        success = preprocess_images(
+            args.input_path,
+            args.output_path,
+            target_size=args.target_size,
+            validation_report_path=args.validation_report_path,
+        )
+        if not success:
+            logger.error("Preprocessing failed")
+            sys.exit(1)
+        # Each instance writes only its share, so a split directory may hold
+        # one class on one instance; the whole-dataset class check ran above.
+        missing_outputs = [
+            path
+            for path in (
                 os.path.join(args.output_path, "train"),
                 os.path.join(args.output_path, "validation"),
                 os.path.join(args.output_path, "test"),
                 os.path.join(args.output_path, "preprocessing_summary.json"),
-            ]
-
-            missing_outputs = [f for f in required_outputs if not os.path.exists(f)]
-            if missing_outputs:
-                logger.error(f"Missing required outputs: {missing_outputs}")
-                sys.exit(1)
-
-            # Validate each split has data
-            for split in ["train", "validation", "test"]:
-                split_dir = os.path.join(args.output_path, split)
-                benign_count = len(
-                    [
-                        f
-                        for f in os.listdir(os.path.join(split_dir, "breast_benign"))
-                        if f.lower().endswith((".jpg", ".jpeg", ".png"))
-                    ]
-                )
-                malignant_count = len(
-                    [
-                        f
-                        for f in os.listdir(os.path.join(split_dir, "breast_malignant"))
-                        if f.lower().endswith((".jpg", ".jpeg", ".png"))
-                    ]
-                )
-
-                if benign_count == 0 or malignant_count == 0:
-                    logger.error(
-                        f"{split} split has no data: benign={benign_count}, malignant={malignant_count}"
-                    )
-                    sys.exit(1)
-
-            logger.info("All preprocessing outputs validated")
-        else:
-            logger.error("Preprocessing failed")
+            )
+            if not os.path.exists(path)
+        ]
+        if missing_outputs:
+            logger.error(f"Missing required outputs: {missing_outputs}")
             sys.exit(1)
+        logger.info("Preprocessing completed successfully")
     except Exception as e:
+        # Top-level boundary of the step: log the failure and exit non-zero so
+        # the pipeline marks the step failed.
         logger.error(f"Preprocessing failed with error: {e}")
         sys.exit(1)

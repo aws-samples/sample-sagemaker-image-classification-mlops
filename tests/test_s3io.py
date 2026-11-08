@@ -4,7 +4,7 @@
 from datetime import UTC, datetime, timedelta
 
 import boto3
-from mlops_common.s3io import delete_prefix, hour_prefixes, iter_capture_keys
+from mlops_common.s3io import hour_prefixes, iter_capture_keys
 from moto import mock_aws
 
 BUCKET = "monitoring-test"
@@ -39,15 +39,3 @@ def test_capture_listing_reads_only_the_window_and_endpoint():
     since = now - timedelta(hours=24)
     found = list(iter_capture_keys(s3, BUCKET, "data-capture", "ep", since))
     assert found == [k for k, want in keys.items() if want]
-
-
-@mock_aws
-def test_delete_prefix_paginates_and_stays_in_prefix():
-    s3 = boto3.client("s3")
-    s3.create_bucket(Bucket=BUCKET)
-    for i in range(1005):
-        s3.put_object(Bucket=BUCKET, Key=f"train/{i:05d}.png", Body=b"x")
-    s3.put_object(Bucket=BUCKET, Key="keep/me.txt", Body=b"x")
-    assert delete_prefix(s3, BUCKET, "train/") == 1005
-    remaining = [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKET).get("Contents", [])]
-    assert remaining == ["keep/me.txt"]

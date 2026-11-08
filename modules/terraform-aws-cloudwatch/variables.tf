@@ -47,15 +47,15 @@ variable "log_groups" {
   description = "Map of log groups to create (generic mode only)"
   type = map(object({
     name              = string
-    retention_in_days = optional(number, 14)
+    retention_in_days = optional(number)
   }))
   default = {}
 }
 
 variable "log_retention_days" {
-  description = "Default CloudWatch log retention in days (generic mode only)"
+  description = "CloudWatch log retention in days for the log groups this module creates (a generic log group can set its own)."
   type        = number
-  default     = 14
+  default     = 365
 }
 
 variable "kms_key_arn" {

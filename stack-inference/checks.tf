@@ -14,4 +14,4 @@ check "cloudfront_distribution_health" {
 
 # Note: SageMaker endpoint health check is not possible via data source
 # (aws_sagemaker_endpoint data source does not exist in the AWS provider).
-# Use the CLI to verify: aws sagemaker describe-endpoint --endpoint-name medical-image-classification-endpoint
+# Use the CLI to verify: aws sagemaker describe-endpoint --endpoint-name <project_name>-endpoint

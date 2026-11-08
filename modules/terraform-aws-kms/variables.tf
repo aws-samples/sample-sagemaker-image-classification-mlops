@@ -44,6 +44,24 @@ variable "enable_cloudtrail_sns_grant" {
   default     = false
 }
 
+variable "cloudtrail_source_arn" {
+  description = "Trail ARN (wildcards allowed) the CloudTrail SNS statement accepts in aws:SourceArn. Null = any trail in this account."
+  type        = string
+  default     = null
+}
+
+variable "enable_cloudwatch_alarms_grant" {
+  description = "Add the key-policy statement CloudWatch needs to publish alarm notifications to an SNS topic encrypted with this CMK (kms:GenerateDataKey* and kms:Decrypt for cloudwatch.amazonaws.com, limited to alarms in this account and Region)."
+  type        = bool
+  default     = false
+}
+
+variable "enable_cloudfront_grant" {
+  description = "Add the key-policy statement that lets CloudFront distributions in this account decrypt S3 objects encrypted with this CMK through origin access control."
+  type        = bool
+  default     = false
+}
+
 variable "enable_cloudtrail_grant" {
   description = "Add a key-policy statement allowing the CloudTrail service principal to GenerateDataKey/DescribeKey. Required when this CMK encrypts a CloudTrail trail, otherwise CreateTrail fails with InsufficientEncryptionPolicyException."
   type        = bool

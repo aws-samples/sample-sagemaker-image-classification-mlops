@@ -19,6 +19,7 @@ module "sagemaker_endpoint" {
   min_capacity                         = var.endpoint_min_capacity
   max_capacity                         = var.endpoint_max_capacity
   target_concurrent_requests_per_model = var.target_concurrent_requests_per_model
+  enable_network_isolation             = var.endpoint_network_isolation
 
   # Serverless inference opt-in. When true, the module swaps the production
   # variant to serverless (scales to zero) and skips DataCaptureConfig and
@@ -52,7 +53,7 @@ module "inference_lambda" {
 
   source_dir            = "${path.module}/lambda"
   function_name         = "${var.project_name}-${each.key}"
-  execution_role_arn    = module.inference_lambda_role.role_arn
+  execution_role_arn    = each.key == "endpoint_refresher" ? module.endpoint_refresher_role.role_arn : module.inference_lambda_role.role_arn
   handler               = each.value.handler
   timeout               = var.lambda_timeout
   memory_size           = var.lambda_memory_size
@@ -94,6 +95,8 @@ module "sns_alerts" {
   topic_name     = "${var.project_name}-inference-alerts"
   email_endpoint = var.alert_email
   alarms         = local.alarms_config
+  # The training stack's key policy lets CloudWatch alarms use this CMK.
+  kms_master_key_id = local.training_outputs.kms_key_arn
 
   composite_alarm = {
     alarm_name        = "${var.project_name}-inference-health"
@@ -112,8 +115,8 @@ module "sns_alerts" {
 # Access control on the public API (defaults): an API key through a usage
 # plan, a regional WAF web ACL (AWS managed common rules + per-IP rate limit),
 # stage throttling, and CORS locked to the CloudFront origin. The key meters
-# callers but is visible in the frontend; switch api_authorization_type to
-# AWS_IAM or COGNITO_USER_POOLS to authenticate users.
+# callers but is visible in the frontend; set api_authorization_type to
+# COGNITO_USER_POOLS (user pool in cognito.tf) or AWS_IAM to authenticate users.
 module "api_gateway" {
   source = "../modules/terraform-aws-api-gateway"
 
@@ -123,7 +126,7 @@ module "api_gateway" {
   cors_allowed_origin = local.frontend_origin
 
   authorization_type     = var.api_authorization_type
-  cognito_user_pool_arns = var.api_cognito_user_pool_arns
+  cognito_user_pool_arns = local.api_cognito_user_pool_arns
   require_api_key        = var.api_require_api_key
   enable_waf             = var.api_enable_waf
   waf_rate_limit         = var.api_waf_rate_limit
@@ -138,7 +141,6 @@ module "api_gateway" {
   permissions_boundary_arn = var.permissions_boundary_arn
 }
 
-# Lambda permission for API Gateway
 resource "aws_lambda_permission" "api_gateway_invoke" {
   statement_id  = "AllowExecutionFromAPIGateway"
   action        = "lambda:InvokeFunction"
@@ -151,10 +153,58 @@ resource "aws_lambda_permission" "api_gateway_invoke" {
 # IAM
 ################################################################################
 
+locals {
+  # A system-defined inference profile id is a model id with a geography prefix
+  # (us.amazon.nova-pro-v1:0 routes amazon.nova-pro-v1:0).
+  bedrock_id_parts              = split(".", var.bedrock_model_id)
+  bedrock_uses_profile          = length(local.bedrock_id_parts) > 2
+  bedrock_foundation_model      = local.bedrock_uses_profile ? join(".", slice(local.bedrock_id_parts, 1, length(local.bedrock_id_parts))) : var.bedrock_model_id
+  bedrock_inference_profile_arn = "arn:aws:bedrock:${var.aws_region}:${data.aws_caller_identity.current.account_id}:inference-profile/${var.bedrock_model_id}"
+
+  # InvokeModel on the configured model only. Through a cross-Region profile
+  # Bedrock authorizes the profile in this Region and the foundation model in
+  # every Region the profile routes to; the condition admits the foundation
+  # model only when the call comes through that profile.
+  bedrock_invoke_statements = concat(
+    [for statement in [
+      {
+        Effect   = "Allow"
+        Action   = ["bedrock:InvokeModel"]
+        Resource = local.bedrock_inference_profile_arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["bedrock:InvokeModel"]
+        Resource = "arn:aws:bedrock:*::foundation-model/${local.bedrock_foundation_model}"
+        Condition = {
+          StringEquals = { "bedrock:InferenceProfileArn" = local.bedrock_inference_profile_arn }
+        }
+      },
+    ] : statement if local.bedrock_uses_profile],
+    [for statement in [
+      {
+        Effect   = "Allow"
+        Action   = ["bedrock:InvokeModel"]
+        Resource = "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.bedrock_model_id}"
+      },
+    ] : statement if !local.bedrock_uses_profile],
+  )
+
+  # Every endpoint config and model the endpoint can run (Terraform,
+  # auto-deploy and refresh ones) is named from the project name; the
+  # Terraform config keeps its first 32 characters.
+  refresh_read_prefix = substr(var.project_name, 0, 32)
+  refresh_name_prefix = substr(local.endpoint_name, 0, 40)
+}
+
+# The public inference API function. It reads and writes request records,
+# calls the endpoint and, when enabled, Amazon Bedrock and Amazon A2I. It cannot
+# change models, endpoint configs or endpoints, and cannot pass a role.
 module "inference_lambda_role" {
   source = "../modules/terraform-aws-iam"
 
   role_name                = "${var.project_name}-lambda-execution-role"
+  description              = "Execution role for the ${var.project_name} inference API Lambda function"
   permissions_boundary_arn = var.permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -169,50 +219,36 @@ module "inference_lambda_role" {
     ]
   })
 
-  managed_policy_arns = [
-    "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-  ]
-
   inline_policies = {
     lambda_permissions = jsonencode({
       Version = "2012-10-17"
       Statement = concat([
         {
-          Effect = "Allow"
-          Action = [
-            "s3:GetObject",
-            "s3:PutObject",
-            "s3:ListBucket"
-          ]
-          Resource = [
-            "arn:aws:s3:::${local.training_outputs.inference_bucket}",
-            "arn:aws:s3:::${local.training_outputs.inference_bucket}/*"
-          ]
+          # Writes only to this function's own log group, which the Lambda
+          # module creates.
+          Effect   = "Allow"
+          Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+          Resource = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.project_name}-inference_api:*"
         },
         {
-          # Read-only on the monitoring bucket for the drift detector: it lists
-          # the data-capture prefix and reads the baseline statistics. No write
-          # access - the detector only publishes to CloudWatch.
-          Effect = "Allow"
-          Action = [
-            "s3:GetObject",
-            "s3:ListBucket"
-          ]
-          Resource = [
-            "arn:aws:s3:::${local.training_outputs.monitoring_bucket}",
-            "arn:aws:s3:::${local.training_outputs.monitoring_bucket}/*"
-          ]
+          # ListBucket turns a missing result into a 404 instead of a 403 for
+          # GET /results/{id}.
+          Effect   = "Allow"
+          Action   = ["s3:ListBucket"]
+          Resource = "arn:aws:s3:::${local.training_outputs.inference_bucket}"
         },
         {
-          Effect = "Allow"
-          Action = [
-            "kms:Decrypt",
-            "kms:GenerateDataKey",
-            "kms:DescribeKey"
-          ]
-          Resource = [
-            data.terraform_remote_state.training.outputs.kms_key_arn
-          ]
+          # Uploaded images and prediction records (lambda/inference_handler.py).
+          Effect   = "Allow"
+          Action   = ["s3:GetObject", "s3:PutObject"]
+          Resource = "arn:aws:s3:::${local.training_outputs.inference_bucket}/predictions/*"
+        },
+        {
+          # SSE-KMS on the inference bucket, and the CMK that encrypts the
+          # Bedrock guardrail.
+          Effect   = "Allow"
+          Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
+          Resource = [data.terraform_remote_state.training.outputs.kms_key_arn]
         },
         {
           # InvokeEndpoint scoped to THIS project's endpoint so a compromised
@@ -226,44 +262,156 @@ module "inference_lambda_role" {
           ]
         },
         {
-          # PutMetricData has no resource-level scoping in AWS.
+          # PutMetricData requires no resource; the namespace condition scopes it.
           Effect   = "Allow"
           Action   = ["cloudwatch:PutMetricData"]
           Resource = "*"
+          Condition = {
+            StringLike = { "cloudwatch:namespace" = "${var.project_name}/*" }
+          }
         },
+        # X-Ray tracing - required when the Lambda module sets
+        # tracing_config.mode = "Active". Without this the function starts
+        # up but fails to publish trace segments.
         {
+          # X-Ray trace writes support only "*".
           Effect = "Allow"
           Action = [
-            "sagemaker:DescribeEndpoint",
-            "sagemaker:DescribeEndpointConfig",
-            "sagemaker:CreateEndpointConfig",
-            "sagemaker:UpdateEndpoint",
+            "xray:PutTraceSegments",
+            "xray:PutTelemetryRecords",
+          ]
+          Resource = "*"
+        },
+        ], [for statement in concat(local.bedrock_invoke_statements, [
+          {
+            # InvokeModel with a guardrail needs ApplyGuardrail on it.
+            Effect   = "Allow"
+            Action   = ["bedrock:ApplyGuardrail"]
+            Resource = aws_bedrock_guardrail.hybrid[*].guardrail_arn
+          },
+        ]) : statement if var.enable_bedrock_hybrid_inference], var.enable_human_review ? [
+        {
+          # Optional A2I review: start a human loop on this project's flow.
+          Effect = "Allow"
+          Action = [
+            "sagemaker:StartHumanLoop"
           ]
           Resource = [
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:flow-definition/${var.project_name}-*"
+          ]
+        }
+      ] : [])
+    })
+  }
+}
+
+# The weekly endpoint refresher (lambda/endpoint_refresher.py): clones the
+# running endpoint config, copies its models onto the newest patched image,
+# rolls the endpoint and deletes what earlier runs left. EventBridge invokes
+# it; nothing public does.
+module "endpoint_refresher_role" {
+  source = "../modules/terraform-aws-iam"
+
+  role_name                = "${var.project_name}-endpoint-refresher-role"
+  description              = "Execution role for the ${var.project_name} weekly endpoint refresher Lambda function"
+  permissions_boundary_arn = var.permissions_boundary_arn
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  inline_policies = {
+    endpoint_refresh = jsonencode({
+      Version = "2012-10-17"
+      Statement = [
+        {
+          # Writes only to this function's own log group, which the Lambda
+          # module creates.
+          Effect   = "Allow"
+          Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+          Resource = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.project_name}-endpoint_refresher:*"
+        },
+        {
+          Effect   = "Allow"
+          Action   = ["sagemaker:DescribeEndpoint"]
+          Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:endpoint/${local.endpoint_name}"
+        },
+        {
+          # UpdateEndpoint authorizes against the endpoint and the config it
+          # moves to, which is always a refresh config.
+          Effect = "Allow"
+          Action = ["sagemaker:UpdateEndpoint"]
+          Resource = [
             "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:endpoint/${local.endpoint_name}",
-            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:endpoint-config/*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:endpoint-config/${local.refresh_name_prefix}-refresh-*",
           ]
         },
         {
-          # Endpoint refresher cleanup: list the refresh configs of earlier
-          # runs, then delete only those (refresh_prefix in
-          # lambda/endpoint_refresher.py). ListEndpointConfigs has no
-          # resource-level scoping.
+          # The config the endpoint runs, whichever created it.
           Effect   = "Allow"
-          Action   = ["sagemaker:ListEndpointConfigs"]
+          Action   = ["sagemaker:DescribeEndpointConfig"]
+          Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:endpoint-config/${local.refresh_read_prefix}*"
+        },
+        {
+          # Only the refresh configs it creates (refresh_prefix in the handler).
+          Effect   = "Allow"
+          Action   = ["sagemaker:CreateEndpointConfig", "sagemaker:DeleteEndpointConfig"]
+          Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:endpoint-config/${local.refresh_name_prefix}-refresh-*"
+        },
+        {
+          # The models the running config names, whichever created them.
+          Effect   = "Allow"
+          Action   = ["sagemaker:DescribeModel"]
+          Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:model/${local.refresh_read_prefix}*"
+        },
+        {
+          # Only the image copies it creates (model_prefix in the handler).
+          Effect   = "Allow"
+          Action   = ["sagemaker:CreateModel", "sagemaker:DeleteModel"]
+          Resource = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:model/${local.refresh_name_prefix}-image-*"
+        },
+        {
+          # ListEndpointConfigs and ListModels support only "*".
+          Effect   = "Allow"
+          Action   = ["sagemaker:ListEndpointConfigs", "sagemaker:ListModels"]
           Resource = "*"
         },
         {
-          Effect = "Allow"
-          Action = ["sagemaker:DeleteEndpointConfig"]
-          Resource = [
-            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:endpoint-config/${substr(local.endpoint_name, 0, 40)}-refresh-*",
-          ]
+          # A model copy keeps the execution role of the model it copies, the
+          # one SageMaker role every model in this sample uses.
+          Effect   = "Allow"
+          Action   = ["iam:PassRole"]
+          Resource = data.terraform_remote_state.training.outputs.sagemaker_execution_role_arn
+          Condition = {
+            StringEquals = {
+              "iam:PassedToService" = "sagemaker.amazonaws.com"
+            }
+          }
         },
         {
-          # The cloned config keeps the project CMK (KmsKeyId) for the ML
-          # storage volume; SageMaker needs a grant from the caller of
-          # UpdateEndpoint to attach it.
+          Effect   = "Allow"
+          Action   = ["ecr:DescribeImages"]
+          Resource = [module.patched_inference_image.repository_arn]
+        },
+        {
+          # DescribeKey: CreateEndpointConfig checks the caller's access to the
+          # KmsKeyId the cloned config keeps; it is a direct call, so it cannot
+          # carry the GrantIsForAWSResource condition that scopes CreateGrant.
+          Effect   = "Allow"
+          Action   = ["kms:DescribeKey"]
+          Resource = [data.terraform_remote_state.training.outputs.kms_key_arn]
+        },
+        {
+          # SageMaker needs a grant from the caller of UpdateEndpoint to attach
+          # the CMK-encrypted ML storage volume.
           Effect   = "Allow"
           Action   = ["kms:CreateGrant"]
           Resource = [data.terraform_remote_state.training.outputs.kms_key_arn]
@@ -280,23 +428,7 @@ module "inference_lambda_role" {
           Resource = module.sagemaker_endpoint.rollback_alarm_arns
         },
         {
-          # PassRole for the execution role (ExecutionRoleArn) the cloned
-          # endpoint config may carry. The refresher attaches no new role.
-          Effect = "Allow"
-          Action = ["iam:PassRole"]
-          Resource = [
-            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.project_name}-*",
-          ]
-          Condition = {
-            StringEquals = {
-              "iam:PassedToService" = "sagemaker.amazonaws.com"
-            }
-          }
-        },
-        # X-Ray tracing - required when the Lambda module sets
-        # tracing_config.mode = "Active". Without this the function starts
-        # up but fails to publish trace segments.
-        {
+          # X-Ray trace writes support only "*".
           Effect = "Allow"
           Action = [
             "xray:PutTraceSegments",
@@ -304,37 +436,7 @@ module "inference_lambda_role" {
           ]
           Resource = "*"
         },
-        ], var.enable_bedrock_hybrid_inference ? [
-        # Hybrid inference: invoke the Bedrock FM for low-confidence reasoning.
-        # Covers both the foundation model and the cross-region inference
-        # profile (the `us.` model id resolves through an inference profile,
-        # which in turn invokes the regional foundation models), and applies
-        # this stack's guardrail only.
-        {
-          Effect = "Allow"
-          Action = ["bedrock:InvokeModel"]
-          Resource = [
-            "arn:aws:bedrock:*::foundation-model/*",
-            "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/*",
-          ]
-        },
-        {
-          Effect   = "Allow"
-          Action   = ["bedrock:ApplyGuardrail"]
-          Resource = [aws_bedrock_guardrail.hybrid[0].guardrail_arn]
-        },
-        ] : [], var.enable_human_review ? [
-        {
-          # Optional A2I review: start a human loop on this project's flow.
-          Effect = "Allow"
-          Action = [
-            "sagemaker:StartHumanLoop"
-          ]
-          Resource = [
-            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:flow-definition/${var.project_name}-*"
-          ]
-        }
-      ] : [])
+      ]
     })
   }
 }
@@ -381,13 +483,13 @@ resource "aws_lambda_permission" "eventbridge_invoke_refresher" {
 # Patched inference image - the one serving image
 ################################################################################
 
-# The public AWS DLC (`tensorflow-inference:2.19.0-cpu-py312-...`) accumulates
-# OS-level CVEs between AWS-published patch releases. This module stands up a
-# private, immutable ECR repo, a CodeBuild project that layers
-# `apt-get dist-upgrade` + `pip --upgrade` on top of the DLC, and a monthly
-# rebuild. Both the Terraform-managed model and the auto-deploy Lambda run the
-# newest build pinned by digest. Re-apply after a rebuild so the next
-# deployment uses the new digest.
+# The public AWS DLC (`tensorflow-inference:2.20-cpu-py312-amzn2023-sagemaker`)
+# accumulates OS-level CVEs between AWS-published patch releases. This module
+# stands up a private, immutable ECR repo, a CodeBuild project that layers the
+# OS package upgrade (dnf or apt) + `pip --upgrade` on top of the DLC, and a
+# weekly rebuild. The Terraform-managed model and the auto-deploy Lambda run
+# the newest build pinned by digest, and the weekly endpoint refresher repins
+# the live endpoint to the newest build, so no apply is needed for patches.
 
 module "patched_inference_image" {
   source = "../modules/terraform-aws-patched-inference-image"
@@ -406,6 +508,12 @@ module "patched_inference_image" {
   # s3:PutObject statement in the CodeBuild IAM policy).
   sbom_bucket     = coalesce(data.terraform_remote_state.training.outputs.sbom_bucket, "")
   sbom_bucket_arn = coalesce(data.terraform_remote_state.training.outputs.sbom_bucket_arn, "")
+
+  # Each build deletes an image with a scan finding at or above this severity
+  # before the endpoint can be repinned to it.
+  scan_block_severity = var.patched_image_scan_block_severity
+  log_retention_days  = var.log_retention_days
+  alarm_actions       = [module.sns_alerts.sns_topic_arn]
 
   permissions_boundary_arn = var.permissions_boundary_arn
 }
@@ -441,6 +549,8 @@ module "auto_deployment" {
   deployment_config_json = module.sagemaker_endpoint.deployment_config_json
   rollback_alarm_arns    = module.sagemaker_endpoint.rollback_alarm_arns
 
+  enable_network_isolation = var.endpoint_network_isolation
+
   # Mirror the serverless flags into the Lambda env so the auto-deployer
   # creates endpoint configs matching the initial Terraform deploy.
   use_serverless_inference   = var.use_serverless_inference
@@ -462,9 +572,22 @@ module "frontend_hosting" {
   source = "../modules/terraform-aws-frontend-hosting"
 
   bucket_name        = "${var.project_name}-frontend-${random_id.frontend_suffix.hex}"
+  force_destroy      = var.force_destroy_buckets
+  kms_key_arn        = local.training_outputs.kms_key_arn
+  access_log_bucket  = try(data.terraform_remote_state.training.outputs.access_log_bucket, null)
   html_template_path = "${path.module}/static-frontend/index.html.tpl"
+  asset_templates = {
+    "app.js"  = "${path.module}/static-frontend/app.js.tpl"
+    "app.css" = "${path.module}/static-frontend/app.css"
+  }
+  # The Content-Security-Policy lets the page call the predict URL only. It is
+  # built from the API id, not the stage's invoke_url: the API's CORS origin
+  # is this distribution, so the stage cannot feed back into it.
+  connect_src = ["https://${module.api_gateway.api_id}.execute-api.${var.aws_region}.amazonaws.com/${var.api_stage_name}/predict"]
   template_vars = {
     api_url = module.api_gateway.invoke_url
-    api_key = module.api_gateway.api_key_value
+    # The key is visible to anyone who loads the page, so it is only rendered
+    # in API key mode; with Cognito the page gets no key.
+    api_key = var.api_authorization_type == "COGNITO_USER_POOLS" ? "" : module.api_gateway.api_key_value
   }
 }

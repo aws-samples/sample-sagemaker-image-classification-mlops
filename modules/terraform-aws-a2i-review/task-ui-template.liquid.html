@@ -5,9 +5,9 @@
 
 <crowd-form>
   <crowd-classifier
-    name="diagnosis"
-    categories="['benign', 'malignant']"
-    header="Confirm the diagnosis for this histopathology image"
+    name="label"
+    categories="${categories}"
+    header="Confirm the label for this image"
   >
     <classification-target>
       <p>
@@ -26,13 +26,12 @@
         The model flagged this case for human review because its confidence was
         below the configured threshold. Review the image and select the correct
         class. Your decision is recorded as ground truth and feeds the next
-        retraining cycle. This is clinical decision support, not an autonomous
-        diagnosis.
+        retraining cycle.
       </p>
     </full-instructions>
 
     <short-instructions>
-      Select benign or malignant for the image shown.
+      Select the correct class for the image shown.
     </short-instructions>
   </crowd-classifier>
 </crowd-form>

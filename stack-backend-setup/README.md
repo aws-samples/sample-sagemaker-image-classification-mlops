@@ -1,10 +1,10 @@
 # stack-backend-setup
 
-Bootstrap stack that provisions the shared S3 backend for all other Terraform stacks in this repo. Uses **local state** (chicken-and-egg: this stack can't store its state in the bucket it creates).
+Bootstrap stack that provisions the shared Amazon S3 backend for all other Terraform stacks in this repo. Uses **local state** (chicken-and-egg: this stack can't store its state in the bucket it creates).
 
 ## What It Does
 
-1. Creates a KMS key (with rotation) and alias `alias/<project_name>-terraform-state` for encrypting Terraform state at rest
+1. Creates an AWS Key Management Service (AWS KMS) key (with rotation) and alias `alias/<project_name>-terraform-state` for encrypting Terraform state at rest. Its key policy also lets Amazon CloudWatch Logs use it for the `stack-cicd` CodeBuild log groups (`/aws/codebuild/<project_name>-*`, limited by encryption context)
 2. Creates an S3 bucket named `<project_name>-tfstate-<random-suffix>` (or a supplied name) with:
    - Versioning enabled (required for safe state)
    - SSE-KMS with the bucket key on
@@ -12,10 +12,10 @@ Bootstrap stack that provisions the shared S3 backend for all other Terraform st
    - Public access fully blocked
    - Deny-insecure-transport and require-latest-TLS bucket policies
    - Lifecycle rule to expire non-current versions after N days
-3. Creates the `<project_name>-workload-boundary` IAM permissions boundary. Every role the training and inference stacks create carries it, and the CI/CD CodeBuild role can only create or change roles that do
+3. Creates the `<project_name>-workload-boundary` AWS Identity and Access Management (IAM) permissions boundary. Every role the training and inference stacks create carries it, and the CI/CD AWS CodeBuild role can only create or change roles that do. The boundary denies passing the CI/CD roles and every CodeBuild call on the four `stack-cicd` deploy projects, which run as the CI/CD role
 4. Emits `backend_hcl`, the contents of `backend.hcl` for the consumer stacks
 
-The consumer stacks (`stack-training`, `stack-inference`, `stack-cicd`) use a partial S3 backend with `use_lockfile = true` (S3 native state locking, Terraform 1.11+); the bucket, region and KMS key come from `backend.hcl`. **No DynamoDB table is needed.**
+The consumer stacks (`stack-training`, `stack-inference`, `stack-cicd`) use a partial S3 backend with `use_lockfile = true` (S3 native state locking, Terraform 1.11+); the bucket, region and KMS key come from `backend.hcl`. **No Amazon DynamoDB table is needed.**
 
 ## Usage
 
@@ -60,6 +60,7 @@ Or by hand: `terraform output -raw backend_hcl > ../stack-training/backend.hcl` 
 | aws\_region | AWS region where the state bucket and KMS key are created | `string` | n/a | yes |
 | environment | Deployment environment | `string` | n/a | yes |
 | project\_name | Name of the project, used as prefix for the state bucket and KMS alias | `string` | n/a | yes |
+| boundary\_extra\_s3\_arns | Extra S3 bucket and object ARNs the workload permissions boundary admits besides the <project\_name>-* buckets, for example ["arn:aws:s3:::my-weights", "arn:aws:s3:::my-weights/backbones/*"] for backbone\_weights\_s3\_uri = "s3://my-weights/backbones/" (the bucket, and the URI's key followed by *). | `list(string)` | `[]` | no |
 | bucket\_name | Name of the S3 bucket for Terraform remote state. If empty, a name is generated from project\_name and a random suffix. | `string` | `""` | no |
 | force\_destroy | Allow Terraform to delete the state bucket even if it contains objects. Set to true only in dev. | `bool` | `false` | no |
 | kms\_key\_administrators | IAM ARNs allowed to administer the state encryption KMS key. Defaults to the caller's account root. | `list(string)` | `[]` | no |
@@ -68,6 +69,7 @@ Or by hand: `terraform output -raw backend_hcl > ../stack-training/backend.hcl` 
 | noncurrent\_version\_retention\_days | Days to retain non-current state file versions before permanent deletion | `number` | `90` | no |
 | tags | Additional tags to apply to all resources | `map(string)` | `{}` | no |
 | workload\_boundary\_name | Name of the IAM permissions boundary policy attached to every workload role. If empty, <project\_name>-workload-boundary is used. | `string` | `""` | no |
+| workload\_project\_name | project\_name of the training, inference and CI/CD stacks, whose <name>-* resources the workload boundary admits. Empty = project\_name. Set it when this stack keeps an older project\_name for its state bucket and key. | `string` | `""` | no |
 
 ## Outputs
 

@@ -16,11 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 # Fake credentials and a region so boto3 clients can be built offline.
-os.environ["AWS_ACCESS_KEY_ID"] = "testing"
-os.environ["AWS_SECRET_ACCESS_KEY"] = (
-    "testing"  # pragma: allowlist secret - fake offline test credential
-)
-os.environ["AWS_SESSION_TOKEN"] = "testing"
+for _name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+    os.environ[_name] = "testing"
 os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
 os.environ.pop("AWS_PROFILE", None)
 
@@ -35,10 +32,15 @@ def load_module(relpath: str, name: str):
     return module
 
 
+CLASSES = ("class_a", "class_b")
+
+
 @pytest.fixture
-def breakhis_name():
-    def make(tumor_class: str, patient: int, magnification: int, seq: int) -> str:
-        kind = "A" if tumor_class == "B" else "DC"
-        return f"breakhis_SOB_{tumor_class}_{kind}-14-{patient:05d}AB-{magnification}-{seq:03d}.png"
+def image_name():
+    """``g<group>__[<subgroup>__]img_<seq>.png``, the dataset_layout naming convention."""
+
+    def make(group: int, seq: int, subgroup: str | None = None) -> str:
+        middle = f"{subgroup}__" if subgroup else ""
+        return f"g{group:03d}__{middle}img_{seq:03d}.png"
 
     return make

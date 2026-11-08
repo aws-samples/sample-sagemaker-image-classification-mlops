@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Bounded, paginated S3 listing and deletion."""
+"""Bounded, paginated S3 listing."""
 
 from __future__ import annotations
 
@@ -66,21 +66,3 @@ def iter_capture_keys(
     for variant_prefix in _child_prefixes(s3, bucket, endpoint_prefix):
         for prefix in hour_prefixes(variant_prefix, since, until):
             yield from iter_keys(s3, bucket, prefix, since=since, suffix=".jsonl")
-
-
-def delete_prefix(s3, bucket: str, prefix: str) -> int:
-    """Delete every object under prefix in one named bucket; returns the count."""
-    if not prefix:
-        raise ValueError("refusing to delete an empty prefix")
-    deleted = 0
-    batch: list[dict] = []
-    for key in iter_keys(s3, bucket, prefix):
-        batch.append({"Key": key})
-        if len(batch) == 1000:
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
-            deleted += len(batch)
-            batch = []
-    if batch:
-        s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
-        deleted += len(batch)
-    return deleted

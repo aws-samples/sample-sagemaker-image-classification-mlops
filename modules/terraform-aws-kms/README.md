@@ -1,12 +1,13 @@
 # kms
 
-KMS key with key policy for IAM and CloudWatch Logs, optional alias, and automatic key rotation.
+AWS Key Management Service (AWS KMS) key with a key policy for AWS Identity and Access Management (IAM) and Amazon CloudWatch Logs, optional alias, and automatic key rotation.
 
 ## What It Does
 
 1. Creates a KMS key with a key policy granting full access to the account root and CloudWatch Logs service
 2. Enables automatic key rotation by default
 3. Optionally creates a KMS alias for the key
+4. Optionally adds key policy statements for AWS CloudTrail and for CloudWatch alarms that publish to an Amazon SNS topic encrypted with the key, each limited to this account with `aws:SourceAccount` and `aws:SourceArn`
 
 <!-- BEGIN_TF_DOCS -->
 ## Requirements
@@ -35,9 +36,12 @@ KMS key with key policy for IAM and CloudWatch Logs, optional alias, and automat
 | ---- | ----------- | ---- | ------- | :------: |
 | description | Description of the KMS key | `string` | n/a | yes |
 | alias\_name | Alias name for the KMS key (optional) | `string` | `null` | no |
+| cloudtrail\_source\_arn | Trail ARN (wildcards allowed) the CloudTrail SNS statement accepts in aws:SourceArn. Null = any trail in this account. | `string` | `null` | no |
 | deletion\_window\_days | Number of days to wait before deleting KMS key | `number` | `7` | no |
+| enable\_cloudfront\_grant | Add the key-policy statement that lets CloudFront distributions in this account decrypt S3 objects encrypted with this CMK through origin access control. | `bool` | `false` | no |
 | enable\_cloudtrail\_grant | Add a key-policy statement allowing the CloudTrail service principal to GenerateDataKey/DescribeKey. Required when this CMK encrypts a CloudTrail trail, otherwise CreateTrail fails with InsufficientEncryptionPolicyException. | `bool` | `false` | no |
 | enable\_cloudtrail\_sns\_grant | Add the key-policy statement CloudTrail needs to publish delivery notifications to an SNS topic encrypted with this CMK (kms:GenerateDataKey* and kms:Decrypt for the CloudTrail service principal). | `bool` | `false` | no |
+| enable\_cloudwatch\_alarms\_grant | Add the key-policy statement CloudWatch needs to publish alarm notifications to an SNS topic encrypted with this CMK (kms:GenerateDataKey* and kms:Decrypt for cloudwatch.amazonaws.com, limited to alarms in this account and Region). | `bool` | `false` | no |
 | enable\_key\_rotation | Enable automatic rotation of KMS key | `bool` | `true` | no |
 | key\_administrators | IAM ARNs allowed to administer the KMS key (schedule deletion, rotate, manage policy). When empty, the AWS account root gets default admin rights. | `list(string)` | `[]` | no |
 | tags | Tags to apply to the KMS key | `map(string)` | `{}` | no |

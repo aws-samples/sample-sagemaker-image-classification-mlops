@@ -47,7 +47,7 @@ def _additive_call(region_weights, bias=0.1):
             cam[3][4] = 2.0
             cam[3][5] = 1.5
             cam[9][9] = 0.4
-            return {"outputs": {"cam_malignant": [cam], "cam_benign": [cam], "score": [0.7]}}
+            return {"outputs": {"cam_positive": [cam], "cam_negative": [cam], "score": [0.7]}}
         return {"predictions": [[bias + sum(region_weights)]]}
 
     return call
@@ -104,7 +104,7 @@ def test_top_region_is_the_connected_hot_area():
 
 
 def test_gradcam_combines_normalised_maps():
-    out = inference.gradcam("[0]", CONFIG, "malignant", _additive_call([0.0] * N))
+    out = inference.gradcam("[0]", CONFIG, "positive", _additive_call([0.0] * N))
     assert out["grid_size"] == 14
     flat = [v for row in out["grid"] for v in row]
     assert max(flat) == 1.0
@@ -126,13 +126,20 @@ def test_response_with_explain_adds_explanations():
     response = inference.run({"instances": [[0]], "explain": True}, CONFIG, call)
     explanations = response["explanations"]
     assert set(explanations) == {"gradcam", "region_shapley", "explain_ms"}
-    assert explanations["gradcam"]["target"] == "malignant"
+    assert explanations["gradcam"]["target"] == "positive"
     assert isinstance(explanations["explain_ms"], int)
 
 
 @pytest.mark.parametrize(
     "raw",
-    [{"methods": []}, {"methods": ["lime"]}, {"max_evals": 5}, "yes", {"methods": "gradcam"}],
+    [
+        {"methods": []},
+        {"methods": ["lime"]},
+        {"max_evals": 5},
+        "yes",
+        {"methods": "gradcam"},
+        {"seed": -1},
+    ],
 )
 def test_invalid_explain_options_are_rejected(raw):
     with pytest.raises(ValueError):
@@ -237,7 +244,7 @@ def test_serving_signature_matches_the_keras_model(served):
 
 def test_exported_gradcam_grid_is_normalised(served):
     image_json = json.dumps(served.image.tolist())
-    for target in ("malignant", "benign"):
+    for target in ("positive", "negative"):
         out = inference.gradcam(image_json, CONFIG, target, served.call)
         grid = out["grid"]
         assert len(grid) == 14
@@ -268,7 +275,7 @@ def test_exported_gradcam_matches_a_direct_gradient_tape(served):
 
     body = json.dumps({"signature_name": "gradcam", "inputs": {"image": [served.image.tolist()]}})
     got = served.call("a_model", body)["outputs"]
-    assert np.allclose(got["cam_malignant"][0], expected, atol=1e-6)
+    assert np.allclose(got["cam_positive"][0], expected, atol=1e-6)
     assert got["score"][0] == pytest.approx(float(model(x)[0, 0]), abs=1e-5)
 
 
@@ -295,7 +302,7 @@ def test_package_puts_the_handler_where_the_serving_container_looks(tmp_path):
         version = tmp_path / f"{name}_model" / "1"
         version.mkdir(parents=True)
         (version / "saved_model.pb").write_bytes(b"pb")
-    creator.create_ensemble_package(str(tmp_path), {"a": 0.4, "b": 0.6}, 0.45)
+    creator.create_ensemble_package(str(tmp_path), {"a": 0.4, "b": 0.6}, 0.45, ("cat", "dog"))
     with tarfile.open(tmp_path / "model.tar.gz") as tar:
         names = set(tar.getnames())
     assert names == {
@@ -307,3 +314,10 @@ def test_package_puts_the_handler_where_the_serving_container_looks(tmp_path):
     config = json.loads((tmp_path / "ensemble_config.json").read_text())
     assert config["models"] == ["a", "b"]
     assert config["weights"] == [0.4, 0.6]
+    assert config["class_names"] == ["cat", "dog"]
+
+
+def test_response_carries_the_class_names_from_the_package():
+    config = {**CONFIG, "class_names": ["cat", "dog"]}
+    response = inference.run({"instances": [[0]]}, config, _additive_call([0.05] * N))
+    assert response["class_names"] == ["cat", "dog"]

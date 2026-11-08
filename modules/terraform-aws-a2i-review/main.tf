@@ -5,7 +5,9 @@ resource "aws_sagemaker_human_task_ui" "this" {
   human_task_ui_name = "${var.name_prefix}-review-ui"
 
   ui_template {
-    content = file("${path.module}/task-ui-template.liquid.html")
+    content = templatefile("${path.module}/task-ui-template.liquid.html", {
+      categories = "[${join(", ", [for c in var.class_labels : "'${c}'"])}]"
+    })
   }
 
   tags = var.tags
@@ -28,6 +30,7 @@ resource "aws_sagemaker_flow_definition" "this" {
 
   output_config {
     s3_output_path = var.output_s3_uri
+    kms_key_id     = var.kms_key_arn
   }
 
   tags = var.tags

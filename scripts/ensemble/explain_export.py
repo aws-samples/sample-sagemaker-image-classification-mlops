@@ -13,14 +13,15 @@ here and exposed as extra signatures next to the usual serving signature:
   signature ``model.export()`` writes. Plain predictions use only this one.
 - ``gradcam``: Grad-CAM for one image. Activations are taken at the feature map
   that feeds the model's GlobalAveragePooling2D layer (the backbone's final
-  convolutional block), gradients are of the malignant logit (the final Dense
-  layer before its sigmoid, so a saturated probability still has a gradient).
-  Returns ReLU maps for both classes (the benign map uses the negated
-  gradient), resized to GRADCAM_GRID x GRADCAM_GRID, and the probability.
-- ``region_scores``: the malignant probability of the image with regions of a
-  coarse grid replaced by the baseline. ``masks`` is (N, G, G): 1 keeps a
-  region, 0 replaces it with 0.0, which after ImageNet normalisation is the
-  ImageNet mean colour. One call scores N coalitions for the region Shapley
+  convolutional block), gradients are of the positive-class logit (the final
+  Dense layer before its sigmoid, so a saturated probability still has a
+  gradient). Returns ReLU maps for both classes (the negative-class map uses
+  the negated gradient), resized to GRADCAM_GRID x GRADCAM_GRID, and the
+  probability.
+- ``region_scores``: the positive-class probability of the image with regions
+  of a coarse grid replaced by the baseline. ``masks`` is (N, G, G): 1 keeps a
+  region, 0 replaces it with 0.0, which after the per-channel normalisation is
+  the mean colour. One call scores N coalitions for the region Shapley
   estimate without sending N images over the wire.
 """
 
@@ -87,8 +88,8 @@ def export_with_explanations(model, saved_dir):
         cam = tf.reduce_sum(acts * alpha, axis=-1, keepdims=True)
         size = [GRADCAM_GRID, GRADCAM_GRID]
         return {
-            "cam_malignant": tf.squeeze(tf.image.resize(tf.nn.relu(cam), size), -1),
-            "cam_benign": tf.squeeze(tf.image.resize(tf.nn.relu(-cam), size), -1),
+            "cam_positive": tf.squeeze(tf.image.resize(tf.nn.relu(cam), size), -1),
+            "cam_negative": tf.squeeze(tf.image.resize(tf.nn.relu(-cam), size), -1),
             "score": tf.sigmoid(logit),
         }
 

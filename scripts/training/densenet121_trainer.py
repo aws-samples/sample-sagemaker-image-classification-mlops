@@ -18,23 +18,17 @@ MODEL_NAME = "densenet121"
 
 
 def build_model(learning_rate, weights_path=None):
-    """Return (model, base_model) for DenseNet121 with a binary head.
+    """Return (model, backbone or None) for DenseNet121 with a binary head.
 
-    Freezing and compilation are owned by the two-phase training loop in
-    `_common.run_two_phase_fit`.
+    The backbone starts from random initialisation, or from your own weights
+    file (`weights_path`); only then is it returned, for two-phase fine-tuning.
     """
     cfg = CONFIG["models"][MODEL_NAME]
     input_size = cfg["input_size"][0]
 
+    base = DenseNet121(weights=None, include_top=False, input_shape=(input_size, input_size, 3))
     if weights_path:
-        logger.info("Loading pre-trained weights from %s", weights_path)
-        base = DenseNet121(weights=None, include_top=False, input_shape=(input_size, input_size, 3))
         base.load_weights(weights_path)
-    else:
-        logger.info("Downloading ImageNet weights (requires internet)")
-        base = DenseNet121(
-            weights="imagenet", include_top=False, input_shape=(input_size, input_size, 3)
-        )
 
     x = GlobalAveragePooling2D()(base.output)
     x = Dense(cfg["dense_units"], activation="relu")(x)
@@ -43,7 +37,7 @@ def build_model(learning_rate, weights_path=None):
 
     model = Model(inputs=base.input, outputs=predictions)
     logger.info("%s model built with %d parameters", MODEL_NAME, model.count_params())
-    return model, base
+    return model, (base if weights_path else None)
 
 
 if __name__ == "__main__":

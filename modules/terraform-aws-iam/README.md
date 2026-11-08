@@ -1,6 +1,6 @@
 # iam-role
 
-Reusable IAM role with support for managed policy attachments and inline policies.
+Reusable AWS Identity and Access Management (IAM) role with support for managed policy attachments and inline policies.
 
 ## What It Does
 

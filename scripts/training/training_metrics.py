@@ -9,9 +9,8 @@ logger = logging.getLogger(__name__)
 
 
 def send_training_metrics_to_cloudwatch(model_name, history):
-    """Send training metrics to CloudWatch via JSON logs"""
+    """Log the final training metrics as JSON lines for the CloudWatch metric filters."""
     try:
-        # Get final metrics
         final_accuracy = history.get("accuracy", [0])[-1]
         final_val_accuracy = history.get("val_accuracy", [0])[-1]
         final_loss = history.get("loss", [1])[-1]
@@ -23,7 +22,6 @@ def send_training_metrics_to_cloudwatch(model_name, history):
         )
         final_val_recall = history.get("val_recall", [0])[-1] if "val_recall" in history else 0
 
-        # Dynamic model name mapping
         model_camel = model_name.replace("-", "").replace("_", "").title()
 
         # Log metrics using JSON format for CloudWatch metric filters
@@ -104,5 +102,5 @@ def send_training_metrics_to_cloudwatch(model_name, history):
 
         logger.info(f"Published training metrics for {model_name} to CloudWatch")
 
-    except Exception as e:
+    except (IndexError, KeyError, TypeError, ValueError) as e:
         logger.warning(f"Failed to send training metrics: {e}")

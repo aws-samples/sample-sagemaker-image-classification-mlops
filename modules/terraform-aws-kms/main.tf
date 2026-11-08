@@ -33,7 +33,9 @@ locals {
   ] : []
 
   # CloudTrail publishing to an SNS topic encrypted with this CMK. The key
-  # policy statement from the CloudTrail SNS notification documentation.
+  # policy statement from the Amazon SNS key management guide, limited with
+  # aws:SourceAccount and aws:SourceArn to this account's trails (or the one
+  # trail the caller names) against the confused deputy problem.
   cloudtrail_sns_statements = var.enable_cloudtrail_sns_grant ? [
     {
       Sid       = "AllowCloudTrailPublishToEncryptedTopic"
@@ -44,6 +46,59 @@ locals {
         "kms:Decrypt",
       ]
       Resource = "*"
+      Condition = {
+        StringEquals = {
+          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+        }
+        ArnLike = {
+          "aws:SourceArn" = coalesce(var.cloudtrail_source_arn, "arn:aws:cloudtrail:*:${data.aws_caller_identity.current.account_id}:trail/*")
+        }
+      }
+    }
+  ] : []
+
+  # CloudWatch alarms publishing to an SNS topic encrypted with this CMK
+  # (the Amazon SNS key management guide lists cloudwatch.amazonaws.com as the
+  # event source principal). Limited to alarms in this account and Region.
+  cloudwatch_alarm_statements = var.enable_cloudwatch_alarms_grant ? [
+    {
+      Sid       = "AllowCloudWatchAlarmsToEncryptedTopic"
+      Effect    = "Allow"
+      Principal = { Service = "cloudwatch.amazonaws.com" }
+      Action = [
+        "kms:GenerateDataKey*",
+        "kms:Decrypt",
+      ]
+      Resource = "*"
+      Condition = {
+        StringEquals = {
+          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+        }
+        ArnLike = {
+          "aws:SourceArn" = "arn:aws:cloudwatch:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:alarm:*"
+        }
+      }
+    }
+  ] : []
+
+  # CloudFront reading SSE-KMS objects through origin access control (the
+  # CloudFront OAC guide's key policy statement), limited to distributions in
+  # this account because the distribution ID is not known here.
+  cloudfront_statements = var.enable_cloudfront_grant ? [
+    {
+      Sid       = "AllowCloudFrontOacDecrypt"
+      Effect    = "Allow"
+      Principal = { Service = "cloudfront.amazonaws.com" }
+      Action    = ["kms:Decrypt"]
+      Resource  = "*"
+      Condition = {
+        StringEquals = {
+          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+        }
+        ArnLike = {
+          "aws:SourceArn" = "arn:aws:cloudfront::${data.aws_caller_identity.current.account_id}:distribution/*"
+        }
+      }
     }
   ] : []
 }
@@ -101,6 +156,23 @@ resource "aws_kms_key" "this" {
         Resource = "*"
       },
       {
+        # The default key policy's grant statement for AWS services. Without
+        # it, setting key_administrators leaves IAM policies unable to allow
+        # kms:CreateGrant, which SageMaker volumes and Lambda need.
+        Sid    = "EnableGrantsForAwsResources"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action = [
+          "kms:CreateGrant",
+          "kms:ListGrants",
+          "kms:RevokeGrant",
+        ]
+        Resource  = "*"
+        Condition = { Bool = { "kms:GrantIsForAWSResource" = "true" } }
+      },
+      {
         Sid    = "AllowCloudWatchLogs"
         Effect = "Allow"
         Principal = {
@@ -120,7 +192,7 @@ resource "aws_kms_key" "this" {
           }
         }
       }
-    ], local.cloudtrail_statements, local.cloudtrail_sns_statements)
+    ], local.cloudtrail_statements, local.cloudtrail_sns_statements, local.cloudwatch_alarm_statements, local.cloudfront_statements)
   })
 }
 

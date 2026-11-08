@@ -15,15 +15,15 @@ This is the script the README points at for smoke-testing after deploy.
 It does NOT bypass the API to hit SageMaker directly (earlier versions did,
 which made it useless for validating the API path).
 
-The API requires an API key (x-api-key header). It comes from --api-key, the
-API_KEY environment variable, or `terraform output -raw api_key_value` in
-stack-inference, in that order.
+The API URL and key (x-api-key header) come from --api-url and --api-key, or
+the API_URL and API_KEY environment variables, for example the stack-inference
+outputs api_gateway_url and api_key_value.
 
 Usage:
-  python ops-scripts/test_api.py                              # pulls API URL and key from terraform output
-  API_KEY="$(terraform -chdir=stack-inference output -raw api_key_value)" python ops-scripts/test_api.py
-  python ops-scripts/test_api.py --api-url https://<...>/prod --image-path data/test/breast_benign_0338.jpg
-  python ops-scripts/test_api.py --count 5                    # test 5 random images from each class
+  export API_URL="$(terraform -chdir=stack-inference output -raw api_gateway_url)"
+  export API_KEY="$(terraform -chdir=stack-inference output -raw api_key_value)"
+  python ops-scripts/test_api.py --image-path data/my-images/<class>/<file>.png
+  python ops-scripts/test_api.py --data-path data/my-images --count 5  # 5 random images per class
   python ops-scripts/test_api.py --image-path <file> --explain  # also print the explanation summary
 """
 
@@ -31,35 +31,16 @@ from __future__ import annotations
 
 import argparse
 import base64
-import glob
 import json
 import os
 import random
-import subprocess  # nosec B404 - runs only the terraform CLI with a fixed argument list
 import sys
 from pathlib import Path
 
 import requests
 from PIL import Image
 
-
-def terraform_output(name: str) -> str | None:
-    """Read one raw output from the inference root."""
-    project_root = Path(__file__).resolve().parent.parent
-    tf_dir = project_root / "stack-inference"
-    try:
-        result = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; terraform from PATH
-            ["terraform", "output", "-raw", name],
-            cwd=tf_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except FileNotFoundError:
-        print("terraform CLI not found on PATH")
-    return None
+IMAGE_PATTERNS = ("*.jpg", "*.jpeg", "*.png")
 
 
 def encode_image(image_path: Path) -> str:
@@ -92,20 +73,16 @@ def call_api(
 
 
 def gather_test_images(data_path: Path, count: int) -> list[tuple[Path, str]]:
-    """Pick up to `count` random images from each class under data/breast_*/."""
-    extensions = ("*.jpg", "*.jpeg", "*.png")
+    """Pick up to `count` random images from each class folder under data_path."""
     pairs: list[tuple[Path, str]] = []
-
-    for label, subdir in (("benign", "breast_benign"), ("malignant", "breast_malignant")):
-        found: list[str] = []
-        for ext in extensions:
-            found.extend(glob.glob(str(data_path / subdir / ext)))
+    rng = random.SystemRandom()
+    for class_dir in sorted(p for p in data_path.iterdir() if p.is_dir()):
+        found = sorted(f for pattern in IMAGE_PATTERNS for f in class_dir.glob(pattern))
         if not found:
-            print(f" No images found in {data_path / subdir}")
+            print(f" No images found in {class_dir}")
             continue
-        selected = random.sample(found, min(count, len(found)))  # nosec B311 - picks test images, not security
-        pairs.extend((Path(p), label) for p in selected)
-
+        selected = rng.sample(found, min(count, len(found)))
+        pairs.extend((p, class_dir.name) for p in selected)
     return pairs
 
 
@@ -138,9 +115,8 @@ def test_api(
 ) -> bool:
     """Run one or more API calls and report accuracy against ground truth."""
     if image_path:
-        # Single-image mode - infer label from the filename
-        label = "malignant" if "malignant" in image_path.name else "benign"
-        pairs = [(image_path, label)]
+        # Single-image mode: the class folder the image sits in is its label.
+        pairs = [(image_path, image_path.parent.name)]
     else:
         pairs = gather_test_images(data_path, count)
 
@@ -151,7 +127,7 @@ def test_api(
     print(f"API URL: {api_url}")
     print(f"Testing {len(pairs)} image(s) via the API\n")
 
-    results = {"benign": {"correct": 0, "total": 0}, "malignant": {"correct": 0, "total": 0}}
+    results = {label: {"correct": 0, "total": 0} for _, label in pairs}
     correct = total = 0
     errors = 0
 
@@ -159,7 +135,7 @@ def test_api(
         print(f"{img_path.name} (true: {true_label})")
         try:
             result = call_api(api_url, encode_image(img_path), api_key, explain=explain)
-        except Exception as exc:
+        except (OSError, RuntimeError, requests.RequestException) as exc:
             print(f"   API call failed: {exc}")
             errors += 1
             continue
@@ -191,11 +167,10 @@ def test_api(
     if total > 0:
         overall = correct / total
         print(f"   Overall Accuracy: {overall:.3f} ({correct}/{total})")
-        for label in ("benign", "malignant"):
-            r = results[label]
+        for label, r in sorted(results.items()):
             if r["total"] > 0:
                 acc = r["correct"] / r["total"]
-                print(f"   {label.capitalize()} Accuracy: {acc:.3f} ({r['correct']}/{r['total']})")
+                print(f"   {label} accuracy: {acc:.3f} ({r['correct']}/{r['total']})")
     if errors:
         print(f"    API errors: {errors}")
 
@@ -206,13 +181,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Test the deployed inference API")
     parser.add_argument(
         "--api-url",
+        default=os.environ.get("API_URL"),
         help="API Gateway invoke URL (e.g. https://abc.execute-api.us-east-1.amazonaws.com/prod). "
-        "Defaults to `terraform output -raw api_gateway_url`.",
+        "Defaults to $API_URL.",
     )
     parser.add_argument(
         "--api-key",
-        help="API key sent as x-api-key. Defaults to $API_KEY, then "
-        "`terraform output -raw api_key_value`.",
+        default=os.environ.get("API_KEY"),
+        help="API key sent as x-api-key. Defaults to $API_KEY.",
     )
     parser.add_argument(
         "--image-path",
@@ -229,7 +205,7 @@ def main() -> int:
         "--data-path",
         type=Path,
         default=Path(__file__).resolve().parent.parent / "data",
-        help="Local dataset root (expects breast_benign/ and breast_malignant/ subdirs)",
+        help="Local dataset root with one folder per class",
     )
     parser.add_argument(
         "--explain",
@@ -238,12 +214,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    api_url = args.api_url or terraform_output("api_gateway_url")
+    api_url = args.api_url
     if not api_url:
-        print("Could not determine API URL. Pass --api-url or run from a deployed project.")
+        print("No API URL. Pass --api-url or set API_URL (stack-inference output api_gateway_url).")
         return 1
 
-    api_key = args.api_key or os.environ.get("API_KEY") or terraform_output("api_key_value")
+    api_key = args.api_key
     if not api_key:
         print(
             "No API key found; the request is sent without x-api-key and fails if the key is required."

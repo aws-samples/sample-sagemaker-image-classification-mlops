@@ -18,7 +18,7 @@ def test_baseline_registers_pending_with_placeholder_marker():
                 "ModelApprovalStatus": "PendingManualApproval",
                 "CustomerMetadataProperties": {
                     "ModelRole": "placeholder-baseline",
-                    "ClinicalUse": "none",
+                    "IntendedUse": "none",
                 },
                 "InferenceSpecification": ANY,
             },

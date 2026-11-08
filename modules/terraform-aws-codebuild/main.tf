@@ -1,6 +1,18 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+# The build log group CodeBuild would otherwise create itself, with no
+# retention and no customer managed key. Skipped when the caller names its own
+# group in log_group_name.
+resource "aws_cloudwatch_log_group" "this" {
+  count = var.log_group_name == null ? 1 : 0
+
+  name              = "/aws/codebuild/${var.name}"
+  retention_in_days = var.log_retention_days
+  kms_key_id        = var.log_kms_key_arn
+  tags              = var.tags
+}
+
 resource "aws_codebuild_project" "this" {
   name          = var.name
   description   = var.description
@@ -36,13 +48,11 @@ resource "aws_codebuild_project" "this" {
   }
 
   # CloudWatch Logs always on - cheap, auditable, and the default place
-  # anyone investigating a failed build will look. Caller can point at an
-  # existing log group via var.log_group_name to reuse KMS encryption set
-  # up elsewhere, otherwise CodeBuild auto-creates one.
+  # anyone investigating a failed build will look.
   logs_config {
     cloudwatch_logs {
       status      = "ENABLED"
-      group_name  = var.log_group_name
+      group_name  = coalesce(var.log_group_name, one(aws_cloudwatch_log_group.this[*].name))
       stream_name = var.log_stream_name
     }
   }

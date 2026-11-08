@@ -8,6 +8,7 @@ module "kms" {
   deletion_window_days = var.kms_deletion_window_days
   enable_key_rotation  = var.enable_kms_key_rotation
   alias_name           = "alias/${var.project_name}-s3-key"
+  key_administrators   = var.kms_key_administrators
 
   # This CMK also encrypts the CloudTrail trail + its CloudWatch log group, so
   # grant the CloudTrail service principal encrypt rights on the key.
@@ -15,20 +16,95 @@ module "kms" {
 
   # The optional CloudTrail SNS topic is encrypted with this CMK too.
   enable_cloudtrail_sns_grant = var.enable_cloudtrail && var.enable_cloudtrail_sns
+  cloudtrail_source_arn       = "arn:aws:cloudtrail:${var.aws_region}:${data.aws_caller_identity.current.account_id}:trail/${var.project_name}-audit-trail"
+
+  # The stack-inference alerts topic is encrypted with this CMK.
+  enable_cloudwatch_alarms_grant = true
+
+  # The stack-inference frontend bucket is encrypted with this CMK and read by
+  # CloudFront through origin access control.
+  enable_cloudfront_grant = true
 }
 
 ################################################################################
 # S3 Buckets
 ################################################################################
 
-# Random suffix for bucket names
 resource "random_id" "bucket_suffix" {
   byte_length = 4
 }
 
-# S3 buckets using the reusable module
+locals {
+  access_log_bucket_name = "${var.project_name}-${var.environment}-access-logs-${random_id.bucket_suffix.hex}"
+  access_log_bucket      = var.enable_s3_access_logging ? module.s3_access_logs[0].bucket_id : null
+}
+
+# Server access logs of every project bucket, and the stack-inference
+# CloudFront standard logs (v2) under cloudfront/. S3 delivers server access
+# logs only to a bucket with SSE-S3 default encryption, hence no CMK on this
+# one bucket. The module's TLS-only policy also carries both delivery grants.
+module "s3_access_logs" {
+  count  = var.enable_s3_access_logging ? 1 : 0
+  source = "../modules/terraform-aws-s3"
+
+  bucket_name         = local.access_log_bucket_name
+  force_destroy       = var.audit_bucket_force_destroy
+  enable_versioning   = true
+  block_public_access = true
+
+  policy_statements = [
+    {
+      Sid       = "S3ServerAccessLogsPolicy"
+      Effect    = "Allow"
+      Principal = { Service = "logging.s3.amazonaws.com" }
+      Action    = "s3:PutObject"
+      Resource  = "arn:aws:s3:::${local.access_log_bucket_name}/*"
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        ArnLike      = { "aws:SourceArn" = "arn:aws:s3:::${var.project_name}-*" }
+      }
+    },
+    {
+      # CloudFront standard logging (v2) delivery sources live in us-east-1.
+      Sid       = "CloudFrontLogDeliveryWrite"
+      Effect    = "Allow"
+      Principal = { Service = "delivery.logs.amazonaws.com" }
+      Action    = "s3:PutObject"
+      Resource  = "arn:aws:s3:::${local.access_log_bucket_name}/cloudfront/*"
+      Condition = {
+        StringEquals = {
+          "s3:x-amz-acl"      = "bucket-owner-full-control"
+          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+        }
+        ArnLike = { "aws:SourceArn" = "arn:aws:logs:us-east-1:${data.aws_caller_identity.current.account_id}:delivery-source:${var.project_name}-*" }
+      }
+    },
+    {
+      # Without these the delivery service logs AccessDenied in CloudTrail.
+      Sid       = "CloudFrontLogDeliveryAclCheck"
+      Effect    = "Allow"
+      Principal = { Service = "delivery.logs.amazonaws.com" }
+      Action    = ["s3:GetBucketAcl", "s3:ListBucket"]
+      Resource  = "arn:aws:s3:::${local.access_log_bucket_name}"
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        ArnLike      = { "aws:SourceArn" = "arn:aws:logs:us-east-1:${data.aws_caller_identity.current.account_id}:delivery-source:${var.project_name}-*" }
+      }
+    },
+  ]
+
+  lifecycle_rules = [{
+    id                      = "expire-access-logs"
+    expiration_days         = var.access_log_retention_days
+    noncurrent_version_days = 30
+  }]
+}
+
 module "s3_raw_data" {
   source = "../modules/terraform-aws-s3"
+
+  logging_target_bucket = local.access_log_bucket
+  enable_access_logging = var.enable_s3_access_logging
 
   bucket_name         = "${var.project_name}-${var.environment}-raw-data-${random_id.bucket_suffix.hex}"
   force_destroy       = var.bucket_defaults.force_destroy
@@ -43,15 +119,30 @@ module "s3_raw_data" {
 module "s3_processed_data" {
   source = "../modules/terraform-aws-s3"
 
+  logging_target_bucket = local.access_log_bucket
+  enable_access_logging = var.enable_s3_access_logging
+
   bucket_name         = "${var.project_name}-${var.environment}-processed-data-${random_id.bucket_suffix.hex}"
   force_destroy       = var.bucket_defaults.force_destroy
   kms_key_arn         = module.kms.key_arn
   enable_versioning   = var.bucket_defaults.enable_versioning
   block_public_access = var.bucket_defaults.block_public_access
+
+  # Each execution writes a full copy of the splits under
+  # executions/<execution-id>/; expire them once no step can still read them.
+  lifecycle_rules = [{
+    id                      = "expire-pipeline-executions"
+    prefix                  = "executions/"
+    expiration_days         = var.processed_data_retention_days
+    noncurrent_version_days = 1
+  }]
 }
 
 module "s3_scripts" {
   source = "../modules/terraform-aws-s3"
+
+  logging_target_bucket = local.access_log_bucket
+  enable_access_logging = var.enable_s3_access_logging
 
   bucket_name         = "${var.project_name}-${var.environment}-scripts-${random_id.bucket_suffix.hex}"
   force_destroy       = var.bucket_defaults.force_destroy
@@ -63,6 +154,9 @@ module "s3_scripts" {
 module "s3_model_artifacts" {
   source = "../modules/terraform-aws-s3"
 
+  logging_target_bucket = local.access_log_bucket
+  enable_access_logging = var.enable_s3_access_logging
+
   bucket_name         = "${var.project_name}-${var.environment}-model-artifacts-${random_id.bucket_suffix.hex}"
   force_destroy       = var.bucket_defaults.force_destroy
   kms_key_arn         = module.kms.key_arn
@@ -73,15 +167,36 @@ module "s3_model_artifacts" {
 module "s3_inference_results" {
   source = "../modules/terraform-aws-s3"
 
+  logging_target_bucket = local.access_log_bucket
+  enable_access_logging = var.enable_s3_access_logging
+
   bucket_name         = "${var.project_name}-${var.environment}-inference-results-${random_id.bucket_suffix.hex}"
   force_destroy       = var.bucket_defaults.force_destroy
   kms_key_arn         = module.kms.key_arn
   enable_versioning   = var.bucket_defaults.enable_versioning
   block_public_access = var.bucket_defaults.block_public_access
+
+  # The inference function writes each uploaded image and its prediction
+  # under predictions/<request-id>/.
+  lifecycle_rules = [
+    {
+      id                      = "expire-predictions"
+      prefix                  = "predictions/"
+      expiration_days         = var.inference_results_retention_days
+      noncurrent_version_days = var.inference_results_retention_days
+    },
+    {
+      id                      = "expire-noncurrent-versions"
+      noncurrent_version_days = var.inference_results_retention_days
+    },
+  ]
 }
 
 module "s3_monitoring" {
   source = "../modules/terraform-aws-s3"
+
+  logging_target_bucket = local.access_log_bucket
+  enable_access_logging = var.enable_s3_access_logging
 
   bucket_name         = "${var.project_name}-${var.environment}-monitoring-${random_id.bucket_suffix.hex}"
   force_destroy       = var.bucket_defaults.force_destroy
@@ -94,13 +209,20 @@ module "s3_monitoring" {
 # IAM
 ################################################################################
 
-# SageMaker execution role
-module "sagemaker_execution_role" {
-  source = "../modules/terraform-aws-iam"
-
-  role_name                = "${var.project_name}-sagemaker-execution-role"
-  permissions_boundary_arn = var.permissions_boundary_arn
-  assume_role_policy = jsonencode({
+# Two SageMaker roles. The job role runs the pipeline's Processing and
+# Training steps: it reads the scripts and data, writes only the job output
+# prefixes and calls no SageMaker API, so code running in a job cannot change
+# the pipeline scripts or a model package. The execution role is the pipeline
+# role (it starts the jobs with the job role and registers the model package)
+# and the role of the MLflow tracking server here and, in stack-inference, of
+# the endpoint model, the scheduled drift and fairness jobs and the Amazon A2I
+# flow. Neither role can approve a model package or deploy an endpoint: people
+# approve with their own credentials, and the deploy and refresh Lambda
+# functions in stack-inference have their own roles.
+locals {
+  # IfExists: the SageMaker confused-deputy guide covers pipelines, jobs and
+  # endpoints, not every caller of these roles (the MLflow tracking server).
+  sagemaker_assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
@@ -109,94 +231,254 @@ module "sagemaker_execution_role" {
         Principal = {
           Service = "sagemaker.amazonaws.com"
         }
+        Condition = {
+          StringEqualsIfExists = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+          ArnLikeIfExists      = { "aws:SourceArn" = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:*" }
+        }
       }
     ]
   })
 
+  # Statements both roles need.
+  sagemaker_common_statements = concat([
+    {
+      Effect = "Allow"
+      Action = [
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey"
+      ]
+      Resource = [module.kms.key_arn]
+    },
+    {
+      # Jobs and the endpoint encrypt their ML storage volumes with the
+      # project CMK (VolumeKmsKeyId), which needs a grant for the EBS
+      # attachment.
+      Effect   = "Allow"
+      Action   = ["kms:CreateGrant"]
+      Resource = [module.kms.key_arn]
+      Condition = {
+        Bool = { "kms:GrantIsForAWSResource" = "true" }
+      }
+    },
+    {
+      # SageMaker jobs and endpoints log to /aws/sagemaker/<JobType>.
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ]
+      Resource = [
+        "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/sagemaker/*",
+        "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/sagemaker/*:log-stream:*",
+      ]
+    },
+    {
+      # PutMetricData requires no resource; the namespace condition keeps
+      # the jobs to this project's metrics.
+      Effect   = "Allow"
+      Action   = ["cloudwatch:PutMetricData"]
+      Resource = "*"
+      Condition = {
+        StringLike = { "cloudwatch:namespace" = "${var.project_name}/*" }
+      }
+    },
+    {
+      # GetAuthorizationToken has no resource type and supports only "*".
+      Effect   = "Allow"
+      Action   = ["ecr:GetAuthorizationToken"]
+      Resource = "*"
+    },
+    ],
+    # ENI management for jobs that run in a VPC (the training VPC or
+    # var.vpc_config): the set the SageMaker execution-role documentation
+    # lists for VPC jobs. The documentation says not to scope these with
+    # resources or conditions, or the job-creation checks fail, hence
+    # Resource "*". The scheduled drift and fairness jobs of stack-inference
+    # run in the same subnets with the execution role.
+    local.job_vpc_enabled ? [
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateNetworkInterface",
+          "ec2:CreateNetworkInterfacePermission",
+          "ec2:DeleteNetworkInterface",
+          "ec2:DeleteNetworkInterfacePermission",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DescribeVpcs",
+          "ec2:DescribeDhcpOptions",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeSecurityGroups"
+        ]
+        Resource = "*"
+      }
+  ] : [])
+
+  mlflow_tracking_server_arn = "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:mlflow-tracking-server/${var.project_name}-mlflow"
+
+  # A prefix URI (the README's folder of <model>.weights.h5 files) or a single
+  # file: SageMaker downloads every object under the S3Prefix channel URI, so
+  # the grant follows the same prefix.
+  backbone_weights_statements = [
+    for statement in [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "arn:aws:s3:::${local.backbone_weights.bucket}/${local.backbone_weights.key}*"
+      },
+      {
+        # SageMaker lists the channel URI to resolve the S3Prefix channel.
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = "arn:aws:s3:::${local.backbone_weights.bucket}"
+        Condition = {
+          StringLike = { "s3:prefix" = "${local.backbone_weights.key}*" }
+        }
+      },
+    ] : statement if var.backbone_weights_s3_uri != ""
+  ]
+}
+
+module "sagemaker_job_role" {
+  source = "../modules/terraform-aws-iam"
+
+  role_name                = "${var.project_name}-sagemaker-job-role"
+  description              = "Role of the ${var.project_name} SageMaker pipeline Processing and Training jobs: reads scripts and data, writes the job outputs"
+  permissions_boundary_arn = var.permissions_boundary_arn
+  assume_role_policy       = local.sagemaker_assume_role_policy
+
+  inline_policies = {
+    job_access = jsonencode({
+      Version = "2012-10-17"
+      Statement = concat(local.sagemaker_common_statements, [
+        {
+          # Inputs: the step scripts, the raw images, the splits and reports,
+          # and the trained models the evaluation steps read.
+          Effect = "Allow"
+          Action = ["s3:GetObject", "s3:ListBucket"]
+          Resource = [
+            module.s3_scripts.bucket_arn,
+            module.s3_raw_data.bucket_arn,
+            module.s3_processed_data.bucket_arn,
+            module.s3_model_artifacts.bucket_arn,
+            "${module.s3_scripts.bucket_arn}/*",
+            "${module.s3_raw_data.bucket_arn}/*",
+            "${module.s3_processed_data.bucket_arn}/*",
+            "${module.s3_model_artifacts.bucket_arn}/*",
+          ]
+        },
+        {
+          # Outputs: the per-execution reports and splits, and the
+          # pipeline.json.tftpl output prefixes in the model artifacts bucket.
+          # Nothing in the scripts or raw data buckets.
+          Effect = "Allow"
+          Action = ["s3:PutObject"]
+          Resource = [
+            "${module.s3_processed_data.bucket_arn}/executions/*",
+            "${module.s3_model_artifacts.bucket_arn}/models/*",
+            "${module.s3_model_artifacts.bucket_arn}/checkpoints/*",
+            "${module.s3_model_artifacts.bucket_arn}/evaluation/*",
+            "${module.s3_model_artifacts.bucket_arn}/ensemble/*",
+            "${module.s3_model_artifacts.bucket_arn}/bias/*",
+            "${module.s3_model_artifacts.bucket_arn}/debug-output/*",
+            "${module.s3_model_artifacts.bucket_arn}/baselines/*",
+          ]
+        },
+        {
+          # SageMaker deletes a spot-training checkpoint in S3 when the
+          # trainer deletes it in the container.
+          Effect   = "Allow"
+          Action   = ["s3:DeleteObject"]
+          Resource = "${module.s3_model_artifacts.bucket_arn}/checkpoints/*"
+        },
+        {
+          # The training images (Deep Learning Containers registry) and the
+          # Debugger rule image when Debugger is on.
+          Effect = "Allow"
+          Action = [
+            "ecr:BatchGetImage",
+            "ecr:GetDownloadUrlForLayer",
+            "ecr:BatchCheckLayerAvailability"
+          ]
+          Resource = distinct(compact([
+            "arn:aws:ecr:${var.aws_region}:${data.aws_sagemaker_prebuilt_ecr_image.tensorflow_cpu.registry_id}:repository/tensorflow-training",
+            "arn:aws:ecr:${var.aws_region}:${data.aws_sagemaker_prebuilt_ecr_image.tensorflow_gpu.registry_id}:repository/tensorflow-training",
+            var.enable_debugger ? "arn:aws:ecr:${var.aws_region}:${split(".", var.debugger_rule_image)[0]}:repository/*" : "",
+          ]))
+        },
+        ],
+        local.backbone_weights_statements,
+        # MLflow client calls from the jobs, and the artifacts they log.
+        var.enable_mlflow ? [
+          {
+            Effect = "Allow"
+            Action = [
+              "sagemaker-mlflow:CreateExperiment",
+              "sagemaker-mlflow:GetExperimentByName",
+              "sagemaker-mlflow:CreateRun",
+              "sagemaker-mlflow:UpdateRun",
+              "sagemaker-mlflow:DeleteRun",
+              "sagemaker-mlflow:LogMetric",
+              "sagemaker-mlflow:LogParam",
+              "sagemaker-mlflow:LogBatch"
+            ]
+            Resource = local.mlflow_tracking_server_arn
+          },
+          {
+            Effect   = "Allow"
+            Action   = ["s3:PutObject"]
+            Resource = "${module.s3_model_artifacts.bucket_arn}/mlflow-artifacts/*"
+          },
+        ] : [],
+      )
+    })
+  }
+}
+
+module "sagemaker_execution_role" {
+  source = "../modules/terraform-aws-iam"
+
+  role_name                = "${var.project_name}-sagemaker-execution-role"
+  description              = "Execution role for the ${var.project_name} SageMaker pipeline, the endpoint model, the scheduled monitoring jobs, the A2I flow and the MLflow tracking server"
+  permissions_boundary_arn = var.permissions_boundary_arn
+  assume_role_policy       = local.sagemaker_assume_role_policy
+
   # No AWS-managed AmazonSageMakerFullAccess - it grants account-wide sagemaker:*
-  # on Resource "*". Replaced with the scoped inline statements below covering
-  # exactly what the pipeline + jobs need (least privilege).
+  # on Resource "*". Replaced with the scoped inline statements below.
   managed_policy_arns = []
 
   inline_policies = {
     s3_access = jsonencode({
       Version = "2012-10-17"
-      Statement = concat([
+      Statement = concat(local.sagemaker_common_statements, [
         {
+          # The scheduled jobs' scripts, the pipeline's property files and the
+          # endpoint's model data, the stored images the A2I task shows, and
+          # the monitoring bucket.
           Effect = "Allow"
-          Action = [
-            "s3:GetObject",
-            "s3:PutObject",
-            "s3:DeleteObject",
-            "s3:ListBucket",
-            "s3:DeleteObjectVersion",
-            "s3:ListBucketVersions"
+          Action = ["s3:GetObject", "s3:ListBucket"]
+          Resource = [
+            module.s3_scripts.bucket_arn,
+            module.s3_model_artifacts.bucket_arn,
+            module.s3_inference_results.bucket_arn,
+            module.s3_monitoring.bucket_arn,
+            "${module.s3_scripts.bucket_arn}/*",
+            "${module.s3_model_artifacts.bucket_arn}/*",
+            "${module.s3_inference_results.bucket_arn}/*",
+            "${module.s3_monitoring.bucket_arn}/*",
           ]
-          Resource = concat(
-            [
-              module.s3_raw_data.bucket_arn,
-              module.s3_processed_data.bucket_arn,
-              module.s3_scripts.bucket_arn,
-              module.s3_model_artifacts.bucket_arn,
-              module.s3_inference_results.bucket_arn,
-              module.s3_monitoring.bucket_arn
-            ],
-            [
-              "${module.s3_raw_data.bucket_arn}/*",
-              "${module.s3_processed_data.bucket_arn}/*",
-              "${module.s3_scripts.bucket_arn}/*",
-              "${module.s3_model_artifacts.bucket_arn}/*",
-              "${module.s3_inference_results.bucket_arn}/*",
-              "${module.s3_monitoring.bucket_arn}/*"
-            ]
-          )
         },
         {
-          Effect = "Allow"
-          Action = [
-            "kms:Decrypt",
-            "kms:GenerateDataKey",
-            "kms:DescribeKey"
-          ]
-          Resource = [module.kms.key_arn]
-        },
-        {
-          # Jobs encrypt their ML storage volumes with the project CMK
-          # (VolumeKmsKeyId), which needs a grant for the EBS attachment.
+          # Endpoint data capture, the fairness reports and the A2I output.
           Effect   = "Allow"
-          Action   = ["kms:CreateGrant"]
-          Resource = [module.kms.key_arn]
-          Condition = {
-            Bool = { "kms:GrantIsForAWSResource" = "true" }
-          }
+          Action   = ["s3:PutObject"]
+          Resource = "${module.s3_monitoring.bucket_arn}/*"
         },
         {
-          Effect = "Allow"
-          Action = [
-            "logs:CreateLogGroup",
-            "logs:CreateLogStream",
-            "logs:PutLogEvents"
-          ]
-          Resource = "arn:aws:logs:*:*:*"
-        },
-        {
-          Effect = "Allow"
-          Action = [
-            "cloudwatch:PutMetricData"
-          ]
-          Resource = "*"
-        },
-        {
-          Effect = "Allow"
-          Action = [
-            "ecr:GetAuthorizationToken",
-            "ecr:BatchCheckLayerAvailability",
-            "ecr:GetDownloadUrlForLayer",
-            "ecr:BatchGetImage"
-          ]
-          Resource = "*"
-        },
-        {
+          # The serving image (the Deep Learning Containers image of the
+          # model packages, or the patched image in this project's
+          # repository) and the scheduled jobs' scikit-learn image.
           Effect = "Allow"
           Action = [
             "ecr:BatchGetImage",
@@ -204,30 +486,18 @@ module "sagemaker_execution_role" {
             "ecr:BatchCheckLayerAvailability"
           ]
           Resource = [
-            "arn:aws:ecr:*:*:repository/sagemaker-*"
+            "arn:aws:ecr:${var.aws_region}:${data.aws_sagemaker_prebuilt_ecr_image.tensorflow_inference.registry_id}:repository/tensorflow-inference",
+            "arn:aws:ecr:${var.aws_region}:${data.aws_sagemaker_prebuilt_ecr_image.monitoring_jobs.registry_id}:repository/sagemaker-scikit-learn",
+            "arn:aws:ecr:${var.aws_region}:${data.aws_caller_identity.current.account_id}:repository/${var.project_name}-*",
           ]
         },
         {
-          # ARN-scoped SageMaker resource operations: models, endpoints,
-          # endpoint-configs, pipelines, model packages/groups, monitoring,
-          # processing/training/transform jobs - all constrained to this
-          # project's name prefix so the role can't touch other teams'
-          # SageMaker resources in the account.
+          # Pipeline role: start, watch and stop the jobs. Pipeline job names
+          # are generated, so job ARNs end in a wildcard; pipeline/<name>-*
+          # also covers its executions.
           Effect = "Allow"
           Action = [
-            "sagemaker:CreateModel",
-            "sagemaker:CreateEndpointConfig",
-            "sagemaker:CreateEndpoint",
-            "sagemaker:UpdateEndpoint",
-            "sagemaker:DeleteModel",
-            "sagemaker:DeleteEndpointConfig",
-            "sagemaker:DeleteEndpoint",
-            "sagemaker:DescribeModel",
-            "sagemaker:DescribeEndpointConfig",
-            "sagemaker:DescribeEndpoint",
-            "sagemaker:CreateModelPackage",
             "sagemaker:DescribeModelPackage",
-            "sagemaker:UpdateModelPackage",
             "sagemaker:CreateModelPackageGroup",
             "sagemaker:DescribeModelPackageGroup",
             "sagemaker:DescribeProcessingJob",
@@ -238,6 +508,7 @@ module "sagemaker_execution_role" {
             "sagemaker:StopTransformJob",
             "sagemaker:DescribePipeline",
             "sagemaker:DescribePipelineExecution",
+            "sagemaker:ListPipelineExecutionSteps",
             "sagemaker:CreateProcessingJob",
             "sagemaker:CreateTrainingJob",
             "sagemaker:CreateTransformJob",
@@ -246,111 +517,65 @@ module "sagemaker_execution_role" {
             "sagemaker:ListTags",
           ]
           Resource = [
-            "arn:aws:sagemaker:*:*:model/${var.project_name}-*",
-            "arn:aws:sagemaker:*:*:endpoint/${var.project_name}-*",
-            "arn:aws:sagemaker:*:*:endpoint-config/${var.project_name}-*",
-            "arn:aws:sagemaker:*:*:model-package/${var.project_name}-*",
-            "arn:aws:sagemaker:*:*:model-package-group/${var.project_name}-*",
-            "arn:aws:sagemaker:*:*:pipeline/${var.project_name}-*",
-            "arn:aws:sagemaker:*:*:processing-job/*",
-            "arn:aws:sagemaker:*:*:training-job/*",
-            "arn:aws:sagemaker:*:*:transform-job/*",
-            "arn:aws:sagemaker:*:*:experiment/*",
-            "arn:aws:sagemaker:*:*:experiment-trial/*",
-            "arn:aws:sagemaker:*:*:experiment-trial-component/*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:model-package/${var.project_name}-*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:model-package-group/${var.project_name}-*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:pipeline/${var.project_name}-*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:processing-job/*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:training-job/*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:transform-job/*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:experiment/*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:experiment-trial/*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:experiment-trial-component/*",
           ]
         },
         {
-          # List/Search and job-creation context actions that AWS does not
-          # support resource-level scoping for. Read-only or pre-resource.
+          # Register model packages only as PendingManualApproval, so a
+          # person approves every version before the approval rule deploys
+          # it.
+          Effect = "Allow"
+          Action = ["sagemaker:CreateModelPackage"]
+          Resource = [
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:model-package/${var.project_name}-*",
+            "arn:aws:sagemaker:${var.aws_region}:${data.aws_caller_identity.current.account_id}:model-package-group/${var.project_name}-*",
+          ]
+          Condition = {
+            StringEquals = { "sagemaker:ModelApprovalStatus" = "PendingManualApproval" }
+          }
+        },
+        {
+          # List and Search calls that have no resource type and support
+          # only "*". Read-only.
           Effect = "Allow"
           Action = [
-            "sagemaker:ListModels",
-            "sagemaker:ListEndpointConfigs",
-            "sagemaker:ListEndpoints",
             "sagemaker:ListModelPackages",
             "sagemaker:ListModelPackageGroups",
             "sagemaker:ListProcessingJobs",
             "sagemaker:ListTrainingJobs",
-            "sagemaker:ListPipelineExecutionSteps",
             "sagemaker:Search",
           ]
           Resource = "*"
         },
         {
-          Effect = "Allow"
-          Action = [
-            "iam:PassRole"
-          ]
-          Resource = "arn:aws:iam::*:role/${var.project_name}-*"
-          # Constrain PassRole to SageMaker only - without this condition any
-          # principal that can act as this role could pass a project role to
-          # any service (confused-deputy / privilege escalation).
+          # The pipeline hands the job role to its jobs, and only to
+          # SageMaker.
+          Effect   = "Allow"
+          Action   = ["iam:PassRole"]
+          Resource = module.sagemaker_job_role.role_arn
           Condition = {
             StringEquals = {
               "iam:PassedToService" = "sagemaker.amazonaws.com"
             }
           }
         },
-        {
-          Effect = "Allow"
-          Action = [
-            "application-autoscaling:RegisterScalableTarget",
-            "application-autoscaling:DeregisterScalableTarget",
-            "application-autoscaling:PutScalingPolicy",
-            "application-autoscaling:DeleteScalingPolicy",
-            "application-autoscaling:DescribeScalableTargets",
-            "application-autoscaling:DescribeScalingPolicies"
-          ]
-          Resource = "*"
-        },
-        {
-          Effect = "Allow"
-          Action = [
-            "cloudwatch:PutMetricAlarm",
-            "cloudwatch:DeleteAlarms",
-            "cloudwatch:DescribeAlarms",
-            "cloudwatch:GetMetricStatistics",
-            "cloudwatch:ListMetrics"
-          ]
-          Resource = "*"
-        },
         ],
+        # The MLflow tracking server's artifact store.
         var.enable_mlflow ? [
           {
-            Effect = "Allow"
-            Action = [
-              "sagemaker-mlflow:AccessUI",
-              "sagemaker-mlflow:CreateExperiment",
-              "sagemaker-mlflow:CreateRun",
-              "sagemaker-mlflow:UpdateRun",
-              "sagemaker-mlflow:DeleteRun",
-              "sagemaker-mlflow:LogMetric",
-              "sagemaker-mlflow:LogParameter"
-            ]
-            Resource = "arn:aws:sagemaker:*:*:mlflow-tracking-server/${var.project_name}-mlflow"
+            Effect   = "Allow"
+            Action   = ["s3:PutObject"]
+            Resource = "${module.s3_model_artifacts.bucket_arn}/mlflow-artifacts/*"
           }
         ] : [],
-        # ENI management for training and processing jobs that run in your
-        # VPC (var.vpc_config): the set the SageMaker execution-role
-        # documentation lists for VPC jobs.
-        var.vpc_config != null ? [
-          {
-            Effect = "Allow"
-            Action = [
-              "ec2:CreateNetworkInterface",
-              "ec2:CreateNetworkInterfacePermission",
-              "ec2:DeleteNetworkInterface",
-              "ec2:DeleteNetworkInterfacePermission",
-              "ec2:DescribeNetworkInterfaces",
-              "ec2:DescribeVpcs",
-              "ec2:DescribeDhcpOptions",
-              "ec2:DescribeSubnets",
-              "ec2:DescribeSecurityGroups"
-            ]
-            Resource = "*"
-          }
-        ] : []
       )
     })
   }
@@ -360,15 +585,15 @@ module "sagemaker_execution_role" {
 # SageMaker Model Registry
 ################################################################################
 
-resource "aws_sagemaker_model_package_group" "medical_image_models" {
+resource "aws_sagemaker_model_package_group" "image_models" {
   model_package_group_name        = "${var.project_name}-model-package-group"
-  model_package_group_description = "Model package group for medical image classification models"
+  model_package_group_description = "Image classification ensemble models for ${var.project_name}"
 }
 
-# Model Card - documents intended use, risk rating, and clinical context so a
-# review board sees the full picture alongside the metrics (Part 2/4). Native
-# resource: https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sagemaker_model_card
-resource "aws_sagemaker_model_card" "medical_image" {
+# Model Card - documents intended use and risk rating so a review board sees
+# the full picture alongside the metrics (Part 2/4). Native resource:
+# https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/sagemaker_model_card
+resource "aws_sagemaker_model_card" "image_model" {
   count = var.enable_model_card ? 1 : 0
 
   model_card_name   = "${var.project_name}-model-card"
@@ -377,19 +602,19 @@ resource "aws_sagemaker_model_card" "medical_image" {
   content = jsonencode({
     model_overview = {
       model_name        = "${var.project_name}-ensemble"
-      model_description = "Weighted-average ensemble (VGG16 + DenseNet121 + EfficientNetV2M) for medical image benign/malignant classification."
+      model_description = "Weighted-average ensemble (VGG16 + DenseNet121 + EfficientNetV2M) for binary image classification (positive class: ${var.positive_class})."
       problem_type      = "Binary image classification"
     }
     intended_uses = {
-      purpose_of_model                   = "Assist radiologists/pathologists in flagging suspicious medical image findings."
-      intended_uses                      = "Primary screening decision support; flags cases for human review. Not for autonomous diagnosis."
-      factors_affecting_model_efficiency = "Performance varies by scanner, stain and magnification and may not generalize to images from other sites or datasets. Validate on your own data before use."
+      purpose_of_model                   = "Flag images of the positive class for human review."
+      intended_uses                      = "Decision support; low-confidence predictions go to a human reviewer. Not for fully automated decisions."
+      factors_affecting_model_efficiency = "Performance depends on how closely new images match the training data (capture device, lighting, resolution, source). Validate on your own data before use."
       risk_rating                        = var.model_card_risk_rating
-      explanations_for_risk_rating       = "Predictions influence clinical decisions; a missed malignant case (false negative) is high-consequence, hence the recall-weighted clinical quality gate."
+      explanations_for_risk_rating       = "A missed positive (false negative) is the costly error, hence the recall-weighted quality gate."
     }
     additional_information = {
-      ethical_considerations      = "Fairness is checked with Fairlearn subgroup metrics in the pipeline gate and a scheduled monitoring job; low-confidence predictions are flagged in the API response for clinician review."
-      caveats_and_recommendations = "Validate thresholds with your clinical team. Do not deploy without review-board approval (models register as PendingManualApproval)."
+      ethical_considerations      = "Fairness is checked with Fairlearn subgroup metrics in the pipeline gate and a scheduled monitoring job; low-confidence predictions are flagged in the API response for human review."
+      caveats_and_recommendations = "Set the gate thresholds for your use case. Models register as PendingManualApproval and need an approver before deployment."
     }
   })
 }
@@ -424,10 +649,9 @@ moved {
 # SageMaker Pipeline
 ################################################################################
 
-# SageMaker Pipeline for Medical Image Classification MLOps: validation,
-# preprocessing, training, evaluation, ensemble, fairness check, clinical
-# quality gate and model registration. The definition lives in
-# pipeline.json.tftpl.
+# SageMaker Pipeline: validation, preprocessing, training, evaluation,
+# ensemble, fairness check, quality gate and model registration. The
+# definition lives in pipeline.json.tftpl.
 locals {
   # Resolves at run time to the execution's ID. Evaluation, ensemble and bias
   # outputs are written under <prefix>/<execution-id>, so every registered
@@ -440,16 +664,53 @@ locals {
   # with a "d" suffix (m5d, c6id, g4dn, p4d) plus g5, g6, g6e, p5 and trn.
   local_storage_instance_regex = "^ml\\.([a-z]+[0-9]+[a-z]*dn?|p4de|g5|g6e?|p5e?n?|trn[12]n?)\\."
 
-  pipeline_vpc_config = var.vpc_config == null ? null : {
+  # Your own subnets (vpc_config) win; otherwise the training VPC
+  # (network.tf); otherwise no VPC.
+  job_vpc_enabled = var.vpc_config != null || var.training_vpc_enabled
+  pipeline_vpc_config = var.vpc_config != null ? {
     Subnets          = var.vpc_config.subnet_ids
     SecurityGroupIds = var.vpc_config.security_group_ids
+    } : var.training_vpc_enabled ? {
+    Subnets          = aws_subnet.training[*].id
+    SecurityGroupIds = [aws_security_group.training_jobs[0].id]
+  } : null
+
+  # Quality gate metric -> the Float pipeline parameter that carries its bar.
+  quality_gate_parameters = {
+    accuracy  = "AccuracyThreshold"
+    auc_roc   = "AucThreshold"
+    precision = "PrecisionThreshold"
+    recall    = "RecallThreshold"
+  }
+
+  # QUALITY_GATE for the evaluation and ensemble steps, built at run time from
+  # the Float parameters ({"accuracy": 0.85, ...}); Std:Join stringifies them.
+  quality_gate_json = {
+    "Std:Join" = {
+      On = ""
+      Values = flatten([
+        "{",
+        [
+          for i, metric in sort(keys(local.quality_gate_parameters)) : [
+            "${i == 0 ? "" : ", "}\"${metric}\": ",
+            { Get = "Parameters.${local.quality_gate_parameters[metric]}" },
+          ]
+        ],
+        "}",
+      ])
+    }
+  }
+
+  backbone_weights = {
+    bucket = try(regex("^s3://([^/]+)/(.+)$", var.backbone_weights_s3_uri)[0], "")
+    key    = try(regex("^s3://([^/]+)/(.+)$", var.backbone_weights_s3_uri)[1], "")
   }
 }
 
-resource "aws_sagemaker_pipeline" "medical_image_pipeline" {
+resource "aws_sagemaker_pipeline" "image_pipeline" {
   pipeline_name         = "${var.project_name}-pipeline"
-  pipeline_display_name = "Medical-Image-Classification-Pipeline"
-  pipeline_description  = "MLOps pipeline for medical image classification with custom models and built-in preprocessing"
+  pipeline_display_name = "Image-Classification-Pipeline"
+  pipeline_description  = "Validation, preprocessing, training, evaluation, ensemble, fairness and quality gates, and model registration"
   role_arn              = module.sagemaker_execution_role.role_arn
 
   # Run the three independent model trainers concurrently instead of serially.
@@ -460,9 +721,9 @@ resource "aws_sagemaker_pipeline" "medical_image_pipeline" {
   pipeline_definition = templatefile("${path.module}/pipeline.json.tftpl", {
     project_name             = var.project_name
     aws_region               = var.aws_region
-    role_arn                 = module.sagemaker_execution_role.role_arn
+    job_role_arn             = module.sagemaker_job_role.role_arn
     kms_key_arn              = module.kms.key_arn
-    model_package_group_name = aws_sagemaker_model_package_group.medical_image_models.model_package_group_name
+    model_package_group_name = aws_sagemaker_model_package_group.image_models.model_package_group_name
     buckets                  = local.base_buckets
     images = {
       tensorflow_cpu       = data.aws_sagemaker_prebuilt_ecr_image.tensorflow_cpu.registry_path
@@ -493,9 +754,15 @@ resource "aws_sagemaker_pipeline" "medical_image_pipeline" {
     vpc_config                   = local.pipeline_vpc_config
     local_storage_instance_regex = local.local_storage_instance_regex
 
-    clinical_quality_gate = var.clinical_quality_gate
-    fairness_gate         = var.fairness_gate
-    allow_not_evaluable   = var.allow_not_evaluable
+    quality_gate            = var.quality_gate
+    quality_gate_parameters = local.quality_gate_parameters
+    quality_gate_json       = local.quality_gate_json
+    fairness_gate           = var.fairness_gate
+    allow_not_evaluable     = var.allow_not_evaluable
+    positive_class          = var.positive_class
+    backbone_weights_s3_uri = var.backbone_weights_s3_uri
+
+    baseline_cnn = var.baseline_cnn
 
     # Defaults for the RetrainingReason, DatasetVersion and CodeCommitSha
     # pipeline parameters.

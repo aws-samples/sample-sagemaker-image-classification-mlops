@@ -6,28 +6,33 @@
 # the settings you are most likely to change; copy the lines you need into
 # terraform.tfvars.
 
-project_name = "medical-image-classification"
+project_name = "image-classification"
 environment  = "dev"
 aws_region   = "us-east-1"
 
-# Audit and cost governance. The trail is account-wide and multi-region; turn
-# it on only when no organization trail records this account.
-enable_cloudtrail         = false
+# Audit and cost governance. The trail records management events account-wide
+# (multi-region) plus data events on the project buckets and Lambda functions;
+# set it to false when an organization trail already records this account.
+enable_cloudtrail         = true
 cloudtrail_retention_days = 400
 monthly_budget_usd        = 200
 budget_alert_emails       = [] # e.g., ["oncall@example.com"]
 budget_start_date         = "2026-01-01_00:00" # YYYY-MM-DD_HH:MM (UTC)
 
-# Training data prefix in the raw data bucket
-training_data_path = "medical_image_data/"
+# Images live under <training_data_path><label>/<file>.
+training_data_path = "images/"
+positive_class     = "" # empty = the second class folder in alphabetical order
+
+# Optional: your own backbone weights; empty trains from random initialisation.
+backbone_weights_s3_uri = ""
 
 # Cost levers
 enable_managed_spot_training = true
 enable_auto_trigger          = true
 
-# Object whose creation starts the pipeline (scripts/data_uploader.sh writes it
-# after a batch upload).
-auto_trigger_marker_key = "medical_image_data/.batch_complete"
+# scripts/data_uploader.sh writes this object after a batch upload; its
+# creation starts the pipeline.
+auto_trigger_marker_key = "images/.batch_complete"
 
 # Move uploads that fail the image checks to quarantine/ (with a .reason.json)
 enable_upload_quarantine     = true
@@ -40,21 +45,29 @@ enable_mlflow = false
 kms_deletion_window_days = 30
 enable_kms_key_rotation  = true
 
-# Training jobs run without outbound network access. Upload the ImageNet
-# weights once first: python scripts/download_pretrained_weights.py
+# Training jobs run without outbound network access; backbone_weights_s3_uri
+# still reaches them as an input channel.
 enable_network_isolation = true
 
-# Optional: run training and processing jobs in your VPC. The subnets need
-# routes to S3, SageMaker, CloudWatch Logs, ECR and PyPI (or a mirror).
+# Training and processing jobs run in a private VPC this stack creates (no
+# internet or NAT gateway, S3 gateway endpoint only). Set false to run them in
+# the SageMaker service network.
+training_vpc_enabled   = true
+training_vpc_cidr      = "10.42.0.0/24"
+training_vpc_flow_logs = true
+
+# Optional: your own subnets instead (takes precedence over the training VPC).
+# They need a route to S3; the processing steps install packages from the
+# wheelhouse in the scripts bucket.
 # vpc_config = {
 #   subnet_ids         = ["subnet-0123456789abcdef0"]
 #   security_group_ids = ["sg-0123456789abcdef0"]
 # }
 
-# Keep buckets (and their data) when the stack is destroyed. Set
-# force_destroy = true only for a throwaway environment.
+# force_destroy = true lets terraform destroy empty and delete every bucket
+# of this stack. Set it to false to keep the buckets and their data.
 bucket_defaults = {
-  force_destroy       = false
+  force_destroy       = true
   enable_versioning   = true
   block_public_access = true
 }
@@ -63,5 +76,5 @@ bucket_defaults = {
 # sagemaker_images = {
 #   tensorflow_gpu_tag       = "2.19.0-gpu-py312-cu125-ubuntu22.04-sagemaker"
 #   tensorflow_cpu_tag       = "2.19.0-cpu-py312-ubuntu22.04-sagemaker"
-#   tensorflow_inference_tag = "2.19.0-cpu-py312-ubuntu22.04-sagemaker"
+#   tensorflow_inference_tag = "2.20-cpu-py312-amzn2023-sagemaker"
 # }

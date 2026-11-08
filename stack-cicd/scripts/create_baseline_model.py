@@ -12,11 +12,11 @@ when the group already holds an Approved or PendingManualApproval package.
 The baseline model is a toy network that cannot classify images:
 - Input: 30 features
 - Hidden: 16 units with ReLU activation
-- Output: 2 classes (benign, malignant) with softmax activation
+- Output: 2 classes with softmax activation
 
 The model is registered as PendingManualApproval and marked as a placeholder
 in CustomerMetadataProperties (ModelRole=placeholder-baseline). It is not a
-medical model: it only lets the first stack-inference apply create an
+real model: it only lets the first stack-inference apply create an
 endpoint. A person approves it once, on purpose, before that first apply:
 
     aws sagemaker update-model-package \
@@ -40,6 +40,7 @@ import tempfile
 import uuid
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 # Configure logging
 logging.basicConfig(
@@ -53,7 +54,7 @@ s3_client = boto3.client("s3")
 
 PLACEHOLDER_METADATA = {
     "ModelRole": "placeholder-baseline",
-    "ClinicalUse": "none",
+    "IntendedUse": "none",
 }
 
 
@@ -82,7 +83,7 @@ def existing_model_package(model_package_group_name: str) -> dict | None:
     except sagemaker_client.exceptions.ResourceNotFound:
         logger.warning(f"Model package group '{model_package_group_name}' not found")
         return None
-    except Exception as e:
+    except (ClientError, BotoCoreError) as e:
         logger.error(f"Failed to check Model Registry: {e}", exc_info=True)
         raise
 
@@ -149,9 +150,9 @@ def create_baseline_model() -> dict[str, str]:
 
     except ImportError as e:
         logger.error(f"Failed to import TensorFlow: {e}", exc_info=True)
-        logger.error("Please ensure TensorFlow is installed: pip install tensorflow")
+        logger.error("Please ensure TensorFlow is installed: pip install tensorflow==2.19.0")
         raise
-    except Exception as e:
+    except (OSError, ValueError, RuntimeError) as e:
         logger.error(f"Failed to create baseline model: {e}", exc_info=True)
         raise
 
@@ -181,7 +182,7 @@ def upload_model_to_s3(model_tar_path: str, bucket: str, key: str) -> str:
 
         return s3_uri
 
-    except Exception as e:
+    except (ClientError, BotoCoreError, OSError) as e:
         logger.error(f"Failed to upload model to S3: {e}", exc_info=True)
         raise
 
@@ -216,7 +217,7 @@ def register_baseline_model(
         response = sagemaker_client.create_model_package(
             ModelPackageGroupName=model_package_group_name,
             ModelPackageDescription=(
-                "PLACEHOLDER baseline (30-feature toy network, not a medical model). "
+                "PLACEHOLDER baseline (30-feature toy network, not a real model). "
                 "Approve only to create the endpoint on first deploy."
             ),
             ModelApprovalStatus=model_approval_status,
@@ -227,13 +228,10 @@ def register_baseline_model(
                         "Image": inference_image_uri,
                         "ModelDataUrl": model_artifacts_uri,
                         "Framework": "TENSORFLOW",
-                        # Must match the DLC tag actually used at serve time -
-                        # the AWS SageMaker TF inference DLC stream caps at
-                        # 2.19 (see stack-training/variables.tf
-                        # sagemaker_images.tensorflow_inference_tag). Upstream
-                        # TF is at 2.21 but AWS has not published 2.20/2.21
-                        # DLCs for SageMaker yet.
-                        "FrameworkVersion": "2.19",
+                        # The serving image's version (INFERENCE_IMAGE_TAG,
+                        # stack-training sagemaker_images.tensorflow_inference_tag).
+                        # TensorFlow Serving 2.20 loads this 2.19 SavedModel.
+                        "FrameworkVersion": "2.20",
                     }
                 ],
                 "SupportedContentTypes": ["application/json"],
@@ -251,7 +249,7 @@ def register_baseline_model(
 
         return model_package_arn
 
-    except Exception as e:
+    except (ClientError, BotoCoreError) as e:
         logger.error(f"Failed to register baseline model: {e}", exc_info=True)
         raise
 
@@ -320,14 +318,14 @@ def main():
             # the target region. The 763104351884 account ID is the canonical
             # DLC registry for commercial AWS regions; AWS GovCloud/CN use
             # different account IDs (see
-            # https://github.com/aws/deep-learning-containers/blob/master/available_images.md).
+            # https://aws.github.io/deep-learning-containers/reference/available_images/).
             # The floating tag (no -v1.X suffix) auto-picks up AWS-published
             # patch versions, matching what stack-training/variables.tf
             # sets via sagemaker_images.tensorflow_inference_tag.
             account_id = os.environ.get("DLC_ACCOUNT_ID", "763104351884")
             dlc_tag = os.environ.get(
                 "INFERENCE_IMAGE_TAG",
-                "2.19.0-cpu-py312-ubuntu22.04-sagemaker",
+                "2.20-cpu-py312-amzn2023-sagemaker",
             )
             args.inference_image_uri = (
                 f"{account_id}.dkr.ecr.{args.aws_region}.amazonaws.com/"
@@ -384,6 +382,7 @@ def main():
         logger.warning("Script interrupted by user")
         sys.exit(1)
     except Exception as e:
+        # Top-level boundary of the script: log the traceback and exit non-zero.
         logger.error(f"Baseline model creation failed: {e}", exc_info=True)
         sys.exit(1)
 

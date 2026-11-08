@@ -1,15 +1,17 @@
 # s3-bucket
 
-Reusable S3 bucket with server-side encryption, optional versioning, public access blocking, and EventBridge notifications.
+Reusable Amazon S3 bucket with server-side encryption, optional versioning, public access blocking, and Amazon EventBridge notifications.
 
 ## What It Does
 
 1. Creates an S3 bucket with configurable force-destroy behavior
-2. Configures server-side encryption using KMS with an S3 Bucket Key (if a key is provided) or AES256 by default
+2. Configures server-side encryption using AWS KMS with an S3 Bucket Key (if a key is provided) or AES256 by default
 3. Sets Object Ownership to BucketOwnerEnforced (ACLs disabled) by default
 4. Optionally enables bucket versioning
 5. Optionally blocks all public access (enabled by default)
 6. Optionally enables EventBridge notifications for S3 events
+7. Attaches a bucket policy that denies requests without TLS, plus any caller statements in `policy_statements` (on by default, `enable_ssl_enforcement`)
+8. Optionally sends server access logs to `logging_target_bucket` (`enable_access_logging` sets it explicitly when that bucket is created in the same apply)
 
 <!-- BEGIN_TF_DOCS -->
 ## Requirements
@@ -46,6 +48,7 @@ Reusable S3 bucket with server-side encryption, optional versioning, public acce
 | bucket\_name | Name of the S3 bucket | `string` | n/a | yes |
 | abort\_incomplete\_multipart\_days | Days after which incomplete multipart uploads are aborted. Applied as a baseline lifecycle rule on every bucket (stale multiparts don't show up in the console and silently accumulate cost). | `number` | `7` | no |
 | block\_public\_access | Block all public access to the bucket | `bool` | `true` | no |
+| enable\_access\_logging | Turn server access logging on or off. Null = on when logging\_target\_bucket is set. Set it when logging\_target\_bucket is a bucket created in the same apply: its name is then unknown at plan time, and the logging resource's count must be known. | `bool` | `null` | no |
 | enable\_eventbridge | Enable EventBridge notifications for S3 events | `bool` | `false` | no |
 | enable\_ssl\_enforcement | Attach a bucket policy that denies all non-TLS (HTTP) access via the aws:SecureTransport condition. Default true. Set false when the caller manages the full bucket policy itself (e.g. the CloudTrail logs bucket has its own policy resource) to avoid two aws\_s3\_bucket\_policy resources fighting over the same bucket. | `bool` | `true` | no |
 | enable\_versioning | Enable versioning on the bucket | `bool` | `false` | no |
@@ -55,6 +58,7 @@ Reusable S3 bucket with server-side encryption, optional versioning, public acce
 | logging\_target\_bucket | Name of a separate S3 bucket that receives server-access logs for this bucket. Null = no logging. The target bucket must grant PutObject to the log-delivery principal. | `string` | `null` | no |
 | logging\_target\_prefix | Object-key prefix under logging\_target\_bucket for this bucket's logs. Null = <source-bucket-name>/ (easy grouping when many buckets log to one destination). | `string` | `null` | no |
 | object\_ownership | S3 Object Ownership setting. BucketOwnerEnforced (default) disables ACLs. Use BucketOwnerPreferred only for a bucket that must accept ACL-based writes, such as CloudFront standard logs. | `string` | `"BucketOwnerEnforced"` | no |
+| policy\_statements | Extra bucket policy statements (IAM policy statement objects) added after the TLS deny in the policy that enable\_ssl\_enforcement attaches, for example a service principal's write grant. | `any` | `[]` | no |
 | tags | Tags to apply to the bucket | `map(string)` | `{}` | no |
 
 ## Outputs

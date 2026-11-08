@@ -77,7 +77,7 @@ variable "cors_allowed_origin" {
 ################################################################################
 
 # Stage-wide throttle for every request. The account default is 10,000
-# requests per second; a medical-image demo caps far lower.
+# requests per second; a demo caps far lower.
 variable "throttling_rate_limit" {
   description = "Stage-wide throttling rate limit (requests per second across all methods)"
   type        = number
@@ -179,7 +179,7 @@ variable "enable_xray_tracing" {
 variable "log_retention_days" {
   description = "Retention in days for the API Gateway access log group"
   type        = number
-  default     = 90
+  default     = 365
 }
 
 variable "log_kms_key_arn" {

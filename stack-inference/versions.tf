@@ -6,8 +6,9 @@ terraform {
 
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
-      version = "~> 6.0"
+      source = "hashicorp/aws"
+      # 6.54 stops a perpetual diff on guardrail filter modalities.
+      version = "~> 6.54"
     }
     random = {
       source  = "hashicorp/random"

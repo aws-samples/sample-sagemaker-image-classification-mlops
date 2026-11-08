@@ -9,6 +9,10 @@ locals {
     Purpose     = "ci-cd-pipeline"
   }
 
+  # Tag keys the role may set on the KMS keys and CloudFront distributions it
+  # creates: the provider default_tags keys, the same four in every stack.
+  resource_tag_keys = keys(local.common_tags)
+
   state_bucket_region      = var.state_bucket_region != "" ? var.state_bucket_region : var.aws_region
   state_kms_key_alias      = var.state_kms_key_alias != "" ? var.state_kms_key_alias : "alias/${var.project_name}-terraform-state"
   workload_boundary_name   = var.workload_boundary_name != "" ? var.workload_boundary_name : "${var.project_name}-workload-boundary"
@@ -21,6 +25,13 @@ locals {
   ci_role_arns = [
     "arn:aws:iam::${local.account_id}:role/${var.project_name}-codebuild-role",
     "arn:aws:iam::${local.account_id}:role/${var.project_name}-codepipeline-role",
+  ]
+
+  # The deploy projects, which run as the CodeBuild role. The workload
+  # boundary in stack-backend-setup denies the same four names.
+  ci_project_arns = [
+    for suffix in ["baseline-model-creation", "training-deploy", "script-upload", "inference-deploy"] :
+    "arn:aws:codebuild:${var.aws_region}:${local.account_id}:project/${var.project_name}-${suffix}"
   ]
 
   # Managed policies CodeBuild may attach to project roles: the project's own

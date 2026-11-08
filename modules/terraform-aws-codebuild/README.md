@@ -6,7 +6,8 @@ Reusable AWS CodeBuild project with configurable environment, source, and artifa
 
 1. Creates a CodeBuild project with configurable build timeout and service role
 2. Configures the build environment (compute type, Docker image, environment variables)
-3. Configures source and artifact settings (defaults to CodePipeline integration)
+3. Configures source and artifact settings (defaults to AWS CodePipeline integration)
+4. Creates the build log group `/aws/codebuild/<name>` with `log_retention_days` (default 365) and an optional customer managed key (`log_kms_key_arn`), unless `log_group_name` names an existing group
 
 <!-- BEGIN_TF_DOCS -->
 ## Requirements
@@ -26,6 +27,7 @@ Reusable AWS CodeBuild project with configurable environment, source, and artifa
 
 | Name | Type |
 | ---- | ---- |
+| [aws_cloudwatch_log_group.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_log_group) | resource |
 | [aws_codebuild_project.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/codebuild_project) | resource |
 
 ## Inputs
@@ -44,7 +46,9 @@ Reusable AWS CodeBuild project with configurable environment, source, and artifa
 | environment\_type | Type of build environment | `string` | `"LINUX_CONTAINER"` | no |
 | environment\_variables | Environment variables for the build | <pre>list(object({<br/>    name  = string<br/>    value = string<br/>  }))</pre> | `[]` | no |
 | image\_pull\_credentials\_type | Type of credentials for pulling the build image | `string` | `"CODEBUILD"` | no |
-| log\_group\_name | CloudWatch Logs group that CodeBuild writes to. Null = CodeBuild auto-creates `/aws/codebuild/<project-name>` with no KMS encryption. | `string` | `null` | no |
+| log\_group\_name | Existing CloudWatch Logs group that CodeBuild writes to. Null = the module creates `/aws/codebuild/<name>` with log\_retention\_days and log\_kms\_key\_arn. | `string` | `null` | no |
+| log\_kms\_key\_arn | Customer managed KMS key ARN for the log group the module creates. Its key policy must let the CloudWatch Logs service principal use it for this log group. Null = CloudWatch Logs default encryption. | `string` | `null` | no |
+| log\_retention\_days | Days the log group the module creates keeps the build logs. | `number` | `365` | no |
 | log\_stream\_name | CloudWatch Logs stream name prefix. Null = default (build ID). | `string` | `null` | no |
 | source\_type | Type of source provider | `string` | `"CODEPIPELINE"` | no |
 | tags | Tags to apply to the CodeBuild project | `map(string)` | `{}` | no |
@@ -63,7 +67,7 @@ Reusable AWS CodeBuild project with configurable environment, source, and artifa
 
 ```
 modules/terraform-aws-codebuild/
-|-- main.tf          # CodeBuild project resource with dynamic environment variables
+|-- main.tf          # Build log group and CodeBuild project with dynamic environment variables
 |-- outputs.tf       # Project name, ARN, ID
 `-- variables.tf     # Project name, IAM role, build config, environment, source, tags
 ```

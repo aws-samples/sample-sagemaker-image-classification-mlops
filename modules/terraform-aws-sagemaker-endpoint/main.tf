@@ -11,7 +11,7 @@ locals {
 
   # The model name changes whenever its inputs change so create_before_destroy
   # on the endpoint config can stand up the replacement before the old one goes.
-  model_name = "${substr(var.project_name, 0, 45)}-model-${substr(sha1("${var.model_package_arn}|${var.serving_image_uri}"), 0, 8)}"
+  model_name = "${substr(var.project_name, 0, 45)}-model-${substr(sha1("${var.model_package_arn}|${var.serving_image_uri}|${var.enable_network_isolation}"), 0, 8)}"
 }
 
 # Reads the approved package through the Cloud Control API (no shell-out, no
@@ -25,8 +25,9 @@ data "awscc_sagemaker_model_package" "approved" {
 }
 
 resource "aws_sagemaker_model" "this" {
-  name               = local.model_name
-  execution_role_arn = var.execution_role_arn
+  name                     = local.model_name
+  execution_role_arn       = var.execution_role_arn
+  enable_network_isolation = var.enable_network_isolation
 
   primary_container {
     model_package_name = local.use_serving_image ? null : var.model_package_arn
@@ -61,9 +62,8 @@ resource "aws_sagemaker_model" "this" {
 #     inference handler itself
 #   - no auto-scaling (scales via max_concurrency on the variant)
 #   - 1-5 second cold start after idle periods
-# Real-time remains the default so the project's compliance / monitoring
-# story stays intact; callers opting into serverless should understand the
-# tradeoffs.
+# Real-time remains the default so the project's compliance / monitoring story
+# stays intact; callers opting into serverless should understand the tradeoffs.
 # kics false positive "Endpoint Configuration Encryption Disabled": kms_key_arn
 # is set to the project CMK in real-time mode (the default); serverless variants
 # attach no ML storage volume and reject the argument, so it must be null there.
@@ -339,7 +339,6 @@ resource "aws_cloudwatch_metric_alarm" "endpoint_error_rate" {
   })
 }
 
-# Alarm for endpoint latency
 resource "aws_cloudwatch_metric_alarm" "endpoint_latency" {
   alarm_name          = "${var.project_name}-endpoint-latency"
   comparison_operator = "GreaterThanThreshold"
@@ -373,7 +372,6 @@ resource "aws_cloudwatch_metric_alarm" "endpoint_latency" {
 # prevents Terraform from trying to register a scalable target that
 # SageMaker would reject for a serverless variant.
 
-# Auto-Scaling Target for SageMaker Endpoint
 resource "aws_appautoscaling_target" "this" {
   count = var.use_serverless_inference ? 0 : 1
 
