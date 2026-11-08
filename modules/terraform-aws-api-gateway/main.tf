@@ -267,6 +267,7 @@ data "aws_iam_policy_document" "apigw_cloudwatch_assume" {
 resource "aws_iam_role" "apigw_cloudwatch" {
   count                = var.enable_access_logging ? 1 : 0
   name                 = "${var.api_name}-cloudwatch-logs"
+  description          = "Lets API Gateway write the ${var.api_name} access and execution logs to CloudWatch Logs"
   permissions_boundary = var.permissions_boundary_arn
   assume_role_policy   = data.aws_iam_policy_document.apigw_cloudwatch_assume[0].json
   tags                 = var.tags
@@ -388,7 +389,7 @@ resource "aws_api_gateway_method_settings" "all" {
   settings {
     metrics_enabled        = true
     logging_level          = var.enable_access_logging ? "INFO" : "OFF"
-    data_trace_enabled     = false # never log full payloads - base64 images are potential PHI
+    data_trace_enabled     = false # never log full payloads: the request body is the uploaded image
     throttling_burst_limit = var.throttling_burst_limit
     throttling_rate_limit  = var.throttling_rate_limit
   }

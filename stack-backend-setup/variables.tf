@@ -90,3 +90,15 @@ variable "workload_boundary_name" {
   type        = string
   default     = ""
 }
+
+variable "boundary_extra_s3_arns" {
+  description = "Extra S3 bucket and object ARNs the workload permissions boundary admits besides the <project_name>-* buckets, for example [\"arn:aws:s3:::my-weights\", \"arn:aws:s3:::my-weights/backbones/*\"] for backbone_weights_s3_uri = \"s3://my-weights/backbones/\" (the bucket, and the URI's key followed by *)."
+  type        = list(string)
+  default     = []
+}
+
+variable "workload_project_name" {
+  description = "project_name of the training, inference and CI/CD stacks, whose <name>-* resources the workload boundary admits. Empty = project_name. Set it when this stack keeps an older project_name for its state bucket and key."
+  type        = string
+  default     = ""
+}

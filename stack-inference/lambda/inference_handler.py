@@ -4,7 +4,7 @@
 """Inference API: POST /predict and GET /results/{id}.
 
 Logs carry only the method, path, request id and payload size. The image and
-the model response are medical data and never go to CloudWatch.
+the model response never go to Amazon CloudWatch.
 """
 
 import base64
@@ -14,10 +14,11 @@ import json
 import logging
 import os
 import re
+import warnings
 from datetime import UTC, datetime
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from mlops_common.preprocess import preprocess
 from mlops_common.scores import extract_score, extract_threshold
 from PIL import Image
@@ -26,16 +27,17 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Decompression-bomb guard: a small payload must not expand to GBs of RAM.
-# 25 MP is far above any real histopathology tile.
+# Pillow warns above MAX_IMAGE_PIXELS and raises at twice that; decode_image
+# turns the warning into an error, so 25 MP is the hard cap.
 Image.MAX_IMAGE_PIXELS = 25_000_000
 MAX_IMAGE_EDGE = 12000
 
-# Pillow format -> (content type, file extension, Bedrock Nova format or None).
+# Pillow format -> (content type, file extension, Bedrock Nova format).
 IMAGE_FORMATS = {
     "JPEG": ("image/jpeg", "jpg", "jpeg"),
     "PNG": ("image/png", "png", "png"),
-    "BMP": ("image/bmp", "bmp", None),
 }
+DEFAULT_CLASS_NAMES = ("negative", "positive")
 
 # Explanation methods the endpoint handler implements (scripts/ensemble/inference.py).
 EXPLAIN_METHODS = ("gradcam", "region_shapley")
@@ -61,7 +63,7 @@ def _response(status_code, body):
 
 
 def _metric_namespace():
-    return f"{os.environ.get('PROJECT_NAME', 'medical-image-classification')}/ModelPerformance"
+    return f"{os.environ.get('PROJECT_NAME', 'image-classification')}/ModelPerformance"
 
 
 def _emit_error_metric(reason):
@@ -71,8 +73,16 @@ def _emit_error_metric(reason):
             Namespace=_metric_namespace(),
             MetricData=[{"MetricName": "PredictionError", "Value": 1, "Unit": "Count"}],
         )
-    except Exception as exc:
+    except (ClientError, BotoCoreError) as exc:
         logger.warning("Failed to publish PredictionError (%s): %s", reason, type(exc).__name__)
+
+
+def class_names(result):
+    """(negative, positive) class names: from the endpoint response, else CLASS_NAMES, else a default."""
+    names = result.get("class_names") if isinstance(result, dict) else None
+    if not (isinstance(names, list) and len(names) == 2 and all(isinstance(n, str) for n in names)):
+        names = [n.strip() for n in os.environ.get("CLASS_NAMES", "").split(",") if n.strip()]
+    return tuple(names) if len(names) == 2 else DEFAULT_CLASS_NAMES
 
 
 def confidence_cutoff():
@@ -80,37 +90,75 @@ def confidence_cutoff():
     return float(os.environ.get("BEDROCK_CONFIDENCE_THRESHOLD", "0.70"))
 
 
+def border_attention(gradcam, band_fraction):
+    """Share of the Grad-CAM mass in the outer band of the image, or None.
+
+    The grid covers the whole resized upload. A cell is in the band when its
+    centre lies within ``band_fraction`` of any edge. A high share means the
+    model looked at edges, borders, watermarks or padding rather than the
+    subject, a shortcut that deserves a second look. None when there is no
+    usable square grid or the map is all zero.
+    """
+    grid = gradcam.get("grid") if isinstance(gradcam, dict) else None
+    if not isinstance(grid, list) or not grid:
+        return None
+    size = len(grid)
+    total = border = 0.0
+    try:
+        for r, row in enumerate(grid):
+            if not isinstance(row, list) or len(row) != size:
+                return None
+            for c, value in enumerate(row):
+                weight = max(float(value), 0.0)
+                total += weight
+                y, x = (r + 0.5) / size, (c + 0.5) / size
+                if min(x, y, 1.0 - x, 1.0 - y) < band_fraction:
+                    border += weight
+    except (TypeError, ValueError):
+        return None
+    return border / total if total > 0.0 else None
+
+
 def decode_image(base64_image):
     """Base64 string to (raw bytes, RGB-convertible PIL image, Pillow format).
 
-    Raises ValueError for anything that is not a supported, sanely sized image.
+    The format and size are checked from the header before any pixel is
+    decoded. Raises ValueError for anything that is not a JPEG or PNG of a
+    sane size.
     """
     try:
         raw = base64.b64decode(base64_image, validate=True)
     except (binascii.Error, ValueError, TypeError) as exc:
         raise ValueError("Invalid base64 image encoding") from exc
     try:
-        img = Image.open(io.BytesIO(raw))
-        img.load()
-    except (OSError, Image.DecompressionBombError) as exc:
-        raise ValueError("Unreadable or oversized image") from exc
-    if img.format not in IMAGE_FORMATS:
-        raise ValueError(f"Unsupported image format: {img.format}")
-    if img.width > MAX_IMAGE_EDGE or img.height > MAX_IMAGE_EDGE:
-        raise ValueError(f"Image dimensions too large: {img.width}x{img.height}")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            img = Image.open(io.BytesIO(raw), formats=list(IMAGE_FORMATS))
+            if img.format not in IMAGE_FORMATS:
+                raise ValueError(f"Unsupported image format: {img.format}")
+            if img.width > MAX_IMAGE_EDGE or img.height > MAX_IMAGE_EDGE:
+                raise ValueError(f"Image dimensions too large: {img.width}x{img.height}")
+            img.load()
+    except (OSError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise ValueError("Unreadable, unsupported or oversized image") from exc
     return raw, img, img.format
 
 
 def bedrock_explain(base64_image, image_format, prediction, confidence):
-    """Ask a Bedrock foundation model for reasoning on a low-confidence case.
+    """Ask an Amazon Bedrock foundation model to describe a low-confidence image.
 
-    Returns the text, or None on any failure or unsupported format; the
-    primary prediction is returned either way. Nova InvokeModel messages-v1:
+    Fails closed: without a guardrail (BEDROCK_GUARDRAIL_ID and
+    BEDROCK_GUARDRAIL_VERSION) Bedrock is not called. Returns the text, or
+    None; the primary prediction is returned either way. Nova InvokeModel
+    messages-v1:
     https://docs.aws.amazon.com/nova/latest/userguide/modalities-image-examples.html
     """
-    nova_format = IMAGE_FORMATS[image_format][2]
-    if nova_format is None:
+    guardrail_id = os.environ.get("BEDROCK_GUARDRAIL_ID", "")
+    guardrail_version = os.environ.get("BEDROCK_GUARDRAIL_VERSION", "")
+    if not (guardrail_id and guardrail_version):
+        logger.warning("Bedrock description skipped: no guardrail configured")
         return None
+    nova_format = IMAGE_FORMATS[image_format][2]
     try:
         native_request = {
             "schemaVersion": "messages-v1",
@@ -121,11 +169,11 @@ def bedrock_explain(base64_image, image_format, prediction, confidence):
                         {"image": {"format": nova_format, "source": {"bytes": base64_image}}},
                         {
                             "text": (
-                                "You are assisting a radiologist. A custom classifier predicted "
-                                f"'{prediction}' with {confidence:.0%} confidence, which is below the "
-                                "confidence threshold. Describe the visual findings in this "
-                                "histopathology image and whether they appear benign or malignant. "
-                                "Be concise and note this is decision support, not a diagnosis."
+                                "You are assisting a human reviewer. An image classifier "
+                                f"predicted the class '{prediction}' with {confidence:.0%} "
+                                "confidence, which is below the confidence threshold. Describe "
+                                "the image and say whether it looks consistent with the "
+                                "predicted class. Be concise; the reviewer makes the decision."
                             )
                         },
                     ],
@@ -133,21 +181,17 @@ def bedrock_explain(base64_image, image_format, prediction, confidence):
             ],
             "inferenceConfig": {"maxTokens": 300, "temperature": 0.2, "topP": 0.9},
         }
-        invoke_kwargs = {
-            "modelId": os.environ.get("BEDROCK_MODEL_ID", "us.amazon.nova-pro-v1:0"),
-            "body": json.dumps(native_request),
-        }
         # The guardrail filters unsafe content and anonymises PII in the output.
-        guardrail_id = os.environ.get("BEDROCK_GUARDRAIL_ID", "")
-        guardrail_version = os.environ.get("BEDROCK_GUARDRAIL_VERSION", "")
-        if guardrail_id and guardrail_version:
-            invoke_kwargs["guardrailIdentifier"] = guardrail_id
-            invoke_kwargs["guardrailVersion"] = guardrail_version
-        response = boto3.client("bedrock-runtime").invoke_model(**invoke_kwargs)
+        response = boto3.client("bedrock-runtime").invoke_model(
+            modelId=os.environ.get("BEDROCK_MODEL_ID", "us.amazon.nova-pro-v1:0"),
+            body=json.dumps(native_request),
+            guardrailIdentifier=guardrail_id,
+            guardrailVersion=guardrail_version,
+        )
         body = json.loads(response["body"].read())
         return body["output"]["message"]["content"][0]["text"]
-    except Exception as exc:
-        logger.warning("Bedrock reasoning unavailable: %s", type(exc).__name__)
+    except (ClientError, BotoCoreError, KeyError, IndexError, TypeError, ValueError) as exc:
+        logger.warning("Bedrock description unavailable: %s", type(exc).__name__)
         return None
 
 
@@ -171,7 +215,7 @@ def start_human_review(request_id, image_s3_uri, prediction, confidence):
             },
         )
         return f"review-{request_id}"
-    except Exception as exc:
+    except (ClientError, BotoCoreError) as exc:
         logger.warning("Failed to start human review loop: %s", type(exc).__name__)
         return None
 
@@ -184,6 +228,7 @@ def save_prediction_data(s3_client, bucket, prediction_data, image_bytes, image_
     """Store the input image and the prediction record under the request id.
 
     Returns the image's S3 URI (or None) so a human review can point at it.
+    The record, which GET /results/{id} returns, does not carry the URI.
     """
     if not bucket:
         return None
@@ -195,7 +240,7 @@ def save_prediction_data(s3_client, bucket, prediction_data, image_bytes, image_
             Bucket=bucket, Key=image_key, Body=image_bytes, ContentType=content_type
         )
         image_uri = f"s3://{bucket}/{image_key}"
-    except Exception as exc:
+    except (ClientError, BotoCoreError) as exc:
         logger.warning("Failed to persist input image: %s", type(exc).__name__)
 
     record = {
@@ -203,7 +248,6 @@ def save_prediction_data(s3_client, bucket, prediction_data, image_bytes, image_
         "timestamp": datetime.now(UTC).isoformat(),
         "image_bytes": len(image_bytes),
         "image_content_type": content_type,
-        "image_s3_uri": image_uri,
     }
     try:
         s3_client.put_object(
@@ -212,7 +256,7 @@ def save_prediction_data(s3_client, bucket, prediction_data, image_bytes, image_
             Body=json.dumps(record),
             ContentType="application/json",
         )
-    except Exception as exc:
+    except (ClientError, BotoCoreError) as exc:
         logger.warning("Failed to save prediction record: %s", type(exc).__name__)
     return image_uri
 
@@ -227,7 +271,10 @@ def fetch_prediction_result(s3_client, bucket, request_id):
         if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
             return None
         raise
-    return json.loads(obj["Body"].read())
+    result = json.loads(obj["Body"].read())
+    if isinstance(result, dict):
+        result.pop("image_s3_uri", None)
+    return result
 
 
 def _handle_get_result(result_id):
@@ -335,7 +382,7 @@ def _handle_predict(event, request_id):
             Accept="application/json",
             Body=json.dumps(endpoint_request),
             # Recorded in data capture as eventMetadata.inferenceId, which the
-            # fairness job joins with clinician-confirmed outcomes.
+            # fairness job joins with the confirmed labels you upload.
             InferenceId=request_id,
         )
     except ClientError as exc:
@@ -380,17 +427,20 @@ def _handle_predict(event, request_id):
             502, {"error": "Unexpected response from the model", "request_id": request_id}
         )
 
-    prediction = "malignant" if score >= threshold else "benign"
-    # P(predicted class): the malignant probability for a malignant call, its
-    # complement for a benign one.
-    confidence = score if prediction == "malignant" else 1.0 - score
+    negative, positive = class_names(result)
+    is_positive = score >= threshold
+    prediction = positive if is_positive else negative
+    # P(predicted class): the positive-class probability for a positive call,
+    # its complement for a negative one.
+    confidence = score if is_positive else 1.0 - score
     is_low_confidence = confidence < confidence_cutoff()
 
     formatted_result = {
         "request_id": request_id,
         "prediction": prediction,
         "confidence": confidence,
-        "probabilities": {"benign": 1.0 - score, "malignant": score},
+        "probabilities": {negative: 1.0 - score, positive: score},
+        "positive_class": positive,
         "threshold_used": threshold,
         "model_info": "Image analysis using ensemble model",
     }
@@ -405,6 +455,17 @@ def _handle_predict(event, request_id):
                 "status": "unavailable",
                 "reason": "the deployed model package does not return explanations",
             }
+        # Flag a heatmap that sits on the image border (outer band, default
+        # 10 percent of each side) instead of the subject.
+        border_share = border_attention(
+            formatted_result["explanations"].get("gradcam"),
+            float(os.environ.get("GRADCAM_BORDER_BAND", "0.1")),
+        )
+        if border_share is not None:
+            formatted_result["attention_on_border"] = border_share > float(
+                os.environ.get("GRADCAM_BORDER_THRESHOLD", "0.5")
+            )
+            formatted_result["border_attention_fraction"] = round(border_share, 4)
 
     hybrid_enabled = os.environ.get("ENABLE_BEDROCK_HYBRID", "false").lower() == "true"
     if hybrid_enabled and is_low_confidence:
@@ -438,9 +499,7 @@ def _handle_predict(event, request_id):
             {"MetricName": "PredictionConfidence", "Value": confidence, "Unit": "None"},
             {"MetricName": "TotalPredictions", "Value": 1, "Unit": "Count"},
             {
-                "MetricName": "BenignPredictions"
-                if prediction == "benign"
-                else "MalignantPredictions",
+                "MetricName": "PositivePredictions" if is_positive else "NegativePredictions",
                 "Value": 1,
                 "Unit": "Count",
             },
@@ -480,7 +539,9 @@ def lambda_handler(event, context):
             return _handle_get_result(path_params.get("id"))
         return _handle_predict(event, request_id)
     except Exception as exc:
-        # Log the class only: exception text can carry ARNs or input fragments.
+        # Top-level boundary of the function: return a generic 500 instead of
+        # the Lambda error payload. Log the class only: exception text can
+        # carry ARNs or input fragments.
         logger.error("Inference error (request_id=%s): %s", request_id, type(exc).__name__)
         _emit_error_metric("unhandled")
         return _response(500, {"error": "Internal server error", "request_id": request_id})

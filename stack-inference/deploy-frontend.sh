@@ -4,9 +4,9 @@
 
 # Refresh the static frontend after `terraform apply` in stack-inference.
 #
-# Terraform renders static-frontend/index.html.tpl (API URL and API key) and
-# uploads it to the frontend bucket, so this script only invalidates the
-# CloudFront cache and prints the URLs. It never runs `terraform apply`.
+# Terraform renders static-frontend/index.html.tpl and app.js.tpl (API URL and
+# API key) and uploads them with app.css to the frontend bucket, so this script
+# only invalidates the CloudFront cache and prints the URLs. It never runs `terraform apply`.
 #
 # Usage: ./deploy-frontend.sh [aws-profile]
 set -euo pipefail
@@ -31,7 +31,7 @@ DISTRIBUTION_ID=$(terraform output -raw frontend_cloudfront_distribution_id)
 
 echo "Invalidating CloudFront distribution ${DISTRIBUTION_ID}..."
 aws cloudfront create-invalidation "${PROFILE_ARGS[@]}" \
-    --distribution-id "$DISTRIBUTION_ID" --paths "/index.html" >/dev/null
+    --distribution-id "$DISTRIBUTION_ID" --paths "/index.html" "/app.js" "/app.css" >/dev/null
 
 echo ""
 echo "Frontend URL: ${FRONTEND_URL}"

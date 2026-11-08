@@ -2,11 +2,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Build the weighted ensemble, tune its threshold and score the clinical gate.
+"""Build the weighted ensemble, tune its threshold and score the quality gate.
 
 - Weights come from each model's VALIDATION accuracy (evaluation step output).
 - The ensemble decision threshold is tuned on the VALIDATION split.
-- The clinical gate (ensemble_results.json, read by the pipeline Condition
+- The quality gate (ensemble_results.json, read by the pipeline Condition
   step) is scored on the TEST split at that threshold.
 - predictions.json carries the ensemble's test scores, labels, the threshold
   and the per-image sensitive attributes, so the fairness gate scores exactly
@@ -28,12 +28,12 @@ import numpy as np
 # The step's code directory holds mlops_common next to this file; a local
 # checkout has it one level up, in scripts/.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mlops_common.breakhis import magnification, patient_id
+from mlops_common.dataset_layout import describe_image, load_classes, read_manifest
 from mlops_common.datasets import list_labeled_images, predict_scores
 from mlops_common.gates import (
-    CLINICAL_QUALITY_THRESHOLDS,
+    QUALITY_THRESHOLDS,
     binary_metrics,
-    clinical_gate,
+    quality_gate,
     select_threshold,
 )
 from mlops_common.preprocess import MODEL_INPUT_SIZE
@@ -82,7 +82,7 @@ def load_and_export_models(models_path, output_path, model_names):
             export_with_explanations(model, saved_dir)
             loaded[model_name] = model
             logger.info("Loaded and exported %s", sanitize_for_log(model_name))
-        except Exception as e:
+        except (OSError, ValueError, RuntimeError, tf.errors.OpError) as e:
             logger.warning(
                 "Failed to process %s: %s", sanitize_for_log(model_name), sanitize_for_log(e)
             )
@@ -108,7 +108,7 @@ def calculate_weights(model_names, evaluation_results):
 
 
 def ensemble_scores(models, weights, paths):
-    """Weighted average of the member models' malignant probabilities."""
+    """Weighted average of the member models' positive-class probabilities."""
     total = np.zeros(len(paths), dtype=float)
     for name, model in models.items():
 
@@ -119,20 +119,22 @@ def ensemble_scores(models, weights, paths):
     return total
 
 
-def create_ensemble_package(output_path, weights, threshold):
+def create_ensemble_package(output_path, weights, threshold, class_names):
     config = {
         "models": list(weights),
         "weights": [weights[name] for name in weights],
         "ensemble_method": "weighted_average",
         "optimal_threshold": threshold,
         "threshold_selected_on": "validation",
+        "class_names": list(class_names),
     }
     with open(safe_path_join(output_path, "ensemble_config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
     # The TensorFlow Serving container runs code/inference.py in front of the
     # SavedModels. No code/requirements.txt: the container would pip install
-    # it at startup, and the handler needs only the standard library.
+    # it at startup, and the handler needs only the standard library, requests
+    # and numpy, which the serving image ships.
     inference_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inference.py")
     code_dir = safe_path_join(output_path, "code")
     os.makedirs(code_dir, exist_ok=True)
@@ -156,6 +158,9 @@ def create_ensemble_package(output_path, weights, threshold):
 def write_predictions(output_path, test_items, test_root, scores, threshold):
     """predictions.json for the fairness gate: the deployed ensemble on test."""
     filenames = [os.path.relpath(p, test_root) for p, _ in test_items]
+    manifest = read_manifest(test_root)
+    described = [describe_image(f, manifest) for f in filenames]
+    attribute_names = sorted({name for d in described for name in d["attributes"]})
     payload = {
         "split": "test",
         "model": "ensemble",
@@ -163,13 +168,13 @@ def write_predictions(output_path, test_items, test_root, scores, threshold):
         "scores": [float(s) for s in scores],
         "labels": [int(label) for _, label in test_items],
         "filenames": filenames,
-        # BreakHis carries no demographic metadata. Magnification is the
-        # available subgroup proxy; add a real attribute per image here (same
-        # order as filenames) for clinical use.
+        # One value per image (same order as filenames) for every attribute
+        # the file names or the manifest carry; the fairness gate groups by one.
         "sensitive_features": {
-            "magnification": [magnification(f) or "unknown" for f in filenames],
+            name: [d["attributes"].get(name) or "unknown" for d in described]
+            for name in attribute_names
         },
-        "patient_ids": [patient_id(f) for f in filenames],
+        "group_ids": [d["group"] for d in described],
     }
     with open(safe_path_join(output_path, "predictions.json"), "w") as f:
         json.dump(payload, f)
@@ -213,15 +218,15 @@ def create_ensemble(models_path, evaluation_path, data_path, validation_dir, out
     threshold, selection = select_threshold(
         [label for _, label in val_items],
         val_scores,
-        min_recall=CLINICAL_QUALITY_THRESHOLDS["recall"],
+        min_recall=QUALITY_THRESHOLDS["recall"],
     )
     logger.info("Decision threshold %.2f tuned on %d validation images", threshold, len(val_items))
 
     test_scores = ensemble_scores(models, weights, [p for p, _ in test_items])
     test_metrics = binary_metrics([label for _, label in test_items], test_scores, threshold)
-    gate = clinical_gate(test_metrics)
+    gate = quality_gate(test_metrics)
 
-    create_ensemble_package(output_path, weights, threshold)
+    create_ensemble_package(output_path, weights, threshold, load_classes(data_path))
     write_predictions(output_path, test_items, data_path, test_scores, threshold)
 
     results = {
@@ -239,12 +244,12 @@ def create_ensemble(models_path, evaluation_path, data_path, validation_dir, out
         "weights": weights,
         "model_count": len(weights),
         "excluded_models": len(model_names) - len(weights),
-        "clinical_quality_gate": gate,
+        "quality_gate": gate,
     }
     with open(safe_path_join(output_path, "ensemble_results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    logger.info("Clinical quality gate on test: %s", "PASSED" if gate["passed"] else "FAILED")
+    logger.info("Quality gate on test: %s", "PASSED" if gate["passed"] else "FAILED")
     for metric, detail in gate["results"].items():
         if not detail["passed"]:
             logger.warning(
@@ -316,5 +321,6 @@ if __name__ == "__main__":
         ):
             sys.exit(1)
     except Exception as e:
+        # Top-level boundary of the step: log the failure and exit non-zero.
         logger.error("Ensemble creation failed: %s", sanitize_for_log(e))
         sys.exit(1)

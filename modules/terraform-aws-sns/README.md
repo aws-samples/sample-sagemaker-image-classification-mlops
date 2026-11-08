@@ -1,10 +1,10 @@
 # sns-alerts
 
-SNS topic with email subscription, CloudWatch metric alarms, and optional composite alarm.
+Amazon SNS topic with email subscription, Amazon CloudWatch metric alarms, and optional composite alarm.
 
 ## What It Does
 
-1. Creates an SNS topic for alert notifications
+1. Creates an SNS topic for alert notifications, encrypted with `kms_master_key_id` (the AWS managed `alias/aws/sns` key when unset). CloudWatch alarms can publish only to a topic whose customer managed AWS KMS key allows them, so `stack-inference` passes the project key
 2. Optionally creates an email subscription on the topic
 3. Creates CloudWatch metric alarms from a configurable map, all wired to the SNS topic
 4. Optionally creates a composite alarm that aggregates multiple alarms with a custom alarm rule

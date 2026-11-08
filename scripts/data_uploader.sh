@@ -12,9 +12,16 @@ NC='\033[0m'
 
 # --- Arg parsing ----------------------------------------------------------
 DATA_FOLDER="../data"
+PREFIX="images"
 IMAGE_COUNT="all"
 APPEND_MODE=0
 SKIP_DVC=0
+
+usage() {
+    echo "Usage: $0 [data-folder] [--prefix images] [--append] [--count N] [--no-dvc]"
+    echo "  data-folder holds one folder per class (<data-folder>/<class>/<image>) and an"
+    echo "  optional manifest.csv; everything goes to s3://<raw-data-bucket>/<prefix>/."
+}
 
 # First positional argument (if it doesn't start with --) is the data folder
 if [ -n "${1:-}" ] && [[ "$1" != --* ]]; then
@@ -25,6 +32,10 @@ fi
 # Remaining args are flags
 while [ $# -gt 0 ]; do
     case "$1" in
+        --prefix)
+            PREFIX="${2%/}"
+            shift 2
+            ;;
         --append)
             APPEND_MODE=1
             shift
@@ -39,13 +50,13 @@ while [ $# -gt 0 ]; do
             ;;
         *)
             echo -e "${RED}Unknown argument: $1${NC}"
-            echo "Usage: $0 [data-folder] [--append] [--count N] [--no-dvc]"
+            usage
             exit 1
             ;;
     esac
 done
 
-echo -e "${GREEN}Medical Image Classification Dataset Upload${NC}"
+echo -e "${GREEN}Image classification dataset upload${NC}"
 echo -e "${BLUE}Data folder: ${DATA_FOLDER}${NC}"
 if [ "$IMAGE_COUNT" = "all" ]; then
     echo -e "${BLUE}Uploading all images${NC}"
@@ -55,7 +66,7 @@ fi
 if [ "$APPEND_MODE" -eq 1 ]; then
     echo -e "${YELLOW}Append mode: existing data will be preserved${NC}"
 else
-    echo -e "${YELLOW}Replace mode: existing medical_image_data/ prefix will be overwritten${NC}"
+    echo -e "${YELLOW}Replace mode: the existing ${PREFIX}/ prefix will be overwritten${NC}"
 fi
 
 # --- Get bucket name ------------------------------------------------------
@@ -75,9 +86,14 @@ if [ ! -d "$DATA_FOLDER" ]; then
     exit 1
 fi
 
-if [ ! -d "$DATA_FOLDER/breast_benign" ] || [ ! -d "$DATA_FOLDER/breast_malignant" ]; then
-    echo -e "${RED}Error: Expected data structure not found in '$DATA_FOLDER'${NC}"
-    echo -e "${YELLOW}Expected: $DATA_FOLDER/breast_benign/ and $DATA_FOLDER/breast_malignant/${NC}"
+CLASSES=()
+while IFS= read -r dir; do
+    CLASSES+=("$(basename "$dir")")
+done < <(find "$DATA_FOLDER" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | sort)
+
+if [ "${#CLASSES[@]}" -ne 2 ]; then
+    echo -e "${RED}Error: expected exactly 2 class folders in '$DATA_FOLDER', found ${#CLASSES[@]}${NC}"
+    usage
     exit 1
 fi
 
@@ -85,37 +101,34 @@ fi
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT   # always cleanup, even on error
 
-mkdir -p "$TEMP_DIR/medical_image_data/breast_benign"
-mkdir -p "$TEMP_DIR/medical_image_data/breast_malignant"
-
 copy_images() {
     local src_dir="$1"
     local dst_dir="$2"
     local limit="$3"
 
-    local find_cmd=(find "$src_dir" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.bmp" \))
+    local find_cmd=(find "$src_dir" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \))
 
     if [ "$limit" = "all" ]; then
         "${find_cmd[@]}" | while read -r file; do
             cp "$file" "$dst_dir/"
         done
     else
-        "${find_cmd[@]}" | head -"$limit" | while read -r file; do
+        "${find_cmd[@]}" | sort | head -"$limit" | while read -r file; do
             cp "$file" "$dst_dir/"
         done
     fi
 }
 
 echo -e "${BLUE}Staging images...${NC}"
-copy_images "$DATA_FOLDER/breast_benign" "$TEMP_DIR/medical_image_data/breast_benign" "$IMAGE_COUNT"
-copy_images "$DATA_FOLDER/breast_malignant" "$TEMP_DIR/medical_image_data/breast_malignant" "$IMAGE_COUNT"
-
-BENIGN_COUNT=$(find "$TEMP_DIR/medical_image_data/breast_benign" -type f | wc -l | tr -d ' ')
-MALIGNANT_COUNT=$(find "$TEMP_DIR/medical_image_data/breast_malignant" -type f | wc -l | tr -d ' ')
-
-echo -e "${GREEN}Staged:${NC}"
-echo -e "   breast_benign: ${BENIGN_COUNT} images"
-echo -e "   breast_malignant: ${MALIGNANT_COUNT} images"
+for class in "${CLASSES[@]}"; do
+    mkdir -p "$TEMP_DIR/$PREFIX/$class"
+    copy_images "$DATA_FOLDER/$class" "$TEMP_DIR/$PREFIX/$class" "$IMAGE_COUNT"
+    echo -e "   ${class}: $(find "$TEMP_DIR/$PREFIX/$class" -type f | wc -l | tr -d ' ') images"
+done
+if [ -f "$DATA_FOLDER/manifest.csv" ]; then
+    cp "$DATA_FOLDER/manifest.csv" "$TEMP_DIR/$PREFIX/manifest.csv"
+    echo -e "   manifest.csv included"
+fi
 
 # --- Upload ---------------------------------------------------------------
 BATCH_ID=$(date +%Y%m%d-%H%M%S)
@@ -124,10 +137,10 @@ if [ "$APPEND_MODE" -eq 1 ]; then
     echo -e "${BLUE}Appending to existing S3 data (no delete)...${NC}"
     # sync WITHOUT --delete: keeps existing objects, adds/overwrites only the
     # staged ones. Matches README "append to existing dataset" semantics.
-    aws s3 sync "$TEMP_DIR/medical_image_data" "s3://$RAW_DATA_BUCKET/medical_image_data"
+    aws s3 sync "$TEMP_DIR/$PREFIX" "s3://$RAW_DATA_BUCKET/$PREFIX"
 else
     echo -e "${BLUE}Replacing S3 data (--delete)...${NC}"
-    aws s3 sync "$TEMP_DIR/medical_image_data" "s3://$RAW_DATA_BUCKET/medical_image_data" --delete
+    aws s3 sync "$TEMP_DIR/$PREFIX" "s3://$RAW_DATA_BUCKET/$PREFIX" --delete
 fi
 
 # --- DVC snapshot (optional) ---------------------------------------------
@@ -163,7 +176,7 @@ if [ "$SKIP_DVC" -eq 0 ] && command -v dvc >/dev/null 2>&1 && [ -d ".dvc" ]; the
 elif [ "$SKIP_DVC" -eq 0 ]; then
     echo -e "${YELLOW} DVC not installed or not initialized - skipping dataset snapshot${NC}"
     echo -e "${YELLOW}   Install DVC for git-linked dataset versioning:${NC}"
-    echo -e "${YELLOW}     pip install 'dvc[s3]' && dvc init && dvc remote add -d storage s3://\$RAW_DATA_BUCKET/dvc-cache${NC}"
+    echo -e "${YELLOW}     pip install 'dvc[s3]==3.67.1' && dvc init && dvc remote add -d storage s3://\$RAW_DATA_BUCKET/dvc-cache${NC}"
 fi
 
 # Completion marker triggers the EventBridge -> SageMaker pipeline rule.
@@ -178,11 +191,11 @@ append_mode: $APPEND_MODE
 dvc_tracked: $([ -f "$(git rev-parse --show-toplevel 2>/dev/null)/data.dvc" ] && echo "true" || echo "false")
 EOF
 )
-echo "$MARKER_CONTENT" | aws s3 cp - "s3://$RAW_DATA_BUCKET/medical_image_data/.batch_complete"
+echo "$MARKER_CONTENT" | aws s3 cp - "s3://$RAW_DATA_BUCKET/$PREFIX/.batch_complete"
 
 echo -e "${GREEN}Upload complete${NC}"
 
 echo -e "${BLUE}Final S3 contents:${NC}"
-aws s3 ls "s3://$RAW_DATA_BUCKET/medical_image_data/" --recursive --human-readable --summarize | tail -20
+aws s3 ls "s3://$RAW_DATA_BUCKET/$PREFIX/" --recursive --human-readable --summarize | tail -20
 
 echo -e "${GREEN}Pipeline will start automatically via EventBridge!${NC}"

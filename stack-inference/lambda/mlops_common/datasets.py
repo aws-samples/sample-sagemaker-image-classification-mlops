@@ -11,23 +11,20 @@ from collections.abc import Callable, Sequence
 import numpy as np
 from PIL import Image
 
-from .constants import CLASS_DIRS, IMAGE_EXTENSIONS
+from .dataset_layout import list_images, load_classes
 from .preprocess import MODEL_INPUT_SIZE, to_model_input
 
 
 def list_labeled_images(split_dir: str) -> list[tuple[str, int]]:
-    """(path, label) for every image, ordered by class then filename.
+    """(path, label) for every image, ordered by label then filename.
 
-    Same order and labels as Keras flow_from_directory(shuffle=False).
+    Same order and labels as Keras flow_from_directory(shuffle=False) with
+    ``classes`` set to the split's class names.
     """
     items: list[tuple[str, int]] = []
-    for label, class_dir in enumerate(CLASS_DIRS):
+    for label, class_dir in enumerate(load_classes(split_dir)):
         folder = os.path.join(split_dir, class_dir)
-        if not os.path.isdir(folder):
-            continue
-        for name in sorted(os.listdir(folder)):
-            if name.lower().endswith(IMAGE_EXTENSIONS):
-                items.append((os.path.join(folder, name), label))
+        items.extend((os.path.join(folder, name), label) for name in list_images(folder))
     return items
 
 
@@ -46,7 +43,7 @@ def predict_scores(
     input_size: int = MODEL_INPUT_SIZE,
     batch_size: int = 32,
 ) -> np.ndarray:
-    """Malignant probability per image, predicted in batches to bound memory."""
+    """Positive-class probability per image, predicted in batches to bound memory."""
     scores = []
     for start in range(0, len(paths), batch_size):
         batch = load_batch(paths[start : start + batch_size], input_size)

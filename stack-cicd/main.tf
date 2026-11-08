@@ -6,6 +6,8 @@ module "s3_codepipeline_artifacts" {
 
   bucket_name       = "${var.project_name}-codepipeline-artifacts"
   enable_versioning = true
+  force_destroy     = var.force_destroy_buckets
+  kms_key_arn       = data.aws_kms_alias.state.target_key_arn
 
   tags = local.common_tags
 }
@@ -14,7 +16,6 @@ module "s3_codepipeline_artifacts" {
 # CodeStar Connection
 ################################################################################
 
-# CodeStar connection for GitHub
 resource "aws_codestarconnections_connection" "github" {
   name          = "${var.project_name}-github"
   provider_type = "GitHub"
@@ -34,6 +35,8 @@ module "codebuild_baseline_model" {
   compute_type       = "BUILD_GENERAL1_SMALL"
   buildspec_path     = "stack-cicd/codebuild/baseline-model-buildspec.yml"
   encryption_key_arn = data.aws_kms_alias.state.target_key_arn
+  log_kms_key_arn    = data.aws_kms_alias.state.target_key_arn
+  log_retention_days = var.log_retention_days
 
   environment_variables = concat(local.terraform_environment, [
     { name = "MODEL_PACKAGE_GROUP_NAME", value = local.model_package_group_name },
@@ -54,6 +57,8 @@ module "codebuild_training_deploy" {
   service_role_arn      = module.codebuild_role.role_arn
   buildspec_path        = "stack-cicd/codebuild/training-deploy-buildspec.yml"
   encryption_key_arn    = data.aws_kms_alias.state.target_key_arn
+  log_kms_key_arn       = data.aws_kms_alias.state.target_key_arn
+  log_retention_days    = var.log_retention_days
   environment_variables = local.terraform_environment
   tags                  = local.common_tags
 }
@@ -65,6 +70,8 @@ module "codebuild_script_upload" {
   service_role_arn      = module.codebuild_role.role_arn
   buildspec_path        = "stack-cicd/codebuild/script-upload-buildspec.yml"
   encryption_key_arn    = data.aws_kms_alias.state.target_key_arn
+  log_kms_key_arn       = data.aws_kms_alias.state.target_key_arn
+  log_retention_days    = var.log_retention_days
   environment_variables = local.terraform_environment
   tags                  = local.common_tags
 }
@@ -76,6 +83,8 @@ module "codebuild_inference_deploy" {
   service_role_arn   = module.codebuild_role.role_arn
   buildspec_path     = "stack-cicd/codebuild/inference-deploy-buildspec.yml"
   encryption_key_arn = data.aws_kms_alias.state.target_key_arn
+  log_kms_key_arn    = data.aws_kms_alias.state.target_key_arn
+  log_retention_days = var.log_retention_days
   # The buildspec resolves TF_VAR_model_package_arn from this group.
   environment_variables = concat(local.terraform_environment, [
     { name = "MODEL_PACKAGE_GROUP_NAME", value = local.model_package_group_name },
@@ -87,7 +96,6 @@ module "codebuild_inference_deploy" {
 # CodePipeline
 ################################################################################
 
-# CodePipeline
 resource "aws_codepipeline" "pipeline" {
   name     = "${var.project_name}-pipeline"
   role_arn = module.codepipeline_role.role_arn
@@ -182,8 +190,7 @@ resource "aws_codepipeline" "pipeline" {
     # Optional manual approval before touching production inference.
     # Gated on var.require_manual_approval so dev/test pipelines can still
     # fully auto-deploy. When enabled, pipeline execution pauses here until
-    # a human approves in the console (or via API) - critical for medical
-    # ML deployments where a bad model can cause real harm.
+    # a human approves in the console (or via API).
     dynamic "action" {
       for_each = var.require_manual_approval ? [1] : []
       content {
@@ -225,12 +232,8 @@ resource "aws_sns_topic" "pipeline_approvals" {
   count = var.require_manual_approval ? 1 : 0
 
   name = "${var.project_name}-pipeline-approvals"
-  # Server-side encryption using the AWS-managed SNS key. Good enough for
-  # approval notifications (no sensitive data in the payload) and doesn't
-  # require a custom KMS grant from CodePipeline to publish.
-  # KICS: approval notifications carry no sensitive data; the AWS-managed key avoids a CodePipeline KMS grant
-  # kics-scan ignore-line
-  kms_master_key_id = "alias/aws/sns"
+  # CodePipeline publishes with its service role, whose policy grants the key.
+  kms_master_key_id = data.aws_kms_alias.state.target_key_arn
   tags              = local.common_tags
 }
 
@@ -246,11 +249,11 @@ resource "aws_sns_topic_subscription" "pipeline_approvals_email" {
 # IAM
 ################################################################################
 
-# IAM roles using module
 module "codepipeline_role" {
   source = "../modules/terraform-aws-iam"
 
-  role_name = "${var.project_name}-codepipeline-role"
+  role_name   = "${var.project_name}-codepipeline-role"
+  description = "Service role for the ${var.project_name} CodePipeline release pipeline"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -259,6 +262,10 @@ module "codepipeline_role" {
         Effect = "Allow"
         Principal = {
           Service = "codepipeline.amazonaws.com"
+        }
+        Condition = {
+          StringEquals = { "aws:SourceAccount" = local.account_id }
+          ArnLike      = { "aws:SourceArn" = "arn:aws:codepipeline:${var.aws_region}:${local.account_id}:${var.project_name}-pipeline" }
         }
       }
     ]
@@ -301,13 +308,20 @@ module "codepipeline_role" {
             module.codebuild_inference_deploy.project_arn
           ]
         },
-        # Publish approval notifications to the SNS topic used by the
-        # manual approval gate. Scoped by wildcard so the policy works
-        # regardless of whether the topic exists yet (first-apply order).
         {
           Effect   = "Allow"
           Action   = ["sns:Publish"]
-          Resource = "arn:aws:sns:*:*:${var.project_name}-pipeline-approvals"
+          Resource = "arn:aws:sns:${var.aws_region}:${local.account_id}:${var.project_name}-pipeline-approvals"
+        },
+        {
+          # The artifact store and the approvals topic use the state CMK.
+          Effect = "Allow"
+          Action = [
+            "kms:Decrypt",
+            "kms:GenerateDataKey*",
+            "kms:DescribeKey",
+          ]
+          Resource = data.aws_kms_alias.state.target_key_arn
         }
       ]
     })
@@ -319,7 +333,8 @@ module "codepipeline_role" {
 module "codebuild_role" {
   source = "../modules/terraform-aws-iam"
 
-  role_name = "${var.project_name}-codebuild-role"
+  role_name   = "${var.project_name}-codebuild-role"
+  description = "Service role for the ${var.project_name} CodeBuild projects that run terraform apply for the training and inference stacks"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -328,6 +343,10 @@ module "codebuild_role" {
         Effect = "Allow"
         Principal = {
           Service = "codebuild.amazonaws.com"
+        }
+        Condition = {
+          StringEquals = { "aws:SourceAccount" = local.account_id }
+          ArnLike      = { "aws:SourceArn" = "arn:aws:codebuild:${var.aws_region}:${local.account_id}:project/${var.project_name}-*" }
         }
       }
     ]
@@ -372,19 +391,23 @@ locals {
           "logs:DescribeMetricFilters",
         ]
         Resource = [
-          "arn:aws:logs:*:*:log-group:/aws/codebuild/${var.project_name}-*",
-          "arn:aws:logs:*:*:log-group:/aws/codebuild/${var.project_name}-*:*",
-          "arn:aws:logs:*:*:log-group:/aws/lambda/${var.project_name}-*",
-          "arn:aws:logs:*:*:log-group:/aws/lambda/${var.project_name}-*:*",
-          "arn:aws:logs:*:*:log-group:/aws/sagemaker/*",
-          "arn:aws:logs:*:*:log-group:/aws/sagemaker/*:*",
-          "arn:aws:logs:*:*:log-group:/aws/apigateway/${var.project_name}-*",
-          "arn:aws:logs:*:*:log-group:/aws/apigateway/${var.project_name}-*:*",
-          "arn:aws:logs:*:*:log-group:/aws/cloudtrail/${var.project_name}",
-          "arn:aws:logs:*:*:log-group:/aws/cloudtrail/${var.project_name}:*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/codebuild/${var.project_name}-*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/codebuild/${var.project_name}-*:*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/lambda/${var.project_name}-*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/lambda/${var.project_name}-*:*",
+          # The two SageMaker job log groups stack-training manages when
+          # enable_training_monitoring is on.
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/sagemaker/ProcessingJobs",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/sagemaker/ProcessingJobs:*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/sagemaker/TrainingJobs",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/sagemaker/TrainingJobs:*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/apigateway/${var.project_name}-*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/apigateway/${var.project_name}-*:*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/cloudtrail/${var.project_name}",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/cloudtrail/${var.project_name}:*",
           # WAF requires the aws-waf-logs- prefix on its log group.
-          "arn:aws:logs:*:*:log-group:aws-waf-logs-${var.project_name}-*",
-          "arn:aws:logs:*:*:log-group:aws-waf-logs-${var.project_name}-*:*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:aws-waf-logs-${var.project_name}-*",
+          "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:aws-waf-logs-${var.project_name}-*:*",
         ]
       },
       {
@@ -407,7 +430,6 @@ locals {
     s3 = [
       {
         Effect = "Allow"
-        # ListBucket and related bucket-level ops support ARN-level scoping
         Action = [
           "s3:ListBucket",
           "s3:GetBucketLocation",
@@ -442,12 +464,10 @@ locals {
         ]
         Resource = [
           "arn:aws:s3:::${var.project_name}-*",
-          "arn:aws:s3:::${var.state_bucket_name}",
         ]
       },
       {
         Effect = "Allow"
-        # Object-level ops scoped to the project buckets
         Action = [
           "s3:GetObject",
           "s3:GetObjectVersion",
@@ -463,8 +483,94 @@ locals {
         ]
         Resource = [
           "arn:aws:s3:::${var.project_name}-*/*",
-          "arn:aws:s3:::${var.state_bucket_name}/*",
         ]
+      },
+      {
+        # Bucket names are global, so the project prefix must not reach a
+        # bucket of the same name in another account.
+        Effect = "Deny"
+        Action = ["s3:*"]
+        Resource = [
+          "arn:aws:s3:::${var.project_name}-*",
+          "arn:aws:s3:::${var.project_name}-*/*",
+        ]
+        Condition = {
+          StringNotEqualsIfExists = { "s3:ResourceAccount" = local.account_id }
+        }
+      },
+      {
+        # The Terraform state of the training and inference stacks, in the
+        # bucket stack-backend-setup owns: what the S3 backend needs (list,
+        # read and write the state, delete the use_lockfile lock files).
+        Sid      = "TerraformStateBucket"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = "arn:aws:s3:::${var.state_bucket_name}"
+      },
+      {
+        Sid    = "TerraformStateObjects"
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject"]
+        Resource = [
+          "arn:aws:s3:::${var.state_bucket_name}/training/*",
+          "arn:aws:s3:::${var.state_bucket_name}/inference/*",
+        ]
+      },
+      {
+        Sid    = "TerraformStateLocks"
+        Effect = "Allow"
+        Action = ["s3:DeleteObject"]
+        Resource = [
+          "arn:aws:s3:::${var.state_bucket_name}/training/*.tflock",
+          "arn:aws:s3:::${var.state_bucket_name}/inference/*.tflock",
+        ]
+      },
+      {
+        # The default state bucket name also matches <project_name>-*, so the
+        # statements above could otherwise administer it, purge state
+        # history or rewrite this stack's own state.
+        Sid    = "DenyStateBucketAdministration"
+        Effect = "Deny"
+        Action = [
+          "s3:CreateBucket",
+          "s3:DeleteBucket",
+          "s3:DeleteBucketPolicy",
+          "s3:PutBucketCORS",
+          "s3:PutBucketLogging",
+          "s3:PutBucketNotification",
+          "s3:PutBucketOwnershipControls",
+          "s3:PutBucketPolicy",
+          "s3:PutBucketPublicAccessBlock",
+          "s3:PutBucketTagging",
+          "s3:PutBucketVersioning",
+          "s3:PutEncryptionConfiguration",
+          "s3:PutLifecycleConfiguration",
+        ]
+        Resource = "arn:aws:s3:::${var.state_bucket_name}"
+      },
+      {
+        Sid    = "DenyStateHistoryChanges"
+        Effect = "Deny"
+        Action = [
+          "s3:DeleteObjectVersion",
+          "s3:PutObjectAcl",
+        ]
+        Resource = "arn:aws:s3:::${var.state_bucket_name}/*"
+      },
+      {
+        Sid    = "DenyStateFileDeletes"
+        Effect = "Deny"
+        Action = ["s3:DeleteObject"]
+        Resource = [
+          "arn:aws:s3:::${var.state_bucket_name}/*.tfstate",
+          "arn:aws:s3:::${var.state_bucket_name}/cicd/*",
+        ]
+      },
+      {
+        Sid      = "DenyCicdStateWrites"
+        Effect   = "Deny"
+        Action   = ["s3:PutObject"]
+        Resource = "arn:aws:s3:::${var.state_bucket_name}/cicd/*"
       },
       {
         Effect = "Allow"
@@ -500,8 +606,6 @@ locals {
           "sagemaker:CreateModelPackageGroup",
           "sagemaker:DeleteModelPackageGroup",
           "sagemaker:DescribeModelPackageGroup",
-          "sagemaker:CreateModelPackage",
-          "sagemaker:UpdateModelPackage",
           "sagemaker:DescribeModelPackage",
           "sagemaker:CreateMlflowTrackingServer",
           "sagemaker:UpdateMlflowTrackingServer",
@@ -520,6 +624,19 @@ locals {
           "arn:aws:sagemaker:*:*:model-package/${var.project_name}-*/*",
           "arn:aws:sagemaker:*:*:mlflow-tracking-server/${var.project_name}-*",
         ]
+      },
+      {
+        # The baseline build registers its placeholder only as
+        # PendingManualApproval; a person approves it.
+        Effect = "Allow"
+        Action = ["sagemaker:CreateModelPackage"]
+        Resource = [
+          "arn:aws:sagemaker:${var.aws_region}:${local.account_id}:model-package-group/${var.project_name}-*",
+          "arn:aws:sagemaker:${var.aws_region}:${local.account_id}:model-package/${var.project_name}-*/*",
+        ]
+        Condition = {
+          StringEquals = { "sagemaker:ModelApprovalStatus" = "PendingManualApproval" }
+        }
       },
       {
         Effect = "Allow"
@@ -694,6 +811,7 @@ locals {
               # the schedule's target assumes (the drift and fairness
               # Processing job schedulers).
               "scheduler.amazonaws.com",
+              "vpc-flow-logs.amazonaws.com",
             ]
           }
         }
@@ -735,13 +853,18 @@ locals {
         ]
       },
       {
-        Sid      = "DenyAttachingCiPolicies"
+        # Neither the CI/CD policies nor the boundary may be attached as a
+        # role's permissions policy.
+        Sid      = "DenyAttachingCiPoliciesAndBoundary"
         Effect   = "Deny"
         Action   = ["iam:AttachRolePolicy"]
         Resource = "*"
         Condition = {
           ArnLike = {
-            "iam:PolicyARN" = "arn:aws:iam::${local.account_id}:policy/${var.project_name}-ci-*"
+            "iam:PolicyARN" = [
+              "arn:aws:iam::${local.account_id}:policy/${var.project_name}-ci-*",
+              data.aws_iam_policy.workload_boundary.arn,
+            ]
           }
         }
       },
@@ -756,7 +879,7 @@ locals {
       {
         Sid    = "AccountReads"
         Effect = "Allow"
-        # Terraform reads the caller identity on every run.
+        # Account-level reads; they support only "*".
         Action = [
           "iam:GetAccountSummary",
           "iam:ListAccountAliases",
@@ -766,17 +889,56 @@ locals {
     ]
 
     # --- KMS: project keys ---------------------------------------------------
+    # Project keys are found by their Project tag (provider default_tags):
+    # key IDs are not known when the policy is written. Tagging is limited so
+    # the role cannot bring another key under these statements: it may tag a
+    # key only while the key has no Project tag (a key it is creating) or
+    # already carries this project's, never set Project to another value, and
+    # use only the tag keys the stacks set.
     kms = [
       {
+        Sid    = "CreateProjectKeys"
+        Effect = "Allow"
+        # CreateKey has no resource type; the request must carry the tag.
+        Action   = ["kms:CreateKey"]
+        Resource = "*"
+        Condition = {
+          StringEquals                = { "aws:RequestTag/Project" = var.project_name }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = local.resource_tag_keys }
+        }
+      },
+      {
+        # The tags sent with CreateKey: KMS requires TagResource in an IAM
+        # policy that is not restricted to particular keys.
+        Sid      = "TagNewProjectKeys"
+        Effect   = "Allow"
+        Action   = ["kms:TagResource"]
+        Resource = "arn:aws:kms:${var.aws_region}:${local.account_id}:key/*"
+        Condition = {
+          Null                        = { "aws:ResourceTag/Project" = "true" }
+          StringEquals                = { "aws:RequestTag/Project" = var.project_name }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = local.resource_tag_keys }
+        }
+      },
+      {
+        Sid      = "RetagProjectKeys"
+        Effect   = "Allow"
+        Action   = ["kms:TagResource"]
+        Resource = "arn:aws:kms:${var.aws_region}:${local.account_id}:key/*"
+        Condition = {
+          StringEquals                = { "aws:ResourceTag/Project" = var.project_name }
+          StringEqualsIfExists        = { "aws:RequestTag/Project" = var.project_name }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = local.resource_tag_keys }
+        }
+      },
+      {
+        Sid    = "ManageProjectKeys"
         Effect = "Allow"
         Action = [
-          "kms:CreateKey",
-          "kms:DescribeKey",
-          "kms:ListKeys",
-          "kms:ListAliases",
           "kms:CreateAlias",
           "kms:DeleteAlias",
           "kms:UpdateAlias",
+          "kms:DescribeKey",
           "kms:EnableKey",
           "kms:DisableKey",
           "kms:EnableKeyRotation",
@@ -786,7 +948,6 @@ locals {
           "kms:PutKeyPolicy",
           "kms:ScheduleKeyDeletion",
           "kms:CancelKeyDeletion",
-          "kms:TagResource",
           "kms:UntagResource",
           "kms:ListResourceTags",
           "kms:Encrypt",
@@ -794,15 +955,66 @@ locals {
           "kms:GenerateDataKey",
           "kms:ReEncryptFrom",
           "kms:ReEncryptTo",
+          "kms:CreateGrant",
         ]
-        # KMS key ARNs contain UUIDs we can't predict, but aliases are scoped.
-        # CreateKey requires * resource per AWS IAM docs. This is an
-        # intentional, narrow wildcard that other statements compensate for.
+        Resource = "arn:aws:kms:${var.aws_region}:${local.account_id}:key/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/Project" = var.project_name }
+        }
+      },
+      {
+        # The alias half of CreateAlias/DeleteAlias/UpdateAlias; aliases
+        # carry no tags.
+        Sid      = "ManageProjectAliases"
+        Effect   = "Allow"
+        Action   = ["kms:CreateAlias", "kms:DeleteAlias", "kms:UpdateAlias"]
+        Resource = "arn:aws:kms:${var.aws_region}:${local.account_id}:alias/${var.project_name}-*"
+      },
+      {
+        # The state key, by its ARN: the Terraform state, the artifact store,
+        # the CodeBuild output and logs and the approvals topic.
+        Sid    = "UseStateKey"
+        Effect = "Allow"
+        Action = [
+          "kms:DescribeKey",
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+        ]
+        Resource = data.aws_kms_alias.state.target_key_arn
+      },
+      {
+        # The state key also carries the Project tag (stack-backend-setup
+        # default_tags), so nothing above may change it or its alias.
+        Sid    = "DenyStateKeyAdministration"
+        Effect = "Deny"
+        Action = [
+          "kms:CreateAlias",
+          "kms:CreateGrant",
+          "kms:DeleteAlias",
+          "kms:DisableKey",
+          "kms:DisableKeyRotation",
+          "kms:PutKeyPolicy",
+          "kms:ScheduleKeyDeletion",
+          "kms:TagResource",
+          "kms:UntagResource",
+          "kms:UpdateAlias",
+        ]
         Resource = [
-          "arn:aws:kms:*:*:key/*",
-          "arn:aws:kms:*:*:${local.state_kms_key_alias}",
-          "arn:aws:kms:*:*:alias/${var.project_name}-*",
+          data.aws_kms_alias.state.target_key_arn,
+          data.aws_kms_alias.state.arn,
         ]
+      },
+      {
+        # ListKeys and ListAliases have no resource type and support only "*".
+        Sid    = "ListKeys"
+        Effect = "Allow"
+        Action = [
+          "kms:ListKeys",
+          "kms:ListAliases",
+        ]
+        Resource = "*"
       },
     ]
 
@@ -838,34 +1050,66 @@ locals {
     ]
 
     # --- API Gateway ---------------------------------------------------------
+    # REST API, key and usage plan IDs are generated, so writes are scoped by
+    # the Project tag: creation must send it, and changes need it on the
+    # resource. Stages, deployments, methods and the other children inherit
+    # their REST API's tags for this check, usage plan keys their usage
+    # plan's (API Gateway tagging guide).
     apigateway = [
+      {
+        Effect   = "Allow"
+        Action   = ["apigateway:GET"]
+        Resource = ["arn:aws:apigateway:${var.aws_region}::/*"]
+      },
+      {
+        Effect = "Allow"
+        Action = ["apigateway:POST"]
+        Resource = [
+          "arn:aws:apigateway:${var.aws_region}::/restapis",
+          "arn:aws:apigateway:${var.aws_region}::/apikeys",
+          "arn:aws:apigateway:${var.aws_region}::/usageplans",
+        ]
+        Condition = {
+          StringEquals                = { "aws:RequestTag/Project" = var.project_name }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = local.resource_tag_keys }
+        }
+      },
       {
         Effect = "Allow"
         Action = [
-          "apigateway:GET",
           "apigateway:POST",
           "apigateway:PUT",
           "apigateway:PATCH",
           "apigateway:DELETE",
-          "apigateway:TagResource",
-          "apigateway:UntagResource",
           # Associating the WAF web ACL with the stage.
           "apigateway:SetWebACL",
         ]
-        # APIGateway v1 REST APIs, API keys and usage plans are not scopable
-        # by name, only by auto-generated ID. We scope by resource path and
-        # rely on the project-name tag applied via provider default_tags.
-        # /account is the account-level CloudWatch role setting.
         Resource = [
-          "arn:aws:apigateway:*::/restapis",
-          "arn:aws:apigateway:*::/restapis/*",
-          "arn:aws:apigateway:*::/apikeys",
-          "arn:aws:apigateway:*::/apikeys/*",
-          "arn:aws:apigateway:*::/usageplans",
-          "arn:aws:apigateway:*::/usageplans/*",
-          "arn:aws:apigateway:*::/account",
-          "arn:aws:apigateway:*::/tags/*",
+          "arn:aws:apigateway:${var.aws_region}::/restapis/*",
+          "arn:aws:apigateway:${var.aws_region}::/apikeys/*",
+          "arn:aws:apigateway:${var.aws_region}::/usageplans/*",
         ]
+        Condition = {
+          StringEquals = { "aws:ResourceTag/Project" = var.project_name }
+        }
+      },
+      {
+        # Tag updates: the tags resource supports no aws:ResourceTag, so only
+        # this project's Project tag and the stacks' tag keys may be set.
+        Effect   = "Allow"
+        Action   = ["apigateway:PUT"]
+        Resource = ["arn:aws:apigateway:${var.aws_region}::/tags/*"]
+        Condition = {
+          StringEquals                = { "aws:RequestTag/Project" = var.project_name }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = local.resource_tag_keys }
+        }
+      },
+      {
+        # The account-wide API Gateway setting (its CloudWatch Logs role),
+        # which has no tags.
+        Effect   = "Allow"
+        Action   = ["apigateway:PATCH"]
+        Resource = ["arn:aws:apigateway:${var.aws_region}::/account"]
       },
     ]
 
@@ -918,19 +1162,35 @@ locals {
           "cloudwatch:ListTagsForResource",
         ]
         Resource = [
-          "arn:aws:cloudwatch:*:*:alarm:${var.project_name}-*",
+          "arn:aws:cloudwatch:${var.aws_region}:${local.account_id}:alarm:${var.project_name}-*",
         ]
       },
       {
+        # Dashboard ARNs have no Region.
         Effect = "Allow"
-        # PutDashboard, PutMetricData, and a handful of others do not
-        # support resource-level permissions per AWS IAM docs.
         Action = [
           "cloudwatch:PutDashboard",
           "cloudwatch:DeleteDashboards",
           "cloudwatch:GetDashboard",
+        ]
+        Resource = [
+          "arn:aws:cloudwatch::${local.account_id}:dashboard/${var.project_name}-*",
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringLike = { "cloudwatch:namespace" = "${var.project_name}/*" }
+        }
+      },
+      {
+        # Read-only calls whose resource type is optional or absent: they
+        # accept "*".
+        Effect = "Allow"
+        Action = [
           "cloudwatch:ListDashboards",
-          "cloudwatch:PutMetricData",
           "cloudwatch:GetMetricData",
           "cloudwatch:GetMetricStatistics",
           "cloudwatch:ListMetrics",
@@ -987,30 +1247,91 @@ locals {
     ]
 
     # --- CloudFront: distribution + OAC --------------------------------------
+    # Distribution IDs are generated, so writes are limited by the Project
+    # tag, and tagging is limited as for the KMS keys: only a distribution
+    # without a Project tag (one being created) or with this project's, only
+    # this project's value and only the stacks' tag keys.
     cloudfront = [
       {
+        # No resource type: listing and these creations support only "*".
         Effect = "Allow"
-        # CloudFront uses global ARNs and distribution IDs aren't
-        # predictable at policy time. Enumerate actions tightly instead
-        # of granting cloudfront:*.
         Action = [
-          "cloudfront:CreateDistribution",
+          "cloudfront:ListDistributions",
+          "cloudfront:CreateOriginAccessControl",
+          "cloudfront:ListOriginAccessControls",
+          "cloudfront:CreateResponseHeadersPolicy",
+          "cloudfront:ListResponseHeadersPolicies",
+        ]
+        Resource = "*"
+      },
+      {
+        # CreateDistributionWithTags is authorized as CreateDistribution plus
+        # TagResource; the request must carry this project's tag.
+        Effect   = "Allow"
+        Action   = ["cloudfront:CreateDistribution"]
+        Resource = "*"
+        Condition = {
+          StringEquals                = { "aws:RequestTag/Project" = var.project_name }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = local.resource_tag_keys }
+        }
+      },
+      {
+        Effect = "Allow"
+        Action = [
           "cloudfront:UpdateDistribution",
           "cloudfront:DeleteDistribution",
           "cloudfront:GetDistribution",
           "cloudfront:GetDistributionConfig",
-          "cloudfront:ListDistributions",
-          "cloudfront:TagResource",
           "cloudfront:UntagResource",
           "cloudfront:ListTagsForResource",
-          "cloudfront:CreateOriginAccessControl",
+        ]
+        Resource = "arn:aws:cloudfront::${local.account_id}:distribution/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/Project" = var.project_name }
+        }
+      },
+      {
+        # Tags sent with CreateDistribution, before the distribution has any.
+        Effect   = "Allow"
+        Action   = ["cloudfront:TagResource"]
+        Resource = "arn:aws:cloudfront::${local.account_id}:distribution/*"
+        Condition = {
+          Null                        = { "aws:ResourceTag/Project" = "true" }
+          StringEquals                = { "aws:RequestTag/Project" = var.project_name }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = local.resource_tag_keys }
+        }
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["cloudfront:TagResource"]
+        Resource = "arn:aws:cloudfront::${local.account_id}:distribution/*"
+        Condition = {
+          StringEquals                = { "aws:ResourceTag/Project" = var.project_name }
+          StringEqualsIfExists        = { "aws:RequestTag/Project" = var.project_name }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = local.resource_tag_keys }
+        }
+      },
+      {
+        # Origin access controls and response headers policies have
+        # generated IDs and support no condition keys, so they cannot be
+        # limited to this project's; deploy into a dedicated account.
+        Effect = "Allow"
+        Action = [
           "cloudfront:UpdateOriginAccessControl",
           "cloudfront:DeleteOriginAccessControl",
           "cloudfront:GetOriginAccessControl",
           "cloudfront:GetOriginAccessControlConfig",
-          "cloudfront:ListOriginAccessControls",
         ]
-        Resource = "*"
+        Resource = "arn:aws:cloudfront::${local.account_id}:origin-access-control/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudfront:UpdateResponseHeadersPolicy",
+          "cloudfront:DeleteResponseHeadersPolicy",
+          "cloudfront:GetResponseHeadersPolicy",
+        ]
+        Resource = "arn:aws:cloudfront::${local.account_id}:response-headers-policy/*"
       },
     ]
 
@@ -1018,25 +1339,35 @@ locals {
     autoscaling = [
       {
         Effect = "Allow"
-        # application-autoscaling targets don't support resource-level
-        # permissions; scope by service via ScalableDimension.
         Action = [
           "application-autoscaling:RegisterScalableTarget",
           "application-autoscaling:DeregisterScalableTarget",
-          "application-autoscaling:DescribeScalableTargets",
           "application-autoscaling:PutScalingPolicy",
           "application-autoscaling:DeleteScalingPolicy",
-          "application-autoscaling:DescribeScalingPolicies",
+        ]
+        Resource = "arn:aws:application-autoscaling:${var.aws_region}:${local.account_id}:scalable-target/*"
+        Condition = {
+          StringEquals = { "application-autoscaling:service-namespace" = "sagemaker" }
+        }
+      },
+      {
+        # The tagging actions do not take the service-namespace key.
+        Effect = "Allow"
+        Action = [
           "application-autoscaling:TagResource",
           "application-autoscaling:UntagResource",
           "application-autoscaling:ListTagsForResource",
         ]
+        Resource = "arn:aws:application-autoscaling:${var.aws_region}:${local.account_id}:scalable-target/*"
+      },
+      {
+        # Describe calls have no resource type and support only "*".
+        Effect = "Allow"
+        Action = [
+          "application-autoscaling:DescribeScalableTargets",
+          "application-autoscaling:DescribeScalingPolicies",
+        ]
         Resource = "*"
-        Condition = {
-          StringEquals = {
-            "application-autoscaling:service-namespace" = "sagemaker"
-          }
-        }
       },
     ]
 
@@ -1158,6 +1489,7 @@ locals {
     # --- STS: GetCallerIdentity is used throughout the Terraform roots -------
     sts = [
       {
+        # GetCallerIdentity supports only "*".
         Effect   = "Allow"
         Action   = ["sts:GetCallerIdentity"]
         Resource = "*"
@@ -1177,13 +1509,35 @@ locals {
           "arn:aws:codebuild:*:*:project/${var.project_name}-*",
         ]
       },
+      {
+        # Only CodePipeline starts the deploy projects. The role they run as
+        # may not start, retry or reconfigure them, so a build cannot carry
+        # its commands into later releases.
+        Sid    = "DenyCiProjectChanges"
+        Effect = "Deny"
+        Action = [
+          "codebuild:CreateWebhook",
+          "codebuild:DeleteProject",
+          "codebuild:PutResourcePolicy",
+          "codebuild:RetryBuild",
+          "codebuild:RetryBuildBatch",
+          "codebuild:StartBuild",
+          "codebuild:StartBuildBatch",
+          "codebuild:StartSandbox",
+          "codebuild:UpdateProject",
+          "codebuild:UpdateProjectVisibility",
+          "codebuild:UpdateWebhook",
+        ]
+        Resource = local.ci_project_arns
+      },
     ]
   }
 
   # Each group stays under the 6,144-character managed policy limit.
   codebuild_policy_groups = {
     iam      = ["iam"]
-    data     = ["logs", "s3", "kms", "sts", "codebuild"]
+    data     = ["logs", "s3", "sts"]
+    keys     = ["kms", "codebuild"]
     ml       = ["sagemaker", "lambda", "events", "sns", "sqs"]
     edge     = ["apigateway", "waf", "cloudfront"]
     platform = ["cloudwatch", "autoscaling", "ecr", "cloudtrail", "budgets"]

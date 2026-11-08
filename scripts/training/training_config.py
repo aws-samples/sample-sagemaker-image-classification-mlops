@@ -2,7 +2,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Common training configuration for all models"""
+"""Training configuration shared by every trainer: hyperparameters, model settings, augmentation."""
 
 import argparse
 import os
@@ -11,13 +11,13 @@ import os
 
 
 def get_hyperparameters():
-    """Get hyperparameters from command line arguments"""
+    """Hyperparameters SageMaker passes as ``--KEY value`` arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--TRAINING_EPOCHS", type=int, default=20)
     parser.add_argument("--TRAINING_BATCH_SIZE", type=int, default=32)
     parser.add_argument("--TRAINING_LEARNING_RATE", type=float, default=0.001)
-    # Epochs spent in Phase 1 (frozen backbone, train head only). The remaining
-    # TRAINING_EPOCHS - PHASE1_EPOCHS run in Phase 2 (unfrozen, 100x lower LR).
+    # With your own backbone weights: epochs in Phase 1 (frozen backbone, head
+    # only); the rest of TRAINING_EPOCHS run in Phase 2 (unfrozen, 100x lower LR).
     parser.add_argument("--PHASE1_EPOCHS", type=int, default=10)
 
     # Only parse known args to avoid conflicts with other scripts
@@ -25,7 +25,6 @@ def get_hyperparameters():
     return args
 
 
-# Get hyperparameters
 try:
     hp = get_hyperparameters()
 except (SystemExit, argparse.ArgumentError):
@@ -42,13 +41,10 @@ except (SystemExit, argparse.ArgumentError):
 # Get model names from environment (passed from SageMaker pipeline parameters)
 MODEL_NAMES = os.environ.get("MODEL_NAMES", "vgg16,densenet121,efficientnet").split(",")
 
-# Dynamic model configurations based on model names.
-#
-# `phase2_unfreeze_layers` is the number of TOP base-model layers unfrozen in
-# Phase 2 of two-phase transfer learning (see scripts/training/_common.py). The
-# blog uses "top 30" for the deep backbones; VGG16 has only ~19 layers, so a
-# value >= depth simply unfreezes the whole base, which is fine at the Phase 2
-# learning rate (100x lower than Phase 1).
+# `phase2_unfreeze_layers` is the number of top backbone layers unfrozen in
+# Phase 2 when your own backbone weights are loaded (scripts/training/_common.py).
+# VGG16 has only ~19 layers, so a value >= depth unfreezes the whole backbone,
+# which is fine at the Phase 2 learning rate.
 MODEL_CONFIGS = {}
 for model_name in MODEL_NAMES:
     model_name = model_name.strip()
@@ -98,21 +94,28 @@ if not MODEL_CONFIGS:
     }
 
 
-# Common training parameters - uses hyperparameters with fallbacks.
-#
-# Two-phase transfer learning (see scripts/training/_common.py):
-#   Phase 1 - freeze the pre-trained backbone, train only the classification
-#             head at `learning_rate` (default 1e-3) for `phase1_epochs`.
-#   Phase 2 - unfreeze the top N base layers, recompile at a 100x-lower rate
-#             (`learning_rate * phase2_lr_factor`) and continue for the
-#             remaining epochs. The 100x reduction prevents catastrophic
-#             forgetting of the ImageNet features.
+# The from-scratch baseline (simple_cnn_trainer.py) is not an ensemble member,
+# so it is not in MODEL_NAMES; its config is always present. Four conv blocks
+# (conv, batch norm, max pool) and a small dense head, trained in one phase.
+MODEL_CONFIGS["simple_cnn"] = {
+    "input_size": (224, 224),
+    "conv_filters": (32, 64, 128, 256),
+    "dense_units": 128,
+    "dropout_rate": 0.5,
+}
+
+
+# With your own backbone weights, training runs in two phases
+# (scripts/training/_common.py): Phase 1 trains only the head with the backbone
+# frozen, Phase 2 unfreezes the top layers at `learning_rate * phase2_lr_factor`,
+# low enough not to wipe out what the loaded weights learned. Without weights
+# every model trains in one phase with every layer trainable.
 TRAINING_PARAMS = {
     "epochs": hp.TRAINING_EPOCHS,
     "batch_size": hp.TRAINING_BATCH_SIZE,
     "learning_rate": hp.TRAINING_LEARNING_RATE,
     "phase1_epochs": hp.PHASE1_EPOCHS,
-    "phase2_lr_factor": 0.01,  # Phase 2 LR = learning_rate * 0.01 (100x lower)
+    "phase2_lr_factor": 0.01,
     "patience": 5,
     "reduce_lr_patience": 3,
     "reduce_lr_factor": 0.5,
@@ -120,16 +123,14 @@ TRAINING_PARAMS = {
     "mixed_precision": False,
 }
 
-# Data augmentation parameters. Each one maps to a real-world variation and
-# must preserve diagnostic features.
-#   rotation_range=15      - slight rotation of the field of view
-#   width/height_shift=0.05 - minor framing differences
-#   brightness=(0.8, 1.2)  - +/-20% illumination and scanner-calibration variation
-#   horizontal/vertical flip - a microscope field has no up or down, so both
-#                            mirror images are real tissue views
-#   stain_sigma=0.2        - per-image HED stain jitter (stain_augment.py); stain
-#                            intensity varies more between BreakHis patients than
-#                            between classes, so without it the models learn colour
+# Data augmentation, training images only:
+#   rotation_range=15        - slight rotation of the subject
+#   width/height_shift=0.05  - minor framing differences
+#   brightness=(0.8, 1.2)    - +/-20% illumination variation
+#   horizontal/vertical flip - turn off a flip when orientation carries meaning
+#   color_jitter_sigma=0.1   - per-image colour and intensity jitter
+#                              (color_jitter.py), so the models cannot learn
+#                              capture-session colour instead of content; 0 is off
 AUGMENTATION_PARAMS = {
     "rotation_range": 15,
     "width_shift_range": 0.05,
@@ -139,20 +140,20 @@ AUGMENTATION_PARAMS = {
     "vertical_flip": True,
     "fill_mode": "constant",
     "cval": 0,
-    "stain_sigma": 0.2,
+    "color_jitter_sigma": 0.1,
 }
+
 
 # SageMaker metric logging
 
 
 def log_metric(metric_name, value):
-    """Log metric for SageMaker"""
+    """Print a metric line the training job's MetricDefinitions match."""
     print(f"{metric_name}: {value}")
 
 
 def log_training_metrics(model_name, epoch, metrics):
-    """Log training metrics with proper formatting"""
-    # Dynamic model name mapping based on actual model names
+    """Print the per-epoch training metrics of one model."""
     model_suffix = model_name.replace("-", "").replace("_", "").title()
 
     required_metrics = [
@@ -166,13 +167,11 @@ def log_training_metrics(model_name, epoch, metrics):
         "val_recall",
     ]
 
-    # Check if all required metrics are present
     missing_metrics = [m for m in required_metrics if m not in metrics]
     if missing_metrics:
         print(f"Warning: Missing metrics for {model_name}: {missing_metrics}")
         return
 
-    # Log all metrics
     log_metric(f"ModelTrainingAccuracy{model_suffix}", metrics["train_accuracy"])
     log_metric(f"ModelValidationAccuracy{model_suffix}", metrics["val_accuracy"])
     log_metric(f"ModelTrainingLoss{model_suffix}", metrics["train_loss"])
@@ -183,13 +182,12 @@ def log_training_metrics(model_name, epoch, metrics):
     log_metric(f"ModelValidationRecall{model_suffix}", metrics["val_recall"])
     log_metric(f"ModelEpochsCompleted{model_suffix}", epoch)
 
-    # Calculate and log overfitting gap
     overfitting_gap = metrics["train_accuracy"] - metrics["val_accuracy"]
     log_metric(f"ModelOverfittingGap{model_suffix}", overfitting_gap)
 
 
 def get_model_config(model_name):
-    """Get configuration for specific model"""
+    """Configuration of one model, VGG16's when the name is unknown."""
     return MODEL_CONFIGS.get(model_name, MODEL_CONFIGS["vgg16"])
 
 

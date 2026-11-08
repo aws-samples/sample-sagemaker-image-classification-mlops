@@ -13,7 +13,7 @@ variable "workteam_arn" {
 }
 
 variable "output_s3_uri" {
-  description = "S3 URI where A2I writes human-review results (the radiologist decision becomes ground truth for the next retraining cycle)."
+  description = "S3 URI where A2I writes human-review results (the reviewer's label becomes ground truth for the next retraining cycle)."
   type        = string
 }
 
@@ -25,13 +25,24 @@ variable "execution_role_arn" {
 variable "task_title" {
   description = "Title shown to the reviewer in the worker portal."
   type        = string
-  default     = "Review a low-confidence medical image prediction"
+  default     = "Review a low-confidence image prediction"
 }
 
 variable "task_description" {
   description = "Short description shown to the reviewer."
   type        = string
-  default     = "The model was not confident. Confirm whether the image is benign or malignant."
+  default     = "The model was not confident. Select the correct class for the image."
+}
+
+variable "class_labels" {
+  description = "Classes the reviewer chooses from in the task UI."
+  type        = list(string)
+  default     = ["negative", "positive"]
+}
+
+variable "kms_key_arn" {
+  description = "KMS key ARN that encrypts the human-review output A2I writes to S3."
+  type        = string
 }
 
 variable "task_count" {

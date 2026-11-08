@@ -6,7 +6,7 @@ ${jsonencode({
   # The whole template is one jsonencode() call so the output is always
   # valid JSON; see the call site for the variables passed in.
   Version = "2020-12-01"
-  Parameters = [
+  Parameters = concat([
     {
       Name         = "ModelNames"
       Type         = "String"
@@ -30,7 +30,18 @@ ${jsonencode({
       Type         = "String"
       DefaultValue = code_commit_sha
     }
-  ]
+    ],
+    # Quality gate bars (AccuracyThreshold, AucThreshold, PrecisionThreshold,
+    # RecallThreshold); quality_gate only sets the defaults, so a caller can
+    # move a bar for one execution at StartPipelineExecution.
+    [
+      for metric, name in quality_gate_parameters : {
+        Name         = name
+        Type         = "Float"
+        DefaultValue = quality_gate[metric]
+      }
+    ]
+  )
   Steps = concat(
     [
       # Step 1: Data Validation
@@ -85,21 +96,27 @@ ${jsonencode({
                 {
                   OutputName = "validation-report"
                   S3Output = {
-                    S3Uri        = "s3://${buckets.processed_data}/validation-reports/"
+                    S3Uri = {
+                      "Std:Join" = {
+                        On     = "/"
+                        Values = ["s3://${buckets.processed_data}/executions", execution_id, "reports", "validation"]
+                      }
+                    }
                     LocalPath    = processing_paths.output
                     S3UploadMode = data_config.s3_upload_mode
                   }
                 }
               ]
             }
-            RoleArn = role_arn
+            RoleArn = job_role_arn
             Environment = {
               PROJECT_NAME         = project_name
               AWS_DEFAULT_REGION   = aws_region
               MIN_IMAGES_PER_CLASS = tostring(min_images_per_class)
+              POSITIVE_CLASS       = positive_class
             }
           },
-          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+          { NetworkConfig = merge({ EnableInterContainerTrafficEncryption = true }, vpc_config == null ? {} : { VpcConfig = vpc_config }) }
         )
         CacheConfig = {
           Enabled     = steps.validation.enable_cache
@@ -133,7 +150,8 @@ ${jsonencode({
               ContainerArguments = [
                 "--input-path", processing_paths.input_data,
                 "--output-path", processing_paths.output,
-                "--target-size", tostring(preprocessing_target_size)
+                "--target-size", tostring(preprocessing_target_size),
+                "--validation-report-path", processing_paths.input_report
               ]
             }
             ProcessingInputs = [
@@ -146,23 +164,49 @@ ${jsonencode({
                   S3InputMode = data_config.s3_input_mode
                 }
               },
+              # Each instance receives a share of the raw images (instance_count
+              # of the preprocessing step). The split is computed from the
+              # validation step's inventory of every image, so all instances
+              # put a group in the same split.
               {
                 InputName = "raw-data"
                 S3Input = {
-                  S3Uri       = "s3://${buckets.raw_data}/${training_data_path}"
-                  LocalPath   = processing_paths.input_data
+                  S3Uri                  = "s3://${buckets.raw_data}/${training_data_path}"
+                  LocalPath              = processing_paths.input_data
+                  S3DataType             = data_config.s3_data_type
+                  S3InputMode            = data_config.s3_input_mode
+                  S3DataDistributionType = "ShardedByS3Key"
+                }
+              },
+              # image_inventory.json and exclusion_manifest.json, on every
+              # instance.
+              {
+                InputName = "validation-report"
+                S3Input = {
+                  S3Uri = {
+                    Get = "Steps.${steps.validation.step_name}.ProcessingOutputConfig.Outputs['validation-report'].S3Output.S3Uri"
+                  }
+                  LocalPath   = processing_paths.input_report
                   S3DataType  = data_config.s3_data_type
                   S3InputMode = data_config.s3_input_mode
                 }
               }
             ]
+            # Per-execution prefixes: every instance uploads its share of the
+            # splits to the same execution's prefix, and no run can mix with
+            # an earlier one's images.
             ProcessingOutputConfig = {
               KmsKeyId = kms_key_arn
               Outputs = [
                 {
                   OutputName = "train-data"
                   S3Output = {
-                    S3Uri        = "s3://${buckets.processed_data}/train/"
+                    S3Uri = {
+                      "Std:Join" = {
+                        On     = "/"
+                        Values = ["s3://${buckets.processed_data}/executions", execution_id, "train"]
+                      }
+                    }
                     LocalPath    = "${processing_paths.output}/train"
                     S3UploadMode = data_config.s3_upload_mode
                   }
@@ -170,7 +214,12 @@ ${jsonencode({
                 {
                   OutputName = "validation-data"
                   S3Output = {
-                    S3Uri        = "s3://${buckets.processed_data}/validation/"
+                    S3Uri = {
+                      "Std:Join" = {
+                        On     = "/"
+                        Values = ["s3://${buckets.processed_data}/executions", execution_id, "validation"]
+                      }
+                    }
                     LocalPath    = "${processing_paths.output}/validation"
                     S3UploadMode = data_config.s3_upload_mode
                   }
@@ -178,24 +227,26 @@ ${jsonencode({
                 {
                   OutputName = "test-data"
                   S3Output = {
-                    S3Uri        = "s3://${buckets.processed_data}/test/"
+                    S3Uri = {
+                      "Std:Join" = {
+                        On     = "/"
+                        Values = ["s3://${buckets.processed_data}/executions", execution_id, "test"]
+                      }
+                    }
                     LocalPath    = "${processing_paths.output}/test"
                     S3UploadMode = data_config.s3_upload_mode
                   }
                 }
               ]
             }
-            RoleArn = role_arn
+            RoleArn = job_role_arn
             Environment = {
               PROJECT_NAME       = project_name
               AWS_DEFAULT_REGION = aws_region
-              # The outputs upload to fixed train/, validation/ and test/
-              # prefixes, so the preprocessor clears them first; otherwise
-              # images from an earlier run would mix into this run's splits.
-              PROCESSED_DATA_BUCKET = buckets.processed_data
+              POSITIVE_CLASS     = positive_class
             }
           },
-          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+          { NetworkConfig = merge({ EnableInterContainerTrafficEncryption = true }, vpc_config == null ? {} : { VpcConfig = vpc_config }) }
         )
         CacheConfig = {
           Enabled     = steps.preprocessing.enable_cache
@@ -282,12 +333,10 @@ ${jsonencode({
                 }
               ]
             }
-            RoleArn = role_arn
-            # The "weights" channel feeds pre-downloaded ImageNet weights
-            # (scripts/download_pretrained_weights.py) for network-isolation
-            # mode. It is only added when isolation is on: otherwise the
-            # prefix may be empty and CreateTrainingJob fails with "No S3
-            # objects found", and the trainers download the weights instead.
+            RoleArn = job_role_arn
+            # An isolated container cannot reach S3, so optional backbone
+            # weights (backbone_weights_s3_uri) arrive as the "weights"
+            # channel.
             InputDataConfig = concat(
               [
                 {
@@ -303,8 +352,8 @@ ${jsonencode({
                   ContentType     = data_config.content_type
                   CompressionType = data_config.compression_type
                 },
-                # Patient-grouped validation split (SM_CHANNEL_VALIDATION), so
-                # early stopping never sees images of a training patient.
+                # Group-aware validation split (SM_CHANNEL_VALIDATION), so early
+                # stopping never sees images of a training group.
                 {
                   ChannelName = "validation"
                   DataSource = {
@@ -319,17 +368,19 @@ ${jsonencode({
                   CompressionType = data_config.compression_type
                 }
               ],
-              enable_network_isolation ? [
+              backbone_weights_s3_uri == "" ? [] : [
                 {
                   ChannelName = "weights"
                   InputMode   = "File"
                   DataSource = {
                     S3DataSource = {
                       S3DataType = "S3Prefix"
-                      S3Uri      = "s3://${buckets.scripts}/pretrained-weights/"
+                      S3Uri      = backbone_weights_s3_uri
                     }
                   }
-                },
+                }
+              ],
+              enable_network_isolation ? [
                 # An isolated container cannot download sagemaker_submit_directory
                 # from S3, so the trainer tarball arrives as a channel instead.
                 {
@@ -375,10 +426,13 @@ ${jsonencode({
               sagemaker_program          = models[model_key].script_name
               sagemaker_submit_directory = enable_network_isolation ? "/opt/ml/input/data/code/${models[model_key].tar_file}" : "s3://${buckets.scripts}/training/${models[model_key].tar_file}"
             }, models[model_key].hyperparameters)
-            EnableNetworkIsolation = enable_network_isolation
+            EnableNetworkIsolation                = enable_network_isolation
+            EnableInterContainerTrafficEncryption = true
             Environment = {
-              PROJECT_NAME       = project_name
-              AWS_DEFAULT_REGION = aws_region
+              PROJECT_NAME            = project_name
+              AWS_DEFAULT_REGION      = aws_region
+              POSITIVE_CLASS          = positive_class
+              BACKBONE_WEIGHTS_S3_URI = backbone_weights_s3_uri
             }
           }
         )
@@ -386,6 +440,96 @@ ${jsonencode({
           Enabled     = models[model_key].enable_cache
           ExpireAfter = models[model_key].cache_expiry
         }
+        DependsOn = [steps.preprocessing.step_name]
+      }
+    ],
+    # Optional baseline: a small CNN trained from scratch on the same splits
+    # (scripts/training/simple_cnn_trainer.py), for comparison with the
+    # transfer-learning members. It also scores the test split. Nothing reads
+    # its artifact: it is not an ensemble member and is never registered.
+    [
+      for _ in(baseline_cnn.enabled ? [1] : []) : {
+        Name = "TrainSimpleCnnBaseline"
+        Type = "Training"
+        Arguments = merge(
+          vpc_config == null ? {} : { VpcConfig = vpc_config },
+          {
+            AlgorithmSpecification = {
+              TrainingImage     = can(regex("^ml\\.(p|g)", baseline_cnn.instance_type)) ? images.tensorflow_gpu : images.tensorflow_cpu
+              TrainingInputMode = training_input_mode
+              MetricDefinitions = [
+                {
+                  Name  = "validation_accuracy"
+                  Regex = "Validation Accuracy: ([0-9\\.]+)"
+                },
+                {
+                  Name  = "test_accuracy"
+                  Regex = "Test Accuracy: ([0-9\\.]+)"
+                }
+              ]
+            }
+            RoleArn = job_role_arn
+            InputDataConfig = concat(
+              [
+                for channel, output in {
+                  training   = "train-data"
+                  validation = "validation-data"
+                  test       = "test-data"
+                  } : {
+                  ChannelName = channel
+                  DataSource = {
+                    S3DataSource = {
+                      S3DataType = data_config.s3_data_type
+                      S3Uri = {
+                        Get = "Steps.${steps.preprocessing.step_name}.ProcessingOutputConfig.Outputs['${output}'].S3Output.S3Uri"
+                      }
+                    }
+                  }
+                  ContentType     = data_config.content_type
+                  CompressionType = data_config.compression_type
+                }
+              ],
+              enable_network_isolation ? [
+                {
+                  ChannelName = "code"
+                  InputMode   = "File"
+                  DataSource = {
+                    S3DataSource = {
+                      S3DataType = "S3Prefix"
+                      S3Uri      = "s3://${buckets.scripts}/training/simple_cnn_trainer.tar.gz"
+                    }
+                  }
+                }
+              ] : []
+            )
+            OutputDataConfig = {
+              S3OutputPath = "s3://${buckets.model_artifacts}/baselines/simple_cnn/"
+              KmsKeyId     = kms_key_arn
+            }
+            ResourceConfig = merge(
+              {
+                InstanceType   = baseline_cnn.instance_type
+                InstanceCount  = 1
+                VolumeSizeInGB = baseline_cnn.volume_size
+              },
+              can(regex(local_storage_instance_regex, baseline_cnn.instance_type)) ? {} : { VolumeKmsKeyId = kms_key_arn },
+            )
+            StoppingCondition = {
+              MaxRuntimeInSeconds = baseline_cnn.max_runtime
+            }
+            HyperParameters = merge({
+              sagemaker_program          = "simple_cnn_trainer.py"
+              sagemaker_submit_directory = enable_network_isolation ? "/opt/ml/input/data/code/simple_cnn_trainer.tar.gz" : "s3://${buckets.scripts}/training/simple_cnn_trainer.tar.gz"
+            }, baseline_cnn.hyperparameters)
+            EnableNetworkIsolation                = enable_network_isolation
+            EnableInterContainerTrafficEncryption = true
+            Environment = {
+              PROJECT_NAME       = project_name
+              AWS_DEFAULT_REGION = aws_region
+              POSITIVE_CLASS     = positive_class
+            }
+          }
+        )
         DependsOn = [steps.preprocessing.step_name]
       }
     ],
@@ -437,7 +581,7 @@ ${jsonencode({
                 }
               },
               # Threshold tuning reads the validation split so the test split
-              # stays untouched for the clinical gate.
+              # stays untouched for the quality gate.
               {
                 InputName = "validation-data"
                 S3Input = {
@@ -480,15 +624,16 @@ ${jsonencode({
                 }
               ]
             }
-            RoleArn = role_arn
+            RoleArn = job_role_arn
             Environment = {
-              PROJECT_NAME          = project_name
-              AWS_DEFAULT_REGION    = aws_region
-              MODEL_NAMES           = { Get = "Parameters.ModelNames" }
-              CLINICAL_QUALITY_GATE = jsonencode(clinical_quality_gate)
+              PROJECT_NAME       = project_name
+              AWS_DEFAULT_REGION = aws_region
+              MODEL_NAMES        = { Get = "Parameters.ModelNames" }
+              QUALITY_GATE       = quality_gate_json
+              POSITIVE_CLASS     = positive_class
             }
           },
-          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+          { NetworkConfig = merge({ EnableInterContainerTrafficEncryption = true }, vpc_config == null ? {} : { VpcConfig = vpc_config }) }
         )
         CacheConfig = {
           Enabled     = steps.evaluation.enable_cache
@@ -598,17 +743,17 @@ ${jsonencode({
                 }
               ]
             }
-            RoleArn = role_arn
+            RoleArn = job_role_arn
             Environment = {
-              PROJECT_NAME          = project_name
-              AWS_DEFAULT_REGION    = aws_region
-              MODEL_NAMES           = { Get = "Parameters.ModelNames" }
-              CLINICAL_QUALITY_GATE = jsonencode(clinical_quality_gate)
+              PROJECT_NAME       = project_name
+              AWS_DEFAULT_REGION = aws_region
+              MODEL_NAMES        = { Get = "Parameters.ModelNames" }
+              QUALITY_GATE       = quality_gate_json
+              POSITIVE_CLASS     = positive_class
             }
           },
-          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+          { NetworkConfig = merge({ EnableInterContainerTrafficEncryption = true }, vpc_config == null ? {} : { VpcConfig = vpc_config }) }
         )
-        # The clinical quality gate reads its metrics from this file.
         PropertyFiles = [
           {
             PropertyFileName = "EnsembleResults"
@@ -702,13 +847,14 @@ ${jsonencode({
                 }
               ]
             }
-            RoleArn = role_arn
+            RoleArn = job_role_arn
             Environment = {
               PROJECT_NAME       = project_name
               AWS_DEFAULT_REGION = aws_region
+              POSITIVE_CLASS     = positive_class
             }
           },
-          vpc_config == null ? {} : { NetworkConfig = { VpcConfig = vpc_config } }
+          { NetworkConfig = merge({ EnableInterContainerTrafficEncryption = true }, vpc_config == null ? {} : { VpcConfig = vpc_config }) }
         )
         PropertyFiles = [
           {
@@ -723,22 +869,22 @@ ${jsonencode({
         }
         DependsOn = [steps.ensemble.step_name]
       },
-      # Step 9: Clinical quality gate. Register only if the ensemble clears
+      # Step 9: Quality gate. Register only if the ensemble clears
       # accuracy, recall, precision and AUC (read from this execution's
       # ensemble_results.json) and the fairness bound (bias_metrics.json).
       # Conditions are ANDed.
       {
         Name        = "Condition"
         Type        = "Condition"
-        DisplayName = "Clinical Quality Gate"
+        DisplayName = "Quality Gate"
         Arguments = {
           Conditions = concat(
             [
-              for metric, threshold in {
-                ensemble_accuracy  = clinical_quality_gate.accuracy
-                ensemble_recall    = clinical_quality_gate.recall
-                ensemble_precision = clinical_quality_gate.precision
-                ensemble_auc       = clinical_quality_gate.auc_roc
+              for metric, gate_metric in {
+                ensemble_accuracy  = "accuracy"
+                ensemble_recall    = "recall"
+                ensemble_precision = "precision"
+                ensemble_auc       = "auc_roc"
                 } : {
                 Type = "GreaterThanOrEqualTo"
                 LeftValue = {
@@ -747,7 +893,7 @@ ${jsonencode({
                     Path         = metric
                   }
                 }
-                RightValue = threshold
+                RightValue = { Get = "Parameters.${quality_gate_parameters[gate_metric]}" }
               }
             ],
             [
@@ -770,12 +916,12 @@ ${jsonencode({
             Type = steps.registry.step_type
             Arguments = {
               ModelPackageGroupName = model_package_group_name
-              # Register as PendingManualApproval so a clinical review board
-              # (not the pipeline) decides what reaches an endpoint. The
-              # auto-deploy Lambda fires on the Approved state change, so the
-              # human approval is the deploy trigger.
+              # Register as PendingManualApproval so a review board (not the
+              # pipeline) decides what reaches an endpoint. The auto-deploy
+              # Lambda fires on the Approved state change, so the human
+              # approval is the deploy trigger.
               ModelApprovalStatus     = "PendingManualApproval"
-              ModelPackageDescription = "Medical image classification ensemble model"
+              ModelPackageDescription = "Image classification ensemble model"
 
               # Audit metadata: why this version was trained, on which data
               # and code, the thresholds it cleared, and the execution whose
@@ -785,10 +931,11 @@ ${jsonencode({
                 data_version          = { Get = "Parameters.DatasetVersion" }
                 code_commit           = { Get = "Parameters.CodeCommitSha" }
                 pipeline_execution_id = execution_id
-                accuracy_threshold    = tostring(clinical_quality_gate.accuracy)
-                recall_threshold      = tostring(clinical_quality_gate.recall)
-                precision_threshold   = tostring(clinical_quality_gate.precision)
-                auc_threshold         = tostring(clinical_quality_gate.auc_roc)
+                # The bars this execution was gated on (parameter values).
+                accuracy_threshold  = { "Std:Join" = { On = "", Values = [{ Get = "Parameters.${quality_gate_parameters.accuracy}" }] } }
+                recall_threshold    = { "Std:Join" = { On = "", Values = [{ Get = "Parameters.${quality_gate_parameters.recall}" }] } }
+                precision_threshold = { "Std:Join" = { On = "", Values = [{ Get = "Parameters.${quality_gate_parameters.precision}" }] } }
+                auc_threshold       = { "Std:Join" = { On = "", Values = [{ Get = "Parameters.${quality_gate_parameters.auc_roc}" }] } }
                 project_name          = project_name
               }
 
@@ -877,7 +1024,7 @@ ${jsonencode({
               Type        = "Fail"
               DisplayName = "Fail Quality Or Fairness Gate"
               Arguments = {
-                ErrorMessage = "Ensemble did not pass the clinical quality gate (accuracy/recall/precision/AUC) or the fairness gate (max_disparity). See clinical_quality_gate in ensemble_results.json and max_disparity in bias_metrics.json."
+                ErrorMessage = "Ensemble did not pass the quality gate (accuracy/recall/precision/AUC) or the fairness gate (max_disparity). See quality_gate in ensemble_results.json and max_disparity in bias_metrics.json."
               }
             }
           ]

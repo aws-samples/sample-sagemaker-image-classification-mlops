@@ -71,15 +71,17 @@ secret_detection:
 # Grype/Syft) and writes an aggregated report. Complements the GitLab native
 # analyzers above with AWS-specific IaC checks. Non-blocking (allow_failure)
 # so a new finding surfaces in the report without hard-failing the pipeline.
+# Installed from its GitHub release at a pinned commit: the PyPI name
+# automated-security-helper is not AWS's package.
 ash:
   stage: scan
   image:
     name: public.ecr.aws/docker/library/python:3.13-slim
   before_script:
     - apt-get update && apt-get install -y --no-install-recommends git
-    - pip install --no-cache-dir automated-security-helper
+    - pip install --no-cache-dir "git+https://github.com/awslabs/automated-security-helper.git@af1206aff596f1288ad066828058b3011de2a998" # v3.7.1
   script:
-    - ash --source-dir . --output-dir ash_output || true
+    - ash --mode local --source-dir . --output-dir ash_output || true
   artifacts:
     when: always
     paths:

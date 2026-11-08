@@ -34,7 +34,7 @@ import time
 import uuid
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -176,8 +176,11 @@ def publish_drift_baseline(model_package_arn, monitoring_bucket, baseline_key=No
             Body=json.dumps(baseline).encode("utf8"),
             ContentType="application/json",
         )
-    except Exception:
-        logger.exception("Could not refresh the drift baseline; the drift job keeps the old one")
+    except (ClientError, BotoCoreError, KeyError, IndexError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Could not refresh the drift baseline (%s); the drift job keeps the old one",
+            type(exc).__name__,
+        )
         return None
     uri = f"s3://{monitoring_bucket}/{baseline_key}"
     logger.info("Drift baseline %s refreshed from %d test scores", uri, len(baseline["scores"]))
@@ -201,6 +204,9 @@ def _create_model_and_config(
     serverless_max_concurrency = int(os.environ.get("SERVERLESS_MAX_CONCURRENCY", "10"))
 
     container = _build_container(model_package_arn)
+    # The serving handler only calls TensorFlow Serving on localhost, so the
+    # model needs no network access.
+    isolation = os.environ.get("ENABLE_NETWORK_ISOLATION", "true").lower() == "true"
     tags = [
         {"Key": "Project", "Value": project_name},
         {"Key": "AutoDeployed", "Value": "true"},
@@ -214,6 +220,7 @@ def _create_model_and_config(
             ModelName=model_name,
             Containers=[container],
             ExecutionRoleArn=os.environ["SAGEMAKER_ROLE"],
+            EnableNetworkIsolation=isolation,
             Tags=tags,
         )
     else:
@@ -221,6 +228,7 @@ def _create_model_and_config(
             ModelName=model_name,
             PrimaryContainer=container,
             ExecutionRoleArn=os.environ["SAGEMAKER_ROLE"],
+            EnableNetworkIsolation=isolation,
             Tags=[*tags, {"Key": "ServingImageOverride", "Value": "true"}],
         )
 
@@ -312,9 +320,12 @@ def lambda_handler(event, _context):
         logger.error(f"ModelPackageArn not in expected group {expected_group}: {model_package_arn}")
         return {"statusCode": 400, "body": "model package group mismatch"}
 
-    if detail.get("ModelApprovalStatus") == "Rejected":
-        logger.info("Model rejected, nothing to deploy")
-        return {"statusCode": 200, "body": "model rejected, skipped"}
+    # The EventBridge rule already matches Approved only; checked here too so a
+    # misconfigured rule can never deploy a package that is not Approved.
+    status = detail.get("ModelApprovalStatus")
+    if status != "Approved":
+        logger.info("Model package status %s, nothing to deploy", status)
+        return {"statusCode": 200, "body": f"model package not approved ({status}), skipped"}
 
     endpoint_name = os.environ["ENDPOINT_NAME"]
     project_name = os.environ["PROJECT_NAME"]
@@ -365,7 +376,7 @@ def lambda_handler(event, _context):
     logger.info(f"Updating endpoint {endpoint_name} -> {config_name} (traffic routing {routing})")
     try:
         sm.update_endpoint(**update_endpoint_request(endpoint_name, config_name, deployment_config))
-    except Exception:
+    except (ClientError, BotoCoreError):
         # Don't leak the just-created model + config if the update fails;
         # otherwise every retry stacks another orphaned pair toward the
         # account's SageMaker quotas.
@@ -376,8 +387,8 @@ def lambda_handler(event, _context):
         ):
             try:
                 delete(**kwargs)
-            except Exception as cleanup_exc:
-                logger.warning(f"Cleanup failed for {kwargs}: {cleanup_exc}")
+            except (ClientError, BotoCoreError) as cleanup_exc:
+                logger.warning(f"Cleanup failed for {kwargs}: {type(cleanup_exc).__name__}")
         raise
 
     if os.environ.get("MODEL_ARTIFACTS_BUCKET"):

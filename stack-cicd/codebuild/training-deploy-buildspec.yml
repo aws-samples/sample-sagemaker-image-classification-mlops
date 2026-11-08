@@ -9,6 +9,7 @@ version: 0.2
 env:
   variables:
     TERRAFORM_VERSION: "1.15.6"
+    HASHICORP_KEY_FINGERPRINT: "C874011F0AB405110D02105534365D9472D7468F" # pragma: allowlist secret - HashiCorp public PGP key fingerprint
 
 phases:
   install:
@@ -18,9 +19,17 @@ phases:
       - dnf update -y python3-pip libtasn1 libxml2 || true
       - curl -fsSLO "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
       - curl -fsSLO "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"
+      - curl -fsSLO "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_SHA256SUMS.sig"
+      # The checksum file is trusted only once its signature verifies against
+      # HashiCorp's release key, identified by its pinned fingerprint.
+      - curl -fsSL https://www.hashicorp.com/.well-known/pgp-key.txt -o hashicorp.asc
+      - export GNUPGHOME="$(mktemp -d)"
+      - gpg --batch --quiet --import hashicorp.asc
+      - gpg --batch --with-colons --fingerprint | grep -q "^fpr:::::::::${HASHICORP_KEY_FINGERPRINT}:$"
+      - gpg --batch --verify "terraform_${TERRAFORM_VERSION}_SHA256SUMS.sig" "terraform_${TERRAFORM_VERSION}_SHA256SUMS"
       - grep " terraform_${TERRAFORM_VERSION}_linux_amd64.zip$" "terraform_${TERRAFORM_VERSION}_SHA256SUMS" | sha256sum -c -
       - unzip -o "terraform_${TERRAFORM_VERSION}_linux_amd64.zip" terraform -d /usr/local/bin/
-      - rm -f "terraform_${TERRAFORM_VERSION}_linux_amd64.zip" "terraform_${TERRAFORM_VERSION}_SHA256SUMS"
+      - rm -rf "terraform_${TERRAFORM_VERSION}_linux_amd64.zip" "terraform_${TERRAFORM_VERSION}_SHA256SUMS" "terraform_${TERRAFORM_VERSION}_SHA256SUMS.sig" hashicorp.asc "$GNUPGHOME"
       - terraform --version
 
   pre_build:

@@ -2,10 +2,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-# Removes the resources that pipeline runs and Lambda functions create outside
-# Terraform (endpoint configs, models, model packages, job log groups, bucket
-# contents), then optionally runs `terraform destroy` on the stacks in
-# dependency order: cicd, inference, training.
+# Stops running pipeline executions and removes the resources that pipeline
+# runs and Lambda functions create outside Terraform (endpoint configs, models,
+# model packages, job log groups, bucket contents), then optionally runs
+# `terraform destroy` on the stacks in dependency order: cicd, inference,
+# training. Without --destroy it is the pre-destroy step for running
+# `terraform destroy` in each stack yourself.
 #
 # The Terraform state bucket is never emptied or deleted. Destroy
 # stack-backend-setup yourself as the very last step, once every other stack
@@ -16,7 +18,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-PROJECT_NAME="medical-image-classification"
+PROJECT_NAME="image-classification"
 PROFILE=""
 REGION=""
 STATE_BUCKET=""
@@ -121,7 +123,8 @@ echo "Region:         $EFFECTIVE_REGION"
 echo "Project prefix: ${PROJECT_NAME}-"
 echo "State bucket:   ${STATE_BUCKET:-<not found; names containing tfstate or terraform-state are skipped>} (never touched)"
 echo ""
-echo "This deletes SageMaker endpoint configs, models and model packages named ${PROJECT_NAME}-*,"
+echo "This stops running executions of the ${PROJECT_NAME}-* SageMaker pipelines, deletes"
+echo "SageMaker endpoint configs, models and model packages named ${PROJECT_NAME}-*,"
 echo "the ${PROJECT_NAME} job log groups, and ALL objects and versions in these buckets:"
 if [ "${#BUCKETS[@]}" -eq 0 ]; then
     echo "  (none)"
@@ -163,6 +166,24 @@ empty_bucket() {
             --query '{Objects: [Versions || `[]`, DeleteMarkers || `[]`][].{Key: Key, VersionId: VersionId}, Quiet: `true`}' \
             --output json)"
         aws s3api delete-objects --bucket "$bucket" --delete "$batch" >/dev/null
+    done
+}
+
+stop_pipeline_executions() {
+    local pipeline arn
+    # A running execution keeps writing to the buckets and would make the
+    # bucket deletes fail later.
+    aws sagemaker list-pipelines --pipeline-name-prefix "$PROJECT_NAME" \
+        --query "PipelineSummaries[?starts_with(PipelineName, '${PROJECT_NAME}-')].PipelineName" \
+        --output text | tr '\t' '\n' | while IFS= read -r pipeline; do
+        [ -z "$pipeline" ] && continue
+        aws sagemaker list-pipeline-executions --pipeline-name "$pipeline" \
+            --query "PipelineExecutionSummaries[?PipelineExecutionStatus=='Executing'].PipelineExecutionArn" \
+            --output text | tr '\t' '\n' | while IFS= read -r arn; do
+            [ -z "$arn" ] && continue
+            echo "Stopping pipeline execution: $arn"
+            aws sagemaker stop-pipeline-execution --pipeline-execution-arn "$arn" >/dev/null || true
+        done
     done
 }
 
@@ -245,6 +266,7 @@ destroy_stack() {
 # Run
 # ---------------------------------------------------------------------------
 
+stop_pipeline_executions
 delete_endpoint_resources
 # stack-inference reads the approved model package when it plans a destroy,
 # so with --destroy the packages go only after that stack is gone.
@@ -280,9 +302,12 @@ if [ "$RUN_DESTROY" = true ]; then
     echo "  cd stack-backend-setup && terraform destroy"
 else
     echo ""
-    echo "Next, destroy the stacks in this order (or rerun with --destroy):"
-    echo "  1. stack-cicd"
-    echo "  2. stack-inference"
-    echo "  3. stack-training"
+    echo "Next, run terraform destroy in each stack in this order (or rerun with --destroy),"
+    echo "with TF_VAR_state_bucket_name and TF_VAR_permissions_boundary_arn set"
+    echo "(stack-backend-setup outputs state_bucket_id and workload_boundary_arn)"
+    echo "and TF_VAR_model_package_arn unset:"
+    echo "  1. stack-inference"
+    echo "  2. stack-training"
+    echo "  3. stack-cicd (reads no other stack's state; any time before step 4)"
     echo "  4. stack-backend-setup (last; it holds the remote state)"
 fi

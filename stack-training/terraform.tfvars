@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: MIT-0
 
 # General
-project_name = "medical-image-classification"
+project_name = "image-classification"
 environment  = "dev"
 aws_region   = "us-east-1"
 
-# Audit & Compliance. The trail is account-wide and multi-region; leave it off
-# when an organization trail already records this account.
-enable_cloudtrail         = false
+# Audit & Compliance. The trail records management events account-wide (multi-
+# region) plus data events on the project buckets and Lambda functions. Set it
+# to false when an organization trail already records this account.
+enable_cloudtrail         = true
 cloudtrail_retention_days = 400
 
 # Cost Governance - project-scoped monthly budget (filtered by Project tag)
@@ -29,9 +30,11 @@ pipeline_steps = {
     enable_cache   = false
     cache_expiry   = "P7D"
   }
+  # Each instance preprocesses its share of the images (ShardedByS3Key); the
+  # group split is the same on every instance.
   preprocessing = {
     instance_type  = "ml.m5.4xlarge"
-    instance_count = 1
+    instance_count = 2
     volume_size    = 100
     script_name    = "data_preprocessor.py"
     step_name      = "PreprocessData"
@@ -61,8 +64,8 @@ pipeline_steps = {
   }
 
   # Part 4 fairness gate. Runs Fairlearn on the ensemble predictions and writes
-  # bias_metrics.json, which the clinical quality gate reads alongside the
-  # accuracy metrics.
+  # bias_metrics.json, which the quality gate reads alongside the accuracy
+  # metrics.
   bias = {
     instance_type  = "ml.m5.large"
     instance_count = 1
@@ -75,25 +78,29 @@ pipeline_steps = {
   }
 
   registry = {
-    instance_type  = "" # Not Required for Registry
-    instance_count = 1  # Not Required for Registry
-    volume_size    = 30 # Not Required for Registry
-    script_name    = "" # Not Required for Registry
+    # The RegisterModel step reads only step_name and step_type.
+    instance_type  = ""
+    instance_count = 1
+    volume_size    = 30
+    script_name    = ""
     step_name      = "RegisterEnsembleModel"
     step_type      = "RegisterModel"
-    enable_cache   = false # Not Required for Registry
-    cache_expiry   = "P7D" # Not Required for Registry
+    enable_cache   = false
+    cache_expiry   = "P7D"
   }
 }
 
 # KMS
-kms_deletion_window_days = 7
+kms_deletion_window_days = 30
 enable_kms_key_rotation  = true
 
-# Training. training_data_path is the prefix scripts/data_uploader.sh writes to;
-# its .batch_complete marker (auto_trigger_marker_key) starts the pipeline.
-training_data_path      = "medical_image_data/"
-auto_trigger_marker_key = "medical_image_data/.batch_complete"
+# Training. Images live under <training_data_path><label>/<file>;
+# scripts/data_uploader.sh writes the auto_trigger_marker_key object that
+# starts the pipeline.
+training_data_path      = "images/"
+auto_trigger_marker_key = "images/.batch_complete"
+positive_class          = ""
+backbone_weights_s3_uri = ""
 min_images_per_class    = 50
 enable_auto_trigger     = true
 training_input_mode     = "FastFile"
@@ -107,7 +114,7 @@ quarantine_min_image_size_px = 112
 
 # Monitoring
 enable_training_monitoring = true
-log_retention_days         = 30
+log_retention_days         = 365
 log_groups                 = {}
 log_group_names = {
   processing = "/aws/sagemaker/ProcessingJobs"
@@ -120,7 +127,7 @@ metric_namespaces = {
   ensemble   = "EnsembleMetrics"
   registry   = "RegistryMetrics"
 }
-dashboard_name   = "medical-image-classification-training-monitoring"
+dashboard_name   = "image-classification-training-monitoring"
 dashboard_config = ""
 
 # Models

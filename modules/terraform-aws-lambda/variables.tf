@@ -95,7 +95,7 @@ variable "tags" {
 variable "log_retention_days" {
   description = "CloudWatch log retention in days for the Lambda log group"
   type        = number
-  default     = 14
+  default     = 365
 }
 
 variable "log_kms_key_arn" {

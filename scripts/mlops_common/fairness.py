@@ -32,7 +32,6 @@ def _per_group(y_true: list[int], y_pred: list[int], groups: list[str]) -> dict[
             "n": n,
             "n_positive": pos,
             "selection_rate": round(flagged / n, 4) if n else None,
-            # Recall is the clinically costly rate: a missed malignant case.
             "true_positive_rate": round(tp / pos, 4) if pos else None,
             "false_positive_rate": round(fp / neg, 4) if neg else None,
             # Equalized odds needs both classes in a group.
@@ -48,15 +47,28 @@ def compute_group_fairness(
     threshold: float,
     allow_not_evaluable: bool = False,
 ) -> dict:
-    """Demographic parity and equalized odds across subgroups.
+    """Demographic parity, equalized odds and equal opportunity across subgroups.
 
-    ``max_disparity`` is the larger of the two measured differences and is
-    what the gate compares against ``threshold``. Groups without both classes
-    are left out of the equalized-odds term (Fairlearn would report their
-    recall as 0 and fire a false maximal disparity) but still count for
-    demographic parity; per_group shows which groups were measurable.
+    All three come from Fairlearn. Equal opportunity is the largest gap in
+    true positive rate (recall on positive cases) between subgroups, from a
+    MetricFrame over ``true_positive_rate``.
+
+    ``max_disparity`` is the larger of the demographic-parity and
+    equalized-odds differences and is what the gate compares against
+    ``threshold``. Equalized odds covers the true-positive-rate gap of the
+    groups that have both classes, so equal opportunity is reported alongside
+    it rather than added to the gate. Groups without both classes are left out
+    of the equalized-odds term (Fairlearn would report their recall as 0 and
+    fire a false maximal disparity) and groups without a positive case out of
+    the equal-opportunity term, but every group counts for demographic parity;
+    per_group shows which groups were measurable.
     """
-    from fairlearn.metrics import demographic_parity_difference, equalized_odds_difference
+    from fairlearn.metrics import (
+        MetricFrame,
+        demographic_parity_difference,
+        equalized_odds_difference,
+        true_positive_rate,
+    )
 
     y_true = [int(v) for v in y_true]
     y_pred = [int(v) for v in y_pred]
@@ -80,6 +92,8 @@ def compute_group_fairness(
                 "demographic_parity_difference": None,
                 "equalized_odds_difference": None,
                 "equalized_odds_groups": [],
+                "equal_opportunity_difference": None,
+                "equal_opportunity_groups": [],
                 "max_disparity": None,
                 "allow_not_evaluable": allow_not_evaluable,
                 "passed": bool(allow_not_evaluable),
@@ -101,6 +115,18 @@ def compute_group_fairness(
             )
         )
 
+    with_positives = [i for i, g in enumerate(groups) if per_group[g]["n_positive"]]
+    eopp_groups = sorted({groups[i] for i in with_positives})
+    eopp: float | None = None
+    if len(eopp_groups) >= 2:
+        frame = MetricFrame(
+            metrics=true_positive_rate,
+            y_true=[y_true[i] for i in with_positives],
+            y_pred=[y_pred[i] for i in with_positives],
+            sensitive_features=[groups[i] for i in with_positives],
+        )
+        eopp = float(frame.difference(method="between_groups"))
+
     max_disparity = max(dp, eo) if eo is not None else dp
     result.update(
         {
@@ -108,6 +134,8 @@ def compute_group_fairness(
             "demographic_parity_difference": round(dp, 4),
             "equalized_odds_difference": round(eo, 4) if eo is not None else None,
             "equalized_odds_groups": eo_groups,
+            "equal_opportunity_difference": round(eopp, 4) if eopp is not None else None,
+            "equal_opportunity_groups": eopp_groups,
             "max_disparity": round(max_disparity, 4),
             "passed": bool(max_disparity <= threshold),
         }

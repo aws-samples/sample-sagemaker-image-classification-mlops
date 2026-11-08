@@ -4,26 +4,26 @@
 
 """Ongoing fairness monitoring over live endpoint predictions (Part 4).
 
-Runs as a daily Amazon SageMaker Processing job started by EventBridge
-Scheduler. Joins the endpoint's captured predictions with the confirmed
-diagnostic outcomes clinicians supply, computes demographic parity and
-equalized-odds differences per subgroup with Fairlearn, and publishes the
-largest disparity to CloudWatch beside the drift metric from Part 3.
+Runs as a daily Amazon SageMaker Processing job started by Amazon EventBridge
+Scheduler. Joins the endpoint's captured predictions with the confirmed labels
+you upload, computes demographic parity, equalized-odds and equal-opportunity
+differences per subgroup with Fairlearn, and publishes the largest disparity
+to Amazon CloudWatch beside the drift metric from Part 3.
 
 Why live monitoring in addition to the in-pipeline gate: the training-time
 BiasCheck step (scripts/bias/compute_bias.py) proves a model was fair on the
-test split. It cannot see a population shift after deployment - a hospital
-network adding a site with a different demographic mix can raise the
-false-negative rate for that group while aggregate accuracy looks unchanged.
+test split. It cannot see a population shift after deployment: a new source
+of images with a different mix can raise the false-negative rate for that
+subgroup while aggregate accuracy looks unchanged.
 
-Ground truth arrives on its own cadence (pathology results, follow-up reads),
-so only predictions that already have a confirmed label are scored. A prediction
-with no matching label is skipped, never guessed.
+Ground truth arrives on its own cadence, so only predictions that already have
+a confirmed label are scored. A prediction with no matching label is skipped,
+never guessed.
 
 Join key: the inference Lambda passes its request id as InvokeEndpoint
 InferenceId, which data capture records as eventMetadata.inferenceId, and
-returns the same request_id to the caller. Clinicians upload outcomes keyed by
-that request_id. Each prediction is scored at the decision threshold the
+returns the same request_id to the caller. Upload labels keyed by that
+request_id. Each prediction is scored at the decision threshold the
 endpoint reported (threshold_used), not at 0.5.
 
 Input layout in the monitoring bucket:
@@ -41,7 +41,7 @@ summary written to the processing output path for the audit trail.
 The published metric is the larger of the two differences, mirroring how the
 in-pipeline gate scores a candidate, so a deployed model is held to the bar it
 registered under. Note the standard caveat on demographic parity: it compares
-selection rates only, so a genuine difference in disease prevalence between
+selection rates only, so a genuine difference in positive-class prevalence between
 subgroups registers as disparity even when the model is accurate on both. Read
 ``per_group`` before concluding a breach is a model defect, and tune
 ``--threshold`` to the subgroup prevalence actually seen in production.
@@ -58,6 +58,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 # The job's code directory holds mlops_common next to this file; a local
 # checkout has it one level up, in scripts/.
@@ -77,8 +78,8 @@ def _read_text(s3, bucket: str, key: str) -> str:
     try:
         return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf8")
     # A single unreadable object must not abort the whole run.
-    except Exception as exc:
-        logger.warning("skipping %s (%s)", key, exc)
+    except (ClientError, BotoCoreError, UnicodeDecodeError) as exc:
+        logger.warning("skipping %s (%s)", key, type(exc).__name__)
         return ""
 
 
@@ -114,7 +115,7 @@ def load_predictions(
 
 
 def load_ground_truth(s3, bucket: str, prefix: str, since: datetime) -> dict[str, dict]:
-    """Map request_id -> {label, group} from clinician-confirmed outcomes."""
+    """Map request_id -> {label, group} from the confirmed labels you upload."""
     truth: dict[str, dict] = {}
     for key in iter_keys(s3, bucket, prefix, since=since, suffix=".jsonl"):
         for rec in _read_jsonl(s3, bucket, key):

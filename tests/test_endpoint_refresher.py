@@ -10,7 +10,7 @@ from conftest import load_module
 
 refresher = load_module("stack-inference/lambda/endpoint_refresher.py", "endpoint_refresher")
 
-ENDPOINT = "medical-image-classification-endpoint"
+ENDPOINT = "image-classification-endpoint"
 NOW = datetime(2026, 9, 25, tzinfo=UTC)
 SOURCE = {
     "EndpointConfigName": f"{ENDPOINT}-refresh-100",
@@ -57,6 +57,7 @@ def test_clone_copies_everything_but_identity():
 def test_handler_rolls_endpoint_and_deletes_only_old_refresh_configs(monkeypatch):
     monkeypatch.setenv("ENDPOINT_NAME", ENDPOINT)
     monkeypatch.delenv("DEPLOYMENT_CONFIG", raising=False)
+    monkeypatch.delenv("PATCHED_IMAGE_REPOSITORY", raising=False)
     monkeypatch.setattr(refresher.time, "time", lambda: 200)
     sm = boto3.client("sagemaker")
     current = SOURCE["EndpointConfigName"]
@@ -106,7 +107,13 @@ def test_handler_rolls_endpoint_and_deletes_only_old_refresh_configs(monkeypatch
         result = refresher.handler({}, None, sm=sm)
         stub.assert_no_pending_responses()
 
-    assert result == {"refreshed": True, "new_config": new, "deleted_configs": [old]}
+    assert result == {
+        "refreshed": True,
+        "new_config": new,
+        "deleted_configs": [old],
+        "created_models": [],
+        "deleted_models": [],
+    }
 
 
 def test_handler_skips_when_not_in_service(monkeypatch):
@@ -162,3 +169,89 @@ def test_clone_raises_instance_count_to_running_fleet():
 def test_clone_never_lowers_instance_count():
     request = refresher.clone_config_request(SOURCE, "new-name", {"primary": 0, "other": 5})
     assert request["ProductionVariants"][0]["InitialInstanceCount"] == 1
+
+
+REPO = "image-classification-inference-patched"
+REPO_URL = f"111122223333.dkr.ecr.us-east-1.amazonaws.com/{REPO}"
+OLD_IMAGE = f"{REPO_URL}@sha256:{'a' * 64}"
+NEW_IMAGE = f"{REPO_URL}@sha256:{'b' * 64}"
+MODEL = {
+    "ModelName": "model-a",
+    "ModelArn": "arn:aws:sagemaker:us-east-1:111122223333:model/model-a",
+    "CreationTime": NOW,
+    "ExecutionRoleArn": "arn:aws:iam::111122223333:role/example",
+    "PrimaryContainer": {
+        "Image": OLD_IMAGE,
+        "ModelDataUrl": "s3://model-artifacts/model.tar.gz",
+        "Environment": {"SAGEMAKER_PROGRAM": "inference.py"},
+    },
+    "EnableNetworkIsolation": True,
+}
+
+
+def _ecr_with_images(stub):
+    stub.add_response(
+        "describe_images",
+        {
+            "imageDetails": [
+                {
+                    "imageDigest": "sha256:" + "a" * 64,
+                    "imagePushedAt": datetime(2026, 10, 1, tzinfo=UTC),
+                },
+                {
+                    "imageDigest": "sha256:" + "b" * 64,
+                    "imagePushedAt": datetime(2026, 10, 29, tzinfo=UTC),
+                },
+            ]
+        },
+        {"repositoryName": REPO, "filter": {"tagStatus": "TAGGED"}},
+    )
+
+
+def test_newest_image_uri_picks_the_latest_push():
+    ecr = boto3.client("ecr", region_name="us-east-1")
+    with Stubber(ecr) as stub:
+        _ecr_with_images(stub)
+        assert refresher.newest_image_uri(ecr, REPO, REPO_URL) == NEW_IMAGE
+
+
+def test_repin_copies_the_model_with_the_newest_image(monkeypatch):
+    monkeypatch.setenv("PATCHED_IMAGE_REPOSITORY", REPO)
+    monkeypatch.setenv("PATCHED_IMAGE_REPOSITORY_URL", REPO_URL)
+    sm = boto3.client("sagemaker", region_name="us-east-1")
+    ecr = boto3.client("ecr", region_name="us-east-1")
+    source = {k: v for k, v in SOURCE.items() if k != "ResponseMetadata"}
+    name = f"{ENDPOINT[:40]}-image-300-0"
+    with Stubber(sm) as sm_stub, Stubber(ecr) as ecr_stub:
+        _ecr_with_images(ecr_stub)
+        sm_stub.add_response("describe_model", MODEL, {"ModelName": "model-a"})
+        expected = refresher.repin_model_request(MODEL, NEW_IMAGE, name)
+        sm_stub.add_response(
+            "create_model",
+            {"ModelArn": "arn:aws:sagemaker:us-east-1:111122223333:model/new"},
+            expected,
+        )
+        repinned, created = refresher.repin_to_newest_image(sm, ecr, source, ENDPOINT, 300)
+
+    assert created == [name]
+    assert repinned["ProductionVariants"][0]["ModelName"] == name
+    assert expected["PrimaryContainer"]["Image"] == NEW_IMAGE
+    assert expected["PrimaryContainer"]["ModelDataUrl"] == MODEL["PrimaryContainer"]["ModelDataUrl"]
+    assert expected["EnableNetworkIsolation"] is True
+    assert len(name) <= 63
+
+
+def test_repin_keeps_a_model_already_on_the_newest_image(monkeypatch):
+    monkeypatch.setenv("PATCHED_IMAGE_REPOSITORY", REPO)
+    monkeypatch.setenv("PATCHED_IMAGE_REPOSITORY_URL", REPO_URL)
+    sm = boto3.client("sagemaker", region_name="us-east-1")
+    ecr = boto3.client("ecr", region_name="us-east-1")
+    source = {k: v for k, v in SOURCE.items() if k != "ResponseMetadata"}
+    current = {**MODEL, "PrimaryContainer": {**MODEL["PrimaryContainer"], "Image": NEW_IMAGE}}
+    with Stubber(sm) as sm_stub, Stubber(ecr) as ecr_stub:
+        _ecr_with_images(ecr_stub)
+        sm_stub.add_response("describe_model", current, {"ModelName": "model-a"})
+        repinned, created = refresher.repin_to_newest_image(sm, ecr, source, ENDPOINT, 300)
+
+    assert created == []
+    assert repinned is source

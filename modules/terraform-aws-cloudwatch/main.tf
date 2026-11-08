@@ -3,13 +3,12 @@
 
 locals {
   # Training mode: ML-specific metrics (hardcoded)
-  processed_data_types      = ["TrainingImageCount", "TrainingBenignCount", "TrainingMalignantCount", "ValidationImageCount", "ValidationBenignCount", "ValidationMalignantCount", "TestImageCount", "TestBenignCount", "TestMalignantCount"]
+  processed_data_types      = ["TrainingImageCount", "TrainingPositiveCount", "TrainingNegativeCount", "ValidationImageCount", "ValidationPositiveCount", "ValidationNegativeCount", "TestImageCount", "TestPositiveCount", "TestNegativeCount"]
   training_metric_types     = ["TrainingAccuracy", "ValidationAccuracy", "TrainingLoss", "ValidationLoss", "TrainingPrecision", "TrainingRecall", "ValidationPrecision", "ValidationRecall", "EpochsCompleted", "OverfittingGap"]
   evaluation_summary_values = ["BestModelAccuracy", "TotalModelCount", "EvaluationAccuracy", "EvaluationPrecision", "EvaluationRecall", "EvaluationF1Score", "SuccessfulModelCount"]
   ensemble_values           = ["EnsembleAccuracy", "EnsemblePrecision", "EnsembleRecall", "EnsembleF1Score"]
   registry_values           = ["ModelRegistrySuccess", "ModelRegistered", "ModelApprovalStatus"]
 
-  # Dynamic model performance history widgets
   model_performance_widgets = var.enable_training_monitoring ? [
     for i, model in var.training_models : {
       type   = "log"
@@ -70,7 +69,7 @@ resource "aws_cloudwatch_log_group" "processing_jobs" {
   count = var.enable_training_monitoring ? 1 : 0
 
   name              = var.log_group_names.processing
-  retention_in_days = 14
+  retention_in_days = var.log_retention_days
   kms_key_id        = var.kms_key_arn
 
   tags = local.common_tags
@@ -80,7 +79,7 @@ resource "aws_cloudwatch_log_group" "training_jobs" {
   count = var.enable_training_monitoring ? 1 : 0
 
   name              = var.log_group_names.training
-  retention_in_days = 14
+  retention_in_days = var.log_retention_days
   kms_key_id        = var.kms_key_arn
 
   tags = local.common_tags
@@ -91,7 +90,7 @@ resource "aws_cloudwatch_log_group" "generic" {
   for_each = var.enable_training_monitoring ? {} : var.log_groups
 
   name              = each.value.name
-  retention_in_days = try(each.value.retention_in_days, var.log_retention_days)
+  retention_in_days = coalesce(each.value.retention_in_days, var.log_retention_days)
   kms_key_id        = var.kms_key_arn
 
   tags = local.common_tags

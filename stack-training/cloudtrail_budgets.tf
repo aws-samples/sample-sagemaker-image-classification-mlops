@@ -1,6 +1,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+locals {
+  # Buckets whose object-level calls the trail records as data events.
+  cloudtrail_data_event_buckets = concat(
+    local.project_bucket_arns,
+    var.enable_sbom_bucket ? [module.s3_sbom[0].bucket_arn] : [],
+  )
+}
+
 resource "random_id" "cloudtrail_suffix" {
   count       = var.enable_cloudtrail ? 1 : 0
   byte_length = 4
@@ -10,19 +18,22 @@ module "s3_cloudtrail_logs" {
   count  = var.enable_cloudtrail ? 1 : 0
   source = "../modules/terraform-aws-s3"
 
-  bucket_name         = "${var.project_name}-${var.environment}-cloudtrail-${random_id.cloudtrail_suffix[0].hex}"
-  force_destroy       = var.bucket_defaults.force_destroy
-  kms_key_arn         = module.kms.key_arn
-  enable_versioning   = true
-  block_public_access = true
+  bucket_name   = "${var.project_name}-${var.environment}-cloudtrail-${random_id.cloudtrail_suffix[0].hex}"
+  force_destroy = var.audit_bucket_force_destroy
+
+  logging_target_bucket = local.access_log_bucket
+  enable_access_logging = var.enable_s3_access_logging
+  kms_key_arn           = module.kms.key_arn
+  enable_versioning     = true
+  block_public_access   = true
 
   # This bucket has its own aws_s3_bucket_policy (CloudTrail write grants +
   # the SSL-only deny below), so the module must not also attach one.
   enable_ssl_enforcement = false
 
-  # Expire old CloudTrail logs after var.cloudtrail_retention_days. HIPAA
-  # requires 6 years of audit retention, which most organizations meet by
-  # shipping CloudTrail to a SIEM and keeping about a year in S3.
+  # Expire old CloudTrail logs after var.cloudtrail_retention_days. Audit
+  # policies that need years of retention are usually met by shipping
+  # CloudTrail to a SIEM and keeping about a year in S3.
   lifecycle_rules = [{
     id                              = "expire-old-logs"
     status                          = "Enabled"
@@ -88,6 +99,7 @@ resource "aws_s3_bucket_policy" "cloudtrail" {
 }
 
 resource "aws_cloudtrail" "audit" {
+  #checkov:skip=CKV2_AWS_10:The trail streams to aws_cloudwatch_log_group.cloudtrail through cloud_watch_logs_group_arn; Checkov does not follow count-indexed references
   count = var.enable_cloudtrail ? 1 : 0
 
   name           = "${var.project_name}-audit-trail"
@@ -119,6 +131,50 @@ resource "aws_cloudtrail" "audit" {
   # Encrypt with the project KMS key (same key protects everything else).
   kms_key_id = module.kms.key_arn
 
+  # Management events (every control-plane call in the account) plus data
+  # events scoped to this project: object-level S3 calls on its buckets and
+  # invocations of its Lambda functions (all named <project_name>-*). The
+  # trail's own log bucket is left out, or each delivery would log itself.
+  advanced_event_selector {
+    name = "Management events"
+    field_selector {
+      field  = "eventCategory"
+      equals = ["Management"]
+    }
+  }
+
+  advanced_event_selector {
+    name = "S3 data events on the project buckets"
+    field_selector {
+      field  = "eventCategory"
+      equals = ["Data"]
+    }
+    field_selector {
+      field  = "resources.type"
+      equals = ["AWS::S3::Object"]
+    }
+    field_selector {
+      field       = "resources.ARN"
+      starts_with = [for arn in local.cloudtrail_data_event_buckets : "${arn}/"]
+    }
+  }
+
+  advanced_event_selector {
+    name = "Lambda invocations of the project functions"
+    field_selector {
+      field  = "eventCategory"
+      equals = ["Data"]
+    }
+    field_selector {
+      field  = "resources.type"
+      equals = ["AWS::Lambda::Function"]
+    }
+    field_selector {
+      field       = "resources.ARN"
+      starts_with = ["arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:${var.project_name}-"]
+    }
+  }
+
   # Require bucket policy (+ SNS topic policy when enabled) in place before the
   # trail starts writing. depends_on tolerates the SNS resources having count 0.
   depends_on = [
@@ -146,6 +202,7 @@ resource "aws_iam_role" "cloudtrail_cwl" {
   count = var.enable_cloudtrail ? 1 : 0
 
   name                 = "${var.project_name}-cloudtrail-cwl-role"
+  description          = "Lets the ${var.project_name} CloudTrail trail write to its CloudWatch Logs log group"
   permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
@@ -154,6 +211,10 @@ resource "aws_iam_role" "cloudtrail_cwl" {
       Effect    = "Allow"
       Principal = { Service = "cloudtrail.amazonaws.com" }
       Action    = "sts:AssumeRole"
+      Condition = {
+        StringEqualsIfExists = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+        ArnLikeIfExists      = { "aws:SourceArn" = "arn:aws:cloudtrail:${var.aws_region}:${data.aws_caller_identity.current.account_id}:trail/${var.project_name}-audit-trail" }
+      }
     }]
   })
 }
@@ -201,6 +262,7 @@ resource "aws_sns_topic_policy" "cloudtrail_notifications" {
       Condition = {
         StringEquals = {
           "AWS:SourceAccount" = data.aws_caller_identity.current.account_id
+          "AWS:SourceArn"     = "arn:aws:cloudtrail:${var.aws_region}:${data.aws_caller_identity.current.account_id}:trail/${var.project_name}-audit-trail"
         }
       }
     }]

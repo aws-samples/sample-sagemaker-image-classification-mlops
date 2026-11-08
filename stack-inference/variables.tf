@@ -33,9 +33,13 @@ variable "state_bucket_region" {
 }
 
 variable "permissions_boundary_arn" {
-  description = "ARN of the permissions boundary attached to every IAM role this stack creates (stack-backend-setup output workload_boundary_arn). Required when CI/CD CodeBuild applies the stack; null leaves the roles unbounded."
+  description = "ARN of the permissions boundary attached to every IAM role this stack creates (stack-backend-setup output workload_boundary_arn). Required: make and the CI/CD stages pass it as TF_VAR_permissions_boundary_arn."
   type        = string
-  default     = null
+
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:policy/", var.permissions_boundary_arn))
+    error_message = "permissions_boundary_arn must be the IAM policy ARN of the workload boundary (stack-backend-setup output workload_boundary_arn)."
+  }
 }
 
 ################################################################################
@@ -50,24 +54,60 @@ variable "api_stage_name" {
 
 variable "api_authorization_type" {
   description = <<-EOT
-    Authorization on POST /predict and GET /results/{id}. "NONE" (default)
-    relies on the API key, usage plan and WAF; the key is visible to anyone who
-    loads the frontend, so it limits and meters callers but does not
-    authenticate them. To authenticate:
+    Authorization on POST /predict and GET /results/{id}. The API key, usage
+    plan and WAF apply in every mode.
+      - "NONE" (default, API key mode): the key is visible to anyone who
+        loads the frontend, so it limits and meters callers but does not
+        authenticate them. The static frontend works in this mode only.
+      - "COGNITO_USER_POOLS": Amazon Cognito authenticates application
+        users. The stack creates a user pool and app client
+        (unless api_cognito_user_pool_arns names existing pools); callers send
+        the user's ID token in the Authorization header. The static frontend
+        has no sign-in flow yet.
       - "AWS_IAM": callers sign with SigV4 and need execute-api:Invoke on the
         API (browsers get credentials from a Cognito identity pool).
-      - "COGNITO_USER_POOLS": set api_cognito_user_pool_arns; callers send the
-        user pool ID token in the Authorization header. The static frontend
-        would need a sign-in flow added.
   EOT
   type        = string
   default     = "NONE"
+
+  validation {
+    condition     = contains(["NONE", "AWS_IAM", "COGNITO_USER_POOLS"], var.api_authorization_type)
+    error_message = "api_authorization_type must be NONE, AWS_IAM or COGNITO_USER_POOLS."
+  }
 }
 
 variable "api_cognito_user_pool_arns" {
-  description = "Cognito user pool ARNs for the API authorizer when api_authorization_type = \"COGNITO_USER_POOLS\"."
+  description = "Existing Cognito user pool ARNs for the API authorizer when api_authorization_type = \"COGNITO_USER_POOLS\". Empty (default) creates a user pool in this stack."
   type        = list(string)
   default     = []
+}
+
+variable "cognito_mfa_configuration" {
+  description = "MFA for the stack's Cognito user pool: OPTIONAL (default; users can add an authenticator app) or ON (every user sets up an authenticator app at first sign-in)."
+  type        = string
+  default     = "OPTIONAL"
+
+  validation {
+    condition     = contains(["OPTIONAL", "ON"], var.cognito_mfa_configuration)
+    error_message = "cognito_mfa_configuration must be OPTIONAL or ON."
+  }
+}
+
+variable "cognito_threat_protection_mode" {
+  description = "Cognito threat protection (compromised credentials, adaptive authentication) for the stack's user pool: OFF (default, Essentials feature plan), AUDIT or ENFORCED. AUDIT and ENFORCED switch the pool to the Plus feature plan, which is billed per monthly active user."
+  type        = string
+  default     = "OFF"
+
+  validation {
+    condition     = contains(["OFF", "AUDIT", "ENFORCED"], var.cognito_threat_protection_mode)
+    error_message = "cognito_threat_protection_mode must be OFF, AUDIT or ENFORCED."
+  }
+}
+
+variable "cognito_deletion_protection" {
+  description = "Turn on deletion protection for the stack's Cognito user pool. Off by default so terraform destroy removes the pool with the stack; turn it on when the pool holds real users."
+  type        = bool
+  default     = false
 }
 
 variable "api_require_api_key" {
@@ -101,7 +141,7 @@ variable "api_throttling_burst_limit" {
 }
 
 variable "max_image_bytes" {
-  description = "Max size of a base64-encoded image accepted by the /predict endpoint. Images above this size return HTTP 413 without invoking SageMaker. Default 5 MB is generous for 224x224 histopathology."
+  description = "Max size of a base64-encoded image accepted by the /predict endpoint. Images above this size return HTTP 413 without invoking SageMaker. Default 5 MB is generous for 224x224 images."
   type        = number
   default     = 5242880 # 5 MB
 }
@@ -135,7 +175,7 @@ variable "lambda_memory_size" {
 variable "log_retention_days" {
   description = "CloudWatch log retention in days"
   type        = number
-  default     = 14
+  default     = 365
 }
 
 variable "alert_email" {
@@ -209,6 +249,12 @@ variable "deployment_max_timeout" {
 ################################################################################
 # SageMaker Endpoint
 ################################################################################
+
+variable "endpoint_network_isolation" {
+  description = "Run the endpoint's inference container with network isolation (no outbound network). The auto-deploy Lambda creates its models the same way."
+  type        = bool
+  default     = true
+}
 
 variable "endpoint_instance_type" {
   description = "Instance type for SageMaker endpoint"
@@ -321,19 +367,19 @@ variable "monitoring_job_image_tag" {
 ################################################################################
 
 variable "enable_fairness_job" {
-  description = "Enable the scheduled fairness Processing job (Part 4). EventBridge Scheduler starts a SageMaker Processing job that joins endpoint data capture with the confirmed diagnostic outcomes clinicians upload, computes demographic parity and equalized odds per subgroup with Fairlearn, and publishes the largest disparity to CloudWatch beside the drift metric. The alarm feeds the same retrain rule. Requires data capture, so it is skipped for serverless endpoints."
+  description = "Enable the scheduled fairness Processing job. EventBridge Scheduler starts a SageMaker Processing job that joins endpoint data capture with the confirmed labels you upload, computes demographic parity and equalized odds per subgroup with Fairlearn, and publishes the largest disparity to CloudWatch beside the drift metric. The alarm feeds the same retrain rule. Requires data capture, so it is skipped for serverless endpoints."
   type        = bool
   default     = true
 }
 
 variable "fairness_job_schedule_expression" {
-  description = "Schedule on which the fairness Processing job runs. Daily by default: confirmed outcomes arrive on a clinical cadence, so a tighter schedule would mostly re-score the same records."
+  description = "Schedule on which the fairness Processing job runs. Daily by default: confirmed labels usually arrive slowly, so a tighter schedule would mostly re-score the same records."
   type        = string
   default     = "rate(1 day)"
 }
 
 variable "fairness_ground_truth_prefix" {
-  description = "Prefix in the monitoring bucket where confirmed diagnostic outcomes are uploaded as JSON Lines: {\"request_id\": ..., \"label\": 0|1, \"group\": \"<subgroup>\"}. Predictions with no matching label are skipped, never guessed."
+  description = "Prefix in the monitoring bucket where confirmed labels are uploaded as JSON Lines: {\"request_id\": ..., \"label\": 0|1, \"group\": \"<subgroup>\"}. Predictions with no matching label are skipped, never guessed."
   type        = string
   default     = "ground-truth"
 }
@@ -379,15 +425,21 @@ variable "fairness_job_max_runtime" {
 ################################################################################
 
 variable "patched_image_source_tag" {
-  description = "DLC source tag to base the patched inference image on. Use the floating major.minor tag (no -v1.X suffix) to auto-pick up the latest AWS patch version."
+  description = "DLC source tag to base the patched inference image on. Use the floating major.minor tag (no -v1.X suffix) to auto-pick up the latest AWS patch version, and move to a newer major.minor when AWS stops publishing patches for this one (the 2.19 Ubuntu tag stopped on 2026-03-10)."
   type        = string
-  default     = "2.19.0-cpu-py312-ubuntu22.04-sagemaker"
+  default     = "2.20-cpu-py312-amzn2023-sagemaker"
 }
 
 variable "dlc_ecr_registry" {
   description = "ECR registry hostname for the AWS Deep Learning Containers. Defaults to commercial-region canonical DLC registry. Override for GovCloud/CN: see https://github.com/aws/deep-learning-containers/blob/master/available_images.md"
   type        = string
   default     = "" # Empty = built from aws_region (see locals in data.tf)
+}
+
+variable "patched_image_scan_block_severity" {
+  description = "Scan gate of the weekly patched image build: an image with an Amazon ECR scan finding at or above this severity is deleted and the build fails, so the endpoint keeps the last image that passed (an alarm notifies alert_email). CRITICAL (default), HIGH, MEDIUM, LOW, or NONE to turn the gate off."
+  type        = string
+  default     = "CRITICAL"
 }
 
 variable "dlc_source_repository" {
@@ -434,6 +486,12 @@ variable "bedrock_confidence_threshold" {
   default     = 0.70
 }
 
+variable "bedrock_guardrail_image_filters" {
+  description = "Also run the guardrail's HATE, INSULTS, SEXUAL and VIOLENCE filters on the image sent to the foundation model. The Bedrock image content filter is generally available in us-east-1, us-west-2, eu-central-1 and ap-northeast-1 and in preview in some other Regions; set false in a Region without it."
+  type        = bool
+  default     = true
+}
+
 ################################################################################
 # Human-in-the-loop review (Amazon A2I)
 ################################################################################
@@ -467,6 +525,28 @@ variable "explanation_max_evaluations" {
   }
 }
 
+variable "gradcam_border_band" {
+  description = "Width of the image border band, as a fraction of each side, for the Grad-CAM border check. An explained prediction whose heatmap puts more than gradcam_border_threshold of its mass in this band is returned with \"attention_on_border\": true."
+  type        = number
+  default     = 0.1
+
+  validation {
+    condition     = var.gradcam_border_band > 0 && var.gradcam_border_band < 0.5
+    error_message = "gradcam_border_band must be greater than 0 and less than 0.5."
+  }
+}
+
+variable "gradcam_border_threshold" {
+  description = "Share of the Grad-CAM mass in the border band (gradcam_border_band) above which an explained prediction is flagged with \"attention_on_border\": true."
+  type        = number
+  default     = 0.5
+
+  validation {
+    condition     = var.gradcam_border_threshold > 0 && var.gradcam_border_threshold < 1
+    error_message = "gradcam_border_threshold must be between 0 and 1."
+  }
+}
+
 variable "explanation_time_budget_ms" {
   description = "Time budget for the explain path on the endpoint, in milliseconds. Region Shapley skips permutations that would overrun it (the first always runs). Keep it well under API Gateway's 29 s integration timeout."
   type        = number
@@ -475,5 +555,54 @@ variable "explanation_time_budget_ms" {
   validation {
     condition     = var.explanation_time_budget_ms >= 1000 && var.explanation_time_budget_ms <= 25000
     error_message = "explanation_time_budget_ms must be between 1000 and 25000."
+  }
+}
+
+################################################################################
+# Teardown
+################################################################################
+
+variable "force_destroy_buckets" {
+  description = "Let terraform destroy delete this stack's frontend bucket with its objects and versions. True by default so the stack tears down in one step; set false to keep the bucket when it is not empty."
+  type        = bool
+  default     = true
+}
+
+variable "test_traffic_enabled" {
+  description = "Send synthetic test traffic (test_traffic.tf): once an hour at a random minute, 1 to test_traffic_max_requests images from the raw-data bucket go to the inference function, so the drift and fairness jobs have predictions to measure. Test deployments only."
+  type        = bool
+  default     = false
+}
+
+variable "test_traffic_end_date" {
+  description = "UTC time (RFC 3339, e.g. 2026-11-28T00:00:00Z) after which the test traffic schedule stops. Required when test_traffic_enabled = true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = !var.test_traffic_enabled || can(formatdate("YYYY", var.test_traffic_end_date))
+    error_message = "Set test_traffic_end_date to an RFC 3339 UTC time when test_traffic_enabled = true."
+  }
+}
+
+variable "test_traffic_max_requests" {
+  description = "Most predictions one test traffic run sends; each run picks 1 to this many at random."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.test_traffic_max_requests >= 1 && var.test_traffic_max_requests <= 20
+    error_message = "test_traffic_max_requests must be between 1 and 20."
+  }
+}
+
+variable "test_traffic_explain_rate" {
+  description = "Share of test traffic requests that ask for explanations (Grad-CAM and region Shapley); explanations are CPU heavy on the endpoint."
+  type        = number
+  default     = 0.1
+
+  validation {
+    condition     = var.test_traffic_explain_rate >= 0 && var.test_traffic_explain_rate <= 1
+    error_message = "test_traffic_explain_rate must be between 0 and 1."
   }
 }

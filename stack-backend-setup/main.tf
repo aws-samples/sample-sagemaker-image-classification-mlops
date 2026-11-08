@@ -1,10 +1,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+data "aws_caller_identity" "current" {}
+
 locals {
   kms_key_alias          = var.kms_key_alias != "" ? var.kms_key_alias : "${var.project_name}-terraform-state"
   workload_boundary_name = var.workload_boundary_name != "" ? var.workload_boundary_name : "${var.project_name}-workload-boundary"
-  state_bucket_name      = var.bucket_name != "" ? var.bucket_name : "${var.project_name}-tfstate-${random_id.suffix[0].hex}"
+  # Resource-name prefix of the stacks the boundary governs.
+  workload_prefix   = var.workload_project_name != "" ? var.workload_project_name : var.project_name
+  state_bucket_name = var.bucket_name != "" ? var.bucket_name : "${var.project_name}-tfstate-${random_id.suffix[0].hex}"
 }
 
 module "kms" {
@@ -17,6 +21,32 @@ module "kms" {
 
   # Default policy includes the account root; key_administrators adds further principals.
   key_administrators = var.kms_key_administrators
+
+  # The stack-cicd CodeBuild log groups are encrypted with this key: the
+  # CloudWatch Logs key policy statement, limited by encryption context to
+  # those log groups.
+  key_statements = [
+    {
+      sid = "AllowCloudWatchLogsForCodeBuildLogGroups"
+      actions = [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:Describe*",
+      ]
+      resources = ["*"]
+      principals = [{
+        type        = "Service"
+        identifiers = ["logs.${var.aws_region}.amazonaws.com"]
+      }]
+      condition = [{
+        test     = "ArnLike"
+        variable = "kms:EncryptionContext:aws:logs:arn"
+        values   = ["arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/codebuild/${local.workload_prefix}-*"]
+      }]
+    },
+  ]
 
   aliases = [local.kms_key_alias]
 }
@@ -124,13 +154,10 @@ resource "aws_iam_policy" "workload_boundary" {
           "application-autoscaling:*",
           "bedrock:*",
           "cloudwatch:*",
-          "codebuild:*",
           "ecr:*",
           "events:*",
-          "kms:*",
-          "lambda:*",
+          "inspector2:ListFindings",
           "logs:*",
-          "s3:*",
           "sagemaker:*",
           "sagemaker-mlflow:*",
           "sns:*",
@@ -141,11 +168,61 @@ resource "aws_iam_policy" "workload_boundary" {
         Resource = "*"
       },
       {
-        # Training and processing jobs that run in a VPC (stack-training
-        # vpc_config) manage their own ENIs through the execution role.
+        # Project buckets only, plus any extra bucket a workload must read
+        # (for example the one holding backbone_weights_s3_uri).
+        Sid    = "ProjectBuckets"
+        Effect = "Allow"
+        Action = ["s3:*"]
+        Resource = concat(
+          [
+            "arn:aws:s3:::${local.workload_prefix}-*",
+            "arn:aws:s3:::${local.workload_prefix}-*/*",
+          ],
+          var.boundary_extra_s3_arns,
+        )
+      },
+      {
+        # Bucket names are global, so the project prefix must not reach a
+        # bucket of the same name in another account.
+        Sid    = "DenyProjectNamedBucketsInOtherAccounts"
+        Effect = "Deny"
+        Action = ["s3:*"]
+        Resource = [
+          "arn:aws:s3:::${local.workload_prefix}-*",
+          "arn:aws:s3:::${local.workload_prefix}-*/*",
+        ]
+        Condition = {
+          StringNotEqualsIfExists = { "s3:ResourceAccount" = data.aws_caller_identity.current.account_id }
+        }
+      },
+      {
+        Sid    = "ProjectFunctionsAndBuilds"
+        Effect = "Allow"
+        Action = [
+          "lambda:*",
+          "codebuild:*",
+        ]
+        Resource = [
+          "arn:aws:lambda:*:${data.aws_caller_identity.current.account_id}:function:${local.workload_prefix}-*",
+          "arn:aws:codebuild:*:${data.aws_caller_identity.current.account_id}:project/${local.workload_prefix}-*",
+          "arn:aws:codebuild:*:${data.aws_caller_identity.current.account_id}:report-group/${local.workload_prefix}-*",
+        ]
+      },
+      {
+        # Project keys carry the Project tag (provider default_tags).
+        Sid      = "ProjectKeys"
+        Effect   = "Allow"
+        Action   = ["kms:*"]
+        Resource = "arn:aws:kms:*:${data.aws_caller_identity.current.account_id}:key/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/Project" = local.workload_prefix }
+        }
+      },
+      {
+        # Jobs in a VPC (training VPC or vpc_config) manage their own ENIs.
         Sid    = "VpcJobNetworking"
         Effect = "Allow"
-        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure - permissions boundary; ENI actions only reach jobs that set vpc_config
+        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure, terraform.lang.security.iam.no-iam-resource-exposure - permissions boundary; ENI actions only reach jobs that set vpc_config
         Action = [
           "ec2:CreateNetworkInterface",
           "ec2:CreateNetworkInterfacePermission",
@@ -164,9 +241,35 @@ resource "aws_iam_policy" "workload_boundary" {
         # jobs they start. Nothing else in IAM is reachable through the boundary.
         Sid    = "PassProjectRoles"
         Effect = "Allow"
-        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure - permissions boundary; PassRole limited to project-prefixed roles
+        # nosemgrep: terraform.lang.security.iam.no-iam-resource-exposure.no-iam-resource-exposure, terraform.lang.security.iam.no-iam-resource-exposure - permissions boundary; PassRole limited to project-prefixed roles
         Action   = ["iam:GetRole", "iam:PassRole"]
-        Resource = "arn:aws:iam::*:role/${var.project_name}-*"
+        Resource = "arn:aws:iam::*:role/${local.workload_prefix}-*"
+      },
+      {
+        # The CI/CD roles match the project prefix but must never be handed to
+        # a workload service.
+        Sid    = "DenyPassingCiRoles"
+        Effect = "Deny"
+        Action = ["iam:PassRole"]
+        Resource = [
+          "arn:aws:iam::*:role/${local.workload_prefix}-codebuild-role",
+          "arn:aws:iam::*:role/${local.workload_prefix}-codepipeline-role",
+        ]
+      },
+      {
+        # The stack-cicd deploy projects run as the CI/CD role and match the
+        # project prefix above. A workload role that could start one (with a
+        # buildspec override), open a sandbox in it or change it would run
+        # commands as that role, so all CodeBuild access to them is denied.
+        Sid    = "DenyCiBuildProjects"
+        Effect = "Deny"
+        Action = ["codebuild:*"]
+        Resource = [
+          "arn:aws:codebuild:*:${data.aws_caller_identity.current.account_id}:project/${local.workload_prefix}-baseline-model-creation",
+          "arn:aws:codebuild:*:${data.aws_caller_identity.current.account_id}:project/${local.workload_prefix}-training-deploy",
+          "arn:aws:codebuild:*:${data.aws_caller_identity.current.account_id}:project/${local.workload_prefix}-script-upload",
+          "arn:aws:codebuild:*:${data.aws_caller_identity.current.account_id}:project/${local.workload_prefix}-inference-deploy",
+        ]
       },
     ]
   })

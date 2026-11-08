@@ -120,7 +120,19 @@ variable "encryption_key_arn" {
 }
 
 variable "log_group_name" {
-  description = "CloudWatch Logs group that CodeBuild writes to. Null = CodeBuild auto-creates `/aws/codebuild/<project-name>` with no KMS encryption."
+  description = "Existing CloudWatch Logs group that CodeBuild writes to. Null = the module creates `/aws/codebuild/<name>` with log_retention_days and log_kms_key_arn."
+  type        = string
+  default     = null
+}
+
+variable "log_retention_days" {
+  description = "Days the log group the module creates keeps the build logs."
+  type        = number
+  default     = 365
+}
+
+variable "log_kms_key_arn" {
+  description = "Customer managed KMS key ARN for the log group the module creates. Its key policy must let the CloudWatch Logs service principal use it for this log group. Null = CloudWatch Logs default encryption."
   type        = string
   default     = null
 }

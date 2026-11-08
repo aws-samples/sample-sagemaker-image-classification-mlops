@@ -5,8 +5,8 @@ import json
 
 import numpy as np
 import pytest
-from conftest import load_module
-from mlops_common.gates import binary_metrics, clinical_gate, select_threshold
+from conftest import CLASSES, load_module
+from mlops_common.gates import binary_metrics, quality_gate, select_threshold
 
 ensemble = load_module("scripts/ensemble/ensemble_creator.py", "ensemble_creator")
 
@@ -29,10 +29,10 @@ def test_select_threshold_reports_unmet_recall_target():
     assert binary_metrics(labels, scores, threshold)["recall"] == 0.5
 
 
-def test_clinical_gate_drops_auc_only_when_undefined():
+def test_quality_gate_drops_auc_only_when_undefined():
     single_class = binary_metrics([1, 1, 1], [0.9, 0.8, 0.7], 0.5)
     assert single_class["auc_roc"] is None
-    gate = clinical_gate(single_class)
+    gate = quality_gate(single_class)
     assert "auc_roc" not in gate["thresholds"]
     assert gate["scored_on"] == "test"
 
@@ -48,23 +48,24 @@ def _make_split(root, names_scores):
             (root / label_dir / name).write_bytes(b"")
 
 
-def test_ensemble_tunes_on_validation_and_gates_on_test(tmp_path, monkeypatch, breakhis_name):
+def test_ensemble_tunes_on_validation_and_gates_on_test(tmp_path, monkeypatch, image_name):
     """Validation and test disagree about the best threshold; the ensemble
     must take validation's and report test metrics at it."""
     val_dir, test_dir, eval_dir, out_dir = (tmp_path / d for d in ("val", "test", "eval", "out"))
+    negative, positive = CLASSES
 
-    # Validation: malignant scores sit at 0.3-0.4, so a low threshold wins.
+    # Validation: positive scores sit at 0.3-0.4, so a low threshold wins.
     val_scores = {}
     for i, s in enumerate([0.05, 0.1, 0.15, 0.2]):
-        val_scores[f"breast_benign/{breakhis_name('B', 1, 40, i)}"] = s
+        val_scores[f"{negative}/{image_name(1, i, 'day')}"] = s
     for i, s in enumerate([0.3, 0.32, 0.35, 0.4]):
-        val_scores[f"breast_malignant/{breakhis_name('M', 2, 100, i)}"] = s
+        val_scores[f"{positive}/{image_name(2, i, 'night')}"] = s
     # Test: separable only at a high threshold.
     test_scores = {}
     for i, s in enumerate([0.1, 0.5, 0.55, 0.6]):
-        test_scores[f"breast_benign/{breakhis_name('B', 3, 40, i)}"] = s
+        test_scores[f"{negative}/{image_name(3, i, 'day')}"] = s
     for i, s in enumerate([0.8, 0.85, 0.9, 0.95]):
-        test_scores[f"breast_malignant/{breakhis_name('M', 4, 100, i)}"] = s
+        test_scores[f"{positive}/{image_name(4, i, 'night')}"] = s
 
     for root, table in ((val_dir, val_scores), (test_dir, test_scores)):
         by_dir = {}
@@ -116,6 +117,36 @@ def test_ensemble_tunes_on_validation_and_gates_on_test(tmp_path, monkeypatch, b
     assert predictions["threshold"] == pytest.approx(expected_threshold)
     assert predictions["labels"] == [0] * 4 + [1] * 4
     assert predictions["scores"] == pytest.approx(list(test_scores.values()))
-    assert predictions["sensitive_features"]["magnification"] == ["40X"] * 4 + ["100X"] * 4
+    assert predictions["sensitive_features"]["subgroup"] == ["day"] * 4 + ["night"] * 4
+    assert predictions["group_ids"] == ["g003"] * 4 + ["g004"] * 4
+    assert results["quality_gate"]["scored_on"] == "test"
     config = json.loads((out_dir / "ensemble_config.json").read_text())
     assert config["optimal_threshold"] == pytest.approx(expected_threshold)
+    assert config["class_names"] == list(CLASSES)
+
+
+def test_gate_reads_thresholds_from_the_pipeline_parameters(monkeypatch):
+    """QUALITY_GATE as the pipeline builds it with Std:Join from the
+    AccuracyThreshold, AucThreshold, PrecisionThreshold and RecallThreshold
+    parameters: an execution that raises RecallThreshold is gated on it, and
+    the report's threshold and gap show that bar."""
+    monkeypatch.setenv(
+        "QUALITY_GATE",
+        '{"accuracy": 0.85, "auc_roc": 0.9, "precision": 0.8, "recall": 0.97}',
+    )
+    gates = load_module("scripts/mlops_common/gates.py", "gates_with_parameters")
+    assert gates.QUALITY_THRESHOLDS == {
+        "accuracy": 0.85,
+        "auc_roc": 0.9,
+        "precision": 0.8,
+        "recall": 0.97,
+    }
+    metrics = {"accuracy": 0.9, "auc_roc": 0.95, "precision": 0.85, "recall": 0.96}
+    gate = gates.quality_gate(metrics)
+    assert gate["passed"] is False
+    assert gate["results"]["recall"] == {
+        "value": 0.96,
+        "threshold": 0.97,
+        "passed": False,
+        "gap": -0.01,
+    }

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 
 # General
-project_name = "medical-image-classification"
+project_name = "image-classification"
 environment  = "dev"
 aws_region   = "us-east-1"
 
@@ -14,7 +14,7 @@ lambda_timeout     = 300
 lambda_memory_size = 1024
 
 # Monitoring
-log_retention_days = 14
+log_retention_days = 365
 alert_email        = "" # Add your email for alerts
 drift_threshold    = 0.1
 
@@ -56,5 +56,4 @@ serverless_max_concurrency = 10   # max concurrent requests (1-200)
 
 # End-to-end exercise of opt-in responsible-AI features (Part 3/4).
 enable_bedrock_hybrid_inference = true
-bedrock_confidence_threshold    = 0.99 # high so the demo prediction routes to Bedrock
 enable_request_explanations     = true

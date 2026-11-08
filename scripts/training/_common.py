@@ -3,16 +3,14 @@
 # SPDX-License-Identifier: MIT-0
 
 """
-Shared training utilities for VGG16, DenseNet121, and EfficientNet trainers.
+Shared training utilities for the VGG16, DenseNet121 and EfficientNet trainers
+and the from-scratch simple CNN baseline.
 
-Every trainer is a thin wrapper: it defines `create_<name>_model()` (architecture)
-and `main()` (CLI + config glue). The rest - data loaders, callbacks, checkpoint
-resume, model packaging, output validation, metric emission - lives here and
-runs identically for all three.
+Every trainer is a thin wrapper: it defines `build_model()` (architecture)
+and `main()` (CLI + config glue). The rest - data loaders, class weights,
+augmentation, callbacks, checkpoint resume, model packaging, output
+validation, metric emission - lives here and runs identically for all of them.
 
-Before this module existed, each trainer duplicated ~300 lines; an indentation
-bug in the network-isolation weights path existed in 2 of 3 copies. Keeping a
-single code path makes that class of bug impossible.
 """
 
 from __future__ import annotations
@@ -25,8 +23,9 @@ import tarfile
 from collections.abc import Callable
 
 import tensorflow as tf
+from backbone_weights import resolve_weights_path
+from color_jitter import make_color_jitter
 from spot_checkpoint import checkpoint_callback, resume_or_new
-from stain_augment import make_stain_augmenter
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from training_config import CONFIG
@@ -35,7 +34,10 @@ from training_metrics import send_training_metrics_to_cloudwatch
 # The training tarball ships mlops_common next to this file; a local checkout
 # has it one level up, in scripts/.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mlops_common.constants import CLASS_DIRS, DEFAULT_SEED, IMAGE_EXTENSIONS
+from mlops_common.constants import DEFAULT_SEED
+from mlops_common.dataset_layout import list_images, load_classes
+from mlops_common.datasets import list_labeled_images, predict_scores
+from mlops_common.gates import QUALITY_THRESHOLDS, binary_metrics, select_threshold
 from mlops_common.preprocess import KERAS_INTERPOLATION, imagenet_normalize
 from mlops_common.seeds import set_seeds
 
@@ -48,32 +50,23 @@ def _camel_suffix(model_name: str) -> str:
     return model_name.replace("-", "").replace("_", "").title()
 
 
-def resolve_weights_path(model_name: str) -> str | None:
-    """Return the pre-downloaded ImageNet weights path injected by
-    `SM_CHANNEL_WEIGHTS`, or None if network isolation is off.
-
-    The training roots sync weights into /opt/ml/input/data/weights/<name>.weights.h5
-    via the `weights` input channel (see `download_pretrained_weights.py`).
-    """
-    channel = os.environ.get("SM_CHANNEL_WEIGHTS")
-    if not channel:
-        return None
-    candidate = os.path.join(channel, f"{model_name}.weights.h5")
-    return candidate if os.path.exists(candidate) else None
-
-
 def validate_training_dir(train_dir: str) -> bool:
     """Verify a channel contains both class directories with at least one image each."""
     if not train_dir or not os.path.exists(train_dir):
         logger.error("Training directory does not exist: %s", train_dir)
         return False
 
-    for required in CLASS_DIRS:
+    try:
+        class_names = load_classes(train_dir)
+    except (OSError, ValueError) as exc:
+        logger.error("Cannot read the class names of %s: %s", train_dir, exc)
+        return False
+    for required in class_names:
         sub = os.path.join(train_dir, required)
         if not os.path.exists(sub):
             logger.error("Required directory missing: %s", sub)
             return False
-        count = sum(1 for f in os.listdir(sub) if f.lower().endswith(IMAGE_EXTENSIONS))
+        count = len(list_images(sub))
         if count == 0:
             logger.error("No images found in %s", sub)
             return False
@@ -84,16 +77,16 @@ def validate_training_dir(train_dir: str) -> bool:
 def build_data_generators(train_dir: str, input_size: int, val_dir: str | None = None):
     """Return (train_generator, val_generator).
 
-    With a `validation` channel (the patient-grouped validation split from
+    With a `validation` channel (the group-split validation split from
     preprocessing) early stopping watches that split. Without one, Keras
     carves validation_split out of the training images, which can put images
-    of one patient on both sides.
+    of one group on both sides.
 
     The loader resizes with KERAS_INTERPOLATION and normalises with the shared
     imagenet_normalize, the same transform mlops_common.preprocess applies at
     evaluation and serving time. preprocessing_function runs after
     augmentation, so it replaces `rescale` rather than adding to it. Training
-    images get the HED stain jitter first; validation images are left as is.
+    images get the colour jitter first; validation images are left as is.
     """
     aug = CONFIG["augmentation"]
     train_cfg = CONFIG["training"]
@@ -102,10 +95,10 @@ def build_data_generators(train_dir: str, input_size: int, val_dir: str | None =
     if not use_val_channel:
         logger.warning("No validation channel; using validation_split=%s of the train split", split)
 
-    stain = make_stain_augmenter(aug["stain_sigma"], seed=DEFAULT_SEED)
+    jitter = make_color_jitter(aug["color_jitter_sigma"], seed=DEFAULT_SEED)
 
     def train_transform(image):
-        return imagenet_normalize(stain(image))
+        return imagenet_normalize(jitter(image))
 
     train_datagen = ImageDataGenerator(
         preprocessing_function=train_transform,
@@ -127,7 +120,7 @@ def build_data_generators(train_dir: str, input_size: int, val_dir: str | None =
         "target_size": (input_size, input_size),
         "batch_size": train_cfg["batch_size"],
         "class_mode": "binary",
-        "classes": list(CLASS_DIRS),
+        "classes": list(load_classes(train_dir)),
         "interpolation": KERAS_INTERPOLATION,
     }
 
@@ -162,9 +155,8 @@ def use_loader_threads(generator) -> None:
 def compute_class_weight(labels) -> dict:
     """Balanced class weights, n / (n_classes * n_c), from the training labels.
 
-    Replaces SMOTE: interpolating raw pixels between two tissue images makes
-    implausible images, while weighting the loss corrects the imbalance
-    without inventing data.
+    Weighting the loss corrects the imbalance without inventing data, unlike
+    oversampling by interpolating pixels between images.
     """
     import numpy as np
 
@@ -177,14 +169,10 @@ def compute_class_weight(labels) -> dict:
 def build_callbacks() -> list:
     """Common callback stack: early stopping + LR-on-plateau + per-epoch checkpoint.
 
-    ReduceLROnPlateau lowers the learning rate when validation loss stalls -
-    medical-imaging curves plateau in waves, and a patience-5 EarlyStopping
-    gives this callback room to trigger a reduction and let the model recover
-    before training halts.
-
-    Per-epoch metric emission is handled centrally by
-    `training_metrics.send_training_metrics_to_cloudwatch()` at the end of
-    training, so we don't duplicate emission via a custom Keras callback.
+    ReduceLROnPlateau lowers the learning rate when validation loss stalls;
+    the patience-5 EarlyStopping gives it room to trigger a reduction and let
+    the model recover before training halts. Metrics are emitted once, by
+    `training_metrics.send_training_metrics_to_cloudwatch()` after training.
     """
     train_cfg = CONFIG["training"]
     return [
@@ -267,14 +255,14 @@ def run_two_phase_fit(
     phase2_unfreeze_layers: int,
     class_weight: dict | None = None,
 ) -> dict:
-    """Two-phase transfer learning, shared by all trainers.
+    """Two-phase fine-tuning of a backbone loaded with your own weights.
 
     Phase 1 - backbone frozen, train only the classification head at
     `learning_rate`, for `phase1_epochs` epochs.
-    Phase 2 - unfreeze the top `phase2_unfreeze_layers` base layers, recompile
-    at a 100x-lower learning rate (`learning_rate * phase2_lr_factor`), and
-    continue to `epochs`. The low rate prevents catastrophic forgetting of the
-    ImageNet features while letting the top layers adapt to the medical domain.
+    Phase 2 - unfreeze the top `phase2_unfreeze_layers` backbone layers,
+    recompile at a 100x-lower learning rate (`learning_rate * phase2_lr_factor`)
+    and continue to `epochs`. The low rate keeps what the loaded weights
+    learned while the top layers adapt to your images.
 
     Returns the merged history dict spanning both phases. If a spot resume put
     us past Phase 1 already (`initial_epoch >= phase1_epochs`), Phase 1 is
@@ -358,15 +346,86 @@ def run_two_phase_fit(
     return _merge_histories(history1, history2) if history1 else history2
 
 
+def run_single_phase_fit(
+    model,
+    model_name: str,
+    train_gen,
+    val_gen,
+    callbacks: list,
+    learning_rate: float,
+    epochs: int,
+    initial_epoch: int,
+    class_weight: dict | None = None,
+) -> dict:
+    """One phase, every layer trainable: for a model trained from random initialisation."""
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+        loss="binary_crossentropy",
+        metrics=["accuracy", tf.keras.metrics.Precision(), tf.keras.metrics.Recall()],
+    )
+    logger.info(
+        "=== %s single phase (from scratch, lr=%.2e) epochs %d->%d ===",
+        model_name,
+        learning_rate,
+        initial_epoch,
+        epochs,
+    )
+    history = model.fit(
+        train_gen,
+        validation_data=val_gen,
+        epochs=epochs,
+        initial_epoch=initial_epoch,
+        callbacks=callbacks,
+        class_weight=class_weight,
+        verbose=1,
+    )
+    return _extract_history(history)
+
+
+def evaluate_splits(model, val_dir: str, test_dir: str, input_size: int, model_dir: str) -> dict:
+    """Score the trained model on the validation and test splits; write test_metrics.json.
+
+    Same rule as the evaluation step: the decision threshold is tuned on
+    validation (recall target from the quality gate) and the test split is
+    scored at it, alongside the plain 0.5 threshold. The file lands in the
+    model artifact, so a baseline can be compared with the ensemble members.
+    """
+    val_items = list_labeled_images(val_dir)
+    test_items = list_labeled_images(test_dir)
+
+    def predict(batch):
+        return model.predict(batch, verbose=0)
+
+    val_scores = predict_scores(predict, [p for p, _ in val_items], input_size)
+    test_scores = predict_scores(predict, [p for p, _ in test_items], input_size)
+    val_labels = [label for _, label in val_items]
+    test_labels = [label for _, label in test_items]
+    threshold, selection = select_threshold(
+        val_labels, val_scores, min_recall=QUALITY_THRESHOLDS["recall"]
+    )
+    results = {
+        "decision_threshold": threshold,
+        "threshold_selection": selection,
+        "validation_metrics": binary_metrics(val_labels, val_scores, threshold),
+        "test_metrics": binary_metrics(test_labels, test_scores, threshold),
+        "test_metrics_at_0_5": binary_metrics(test_labels, test_scores, 0.5),
+    }
+    with open(os.path.join(model_dir, "test_metrics.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    # Matched by the training step's MetricDefinitions.
+    logger.info("Validation Accuracy: %.4f", results["validation_metrics"]["accuracy"])
+    logger.info("Test Accuracy: %.4f", results["test_metrics"]["accuracy"])
+    logger.info("Test metrics (threshold %.2f tuned on validation): %s", threshold, results)
+    return results
+
+
 def unfreeze_top_layers(base, count: int) -> None:
     """Make the top `count` backbone layers trainable, except BatchNormalization.
 
     An unfrozen BatchNormalization layer switches to batch statistics and
-    starts overwriting its ImageNet moving averages with batches of 32; in the
-    2026-09 runs that dropped DenseNet121 and EfficientNet training accuracy at
-    the start of Phase 2, which then ended with a higher validation loss than
-    Phase 1. Keeping
-    those layers frozen (the Keras fine-tuning guidance) avoids it.
+    starts overwriting the moving averages it loaded with batches of 32, which
+    dropped DenseNet121 and EfficientNet accuracy at the start of Phase 2.
+    Keeping those layers frozen (the Keras fine-tuning guidance) avoids it.
     """
     base.trainable = True
     top = base.layers[-count:] if 0 < count < len(base.layers) else base.layers
@@ -401,12 +460,16 @@ def run_training(
     model_dir: str,
     train_dir: str,
     val_dir: str | None = None,
+    test_dir: str | None = None,
 ) -> bool:
-    """Entire training loop, identical across all three trainer scripts.
+    """Entire training loop, identical across all trainer scripts.
 
     `model_builder` takes (learning_rate, weights_path) -> (model, base_model).
-    The trainer script only provides this function - everything else is
-    orchestrated here.
+    A base model (returned only when your own backbone weights were loaded)
+    means two-phase fine-tuning; None means one phase with every layer
+    trainable. The trainer script
+    only provides this function - everything else is orchestrated here. With a
+    test channel the trained model is also scored (`evaluate_splits`).
     """
     if not model_dir:
         logger.error("model_dir is required")
@@ -438,39 +501,63 @@ def run_training(
     tf.keras.mixed_precision.set_global_policy("float32")
 
     model_cfg = CONFIG["models"][model_name]
-    weights_path = resolve_weights_path(model_name)
-
-    # model_builder returns (compiled_model, base_model). The base model is the
-    # pre-trained backbone whose layers we freeze in Phase 1 and selectively
-    # unfreeze in Phase 2.
+    try:
+        weights_path = resolve_weights_path(model_name)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return False
+    logger.info(
+        "%s: %s",
+        model_name,
+        f"loading backbone weights from {weights_path}" if weights_path else "random init",
+    )
+    # model_builder returns (model, base_model). The base model is the backbone
+    # frozen in Phase 1 and partly unfrozen in Phase 2; None (no weights
+    # loaded) trains every layer in one phase.
     model, base = model_builder(learning_rate, weights_path)
 
     input_size = model_cfg["input_size"][0]
     train_gen, val_gen = build_data_generators(train_dir, input_size, val_dir)
     class_weight = compute_class_weight(train_gen.classes)
-    logger.info("Class weights (benign=0, malignant=1): %s", class_weight)
+    logger.info("Class weights (label order %s): %s", list(train_gen.class_indices), class_weight)
 
     callbacks = build_callbacks()
     initial_epoch = resume_or_new(model)
 
-    history = run_two_phase_fit(
-        model=model,
-        base=base,
-        model_name=model_name,
-        train_gen=train_gen,
-        val_gen=val_gen,
-        callbacks=callbacks,
-        learning_rate=learning_rate,
-        epochs=epochs,
-        initial_epoch=initial_epoch,
-        phase2_unfreeze_layers=model_cfg["phase2_unfreeze_layers"],
-        class_weight=class_weight,
-    )
+    if base is None:
+        history = run_single_phase_fit(
+            model=model,
+            model_name=model_name,
+            train_gen=train_gen,
+            val_gen=val_gen,
+            callbacks=callbacks,
+            learning_rate=learning_rate,
+            epochs=epochs,
+            initial_epoch=initial_epoch,
+            class_weight=class_weight,
+        )
+    else:
+        history = run_two_phase_fit(
+            model=model,
+            base=base,
+            model_name=model_name,
+            train_gen=train_gen,
+            val_gen=val_gen,
+            callbacks=callbacks,
+            learning_rate=learning_rate,
+            epochs=epochs,
+            initial_epoch=initial_epoch,
+            phase2_unfreeze_layers=model_cfg["phase2_unfreeze_layers"],
+            class_weight=class_weight,
+        )
 
     tar_path, history_dict = save_and_package(model, model_dir, model_name, history)
 
     if not validate_outputs(model_dir, model_name):
         return False
+
+    if test_dir and val_dir and validate_training_dir(test_dir):
+        evaluate_splits(model, val_dir, test_dir, input_size, model_dir)
 
     # Single metric emission path (no duplicate in-band Keras callback).
     send_training_metrics_to_cloudwatch(model_name, history_dict)
@@ -517,7 +604,12 @@ def parse_common_args():
     parser.add_argument(
         "--validation",
         default=os.environ.get("SM_CHANNEL_VALIDATION"),
-        help="Optional validation channel (patient-grouped split from preprocessing)",
+        help="Optional validation channel (group split from preprocessing)",
+    )
+    parser.add_argument(
+        "--test",
+        default=os.environ.get("SM_CHANNEL_TEST"),
+        help="Optional test channel; when given, the trained model is scored on it",
     )
     args, _ = parser.parse_known_args()
     return args
@@ -531,8 +623,12 @@ def trainer_main(model_name: str, model_builder: Callable) -> None:
     )
     args = parse_common_args()
     try:
-        ok = run_training(model_name, model_builder, args.model_dir, args.train, args.validation)
+        ok = run_training(
+            model_name, model_builder, args.model_dir, args.train, args.validation, args.test
+        )
         sys.exit(0 if ok else 1)
     except Exception as exc:
+        # Top-level boundary of the training job: log the traceback and exit
+        # non-zero so SageMaker marks the job failed.
         logger.error("%s training script failed: %s", model_name, exc, exc_info=True)
         sys.exit(1)

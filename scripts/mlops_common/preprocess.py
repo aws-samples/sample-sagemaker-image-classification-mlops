@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
-from .constants import IMAGENET_MEAN, IMAGENET_STD
+from .constants import CHANNEL_MEAN, CHANNEL_STD
 
 STORAGE_SIZE = 512
 MODEL_INPUT_SIZE = 224
@@ -27,8 +27,8 @@ MODEL_RESAMPLE = Image.Resampling.BILINEAR
 # Keras load_img maps "bilinear" to PIL BILINEAR, the same filter as MODEL_RESAMPLE.
 KERAS_INTERPOLATION = "bilinear"
 
-_MEAN = np.asarray(IMAGENET_MEAN, dtype=np.float32)
-_STD = np.asarray(IMAGENET_STD, dtype=np.float32)
+_MEAN = np.asarray(CHANNEL_MEAN, dtype=np.float32)
+_STD = np.asarray(CHANNEL_STD, dtype=np.float32)
 
 
 def standardize(img: Image.Image, size: int = STORAGE_SIZE) -> Image.Image:

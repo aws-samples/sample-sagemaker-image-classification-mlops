@@ -40,6 +40,7 @@ resource "aws_lambda_permission" "allow_eventbridge" {
 # IAM role for auto-deployment Lambda
 resource "aws_iam_role" "auto_deploy_lambda_role" {
   name                 = "${var.project_name}-auto-deploy-lambda-role"
+  description          = "Execution role for the ${var.project_name} Lambda function that deploys newly approved model packages"
   permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
@@ -151,6 +152,7 @@ resource "aws_iam_role_policy" "auto_deploy_lambda_policy" {
       },
       # X-Ray tracing - required when tracing_config.mode = "Active".
       {
+        # X-Ray trace writes support only "*".
         Effect = "Allow"
         Action = [
           "xray:PutTraceSegments",
@@ -233,6 +235,21 @@ resource "aws_sqs_queue" "dlq" {
   tags = var.tags
 }
 
+resource "aws_sqs_queue_policy" "dlq" {
+  queue_url = aws_sqs_queue.dlq.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "sqs:*"
+      Resource  = aws_sqs_queue.dlq.arn
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }]
+  })
+}
+
 # CloudWatch alarm on DLQ depth > 0 - anything in the DLQ means an approval
 # event was lost and needs operator attention.
 resource "aws_cloudwatch_metric_alarm" "dlq_visible" {
@@ -309,6 +326,8 @@ resource "aws_lambda_function" "auto_deploy" {
       SERVERLESS_MAX_CONCURRENCY = tostring(var.serverless_max_concurrency)
       # Production variant size; canary and linear shifting need at least 2.
       INITIAL_INSTANCE_COUNT = tostring(var.endpoint_initial_instance_count)
+      # Models are created with network isolation, like the Terraform model.
+      ENABLE_NETWORK_ISOLATION = tostring(var.enable_network_isolation)
       # Blue/green policy sent with UpdateEndpoint (canary or linear traffic
       # shifting plus the auto-rollback alarms). Empty = retain the last one.
       DEPLOYMENT_CONFIG = var.deployment_config_json

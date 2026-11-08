@@ -21,6 +21,7 @@ import os
 import sys
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 # Configure logging
 logging.basicConfig(
@@ -91,7 +92,7 @@ def verify_model_registry(model_package_group_name: str) -> dict | None:
         metadata = model_details.get("CustomerMetadataProperties", {})
         logger.info(f"Model approval status: {model_details['ModelApprovalStatus']}")
         if metadata.get("ModelRole") == "placeholder-baseline":
-            logger.warning("Latest approved model is the placeholder baseline, not a medical model")
+            logger.warning("Latest approved model is the placeholder baseline, not a trained model")
         else:
             logger.info("Latest approved model is a pipeline-trained model")
 
@@ -108,7 +109,7 @@ def verify_model_registry(model_package_group_name: str) -> dict | None:
     except sagemaker_client.exceptions.ResourceNotFound:
         logger.error(f"Model package group '{model_package_group_name}' not found")
         return None
-    except Exception as e:
+    except (ClientError, BotoCoreError, KeyError, IndexError) as e:
         logger.error(f"Failed to verify Model Registry: {e}", exc_info=True)
         return None
 
@@ -152,7 +153,7 @@ def verify_s3_artifacts(model_data_url: str) -> bool:
     except s3_client.exceptions.NoSuchBucket:
         logger.error(f"S3 bucket not found: {bucket}")
         return False
-    except Exception as e:
+    except (ClientError, BotoCoreError, ValueError) as e:
         logger.error(f"Failed to verify S3 artifacts: {e}", exc_info=True)
         return False
 
@@ -229,6 +230,7 @@ def main():
         logger.warning("\nVerification interrupted by user")
         sys.exit(1)
     except Exception as e:
+        # Top-level boundary of the script: log the traceback and exit non-zero.
         logger.error(f"\nVerification failed: {e}", exc_info=True)
         sys.exit(1)
 

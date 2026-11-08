@@ -4,7 +4,7 @@
 variable "project_name" {
   description = "Name of the project"
   type        = string
-  default     = "medical-image-classification"
+  default     = "image-classification"
 }
 
 variable "environment" {
@@ -105,9 +105,9 @@ variable "dlc_account_id" {
 }
 
 variable "inference_image_tag" {
-  description = "DLC tensorflow-inference tag. Use the floating major.minor tag (no -v1.X suffix) to auto-pick up AWS patches."
+  description = "DLC tensorflow-inference tag. Use the floating major.minor tag (no -v1.X suffix) to auto-pick up AWS patches, and keep it equal to sagemaker_images.tensorflow_inference_tag in stack-training."
   type        = string
-  default     = "2.19.0-cpu-py312-ubuntu22.04-sagemaker"
+  default     = "2.20-cpu-py312-amzn2023-sagemaker"
 }
 
 ################################################################################
@@ -115,7 +115,7 @@ variable "inference_image_tag" {
 ################################################################################
 
 variable "require_manual_approval" {
-  description = "Insert a manual approval action before the Inference-Deploy stage. Strongly recommended for medical ML: a human must review the model card + drift metrics before a new model reaches prod."
+  description = "Insert a manual approval action before the Inference-Deploy stage, so a person reviews the model card and drift metrics before a new model reaches the endpoint."
   type        = bool
   default     = true
 }
@@ -124,4 +124,24 @@ variable "approval_notification_emails" {
   description = "Email addresses to notify when the pipeline pauses at the manual approval gate. Subscribers must confirm the SNS subscription after the first apply."
   type        = list(string)
   default     = []
+}
+
+################################################################################
+# Logs
+################################################################################
+
+variable "log_retention_days" {
+  description = "Days the CodeBuild log groups keep the build logs. They are encrypted with the state key, whose policy (stack-backend-setup) admits CloudWatch Logs for /aws/codebuild/<project_name>-* log groups."
+  type        = number
+  default     = 365
+}
+
+################################################################################
+# Teardown
+################################################################################
+
+variable "force_destroy_buckets" {
+  description = "Let terraform destroy delete the CodePipeline artifacts bucket with its objects and versions (build artifacts only). True by default so the stack tears down in one step."
+  type        = bool
+  default     = true
 }

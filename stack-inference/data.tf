@@ -23,22 +23,23 @@ data "aws_sagemaker_prebuilt_ecr_image" "monitoring_jobs" {
 }
 
 # Pillow + numpy layer for the inference Lambda. The zip is not committed: it
-# is built at apply time by ops-scripts/build_lambda_layer.sh (pinned versions,
-# manylinux wheels for the Lambda runtime) unless it is already present, for
-# example from the CI/CD pre_build step. Delete the zip to force a rebuild.
-# The runner needs bash, zip and uv or pip.
+# is built by ops-scripts/build_lambda_layer.sh (pinned versions, manylinux
+# wheels for the Lambda runtime). The apply builds it on the first deploy and
+# again whenever the script changes, so a version bump always reaches the
+# layer. The runner needs bash, zip and uv or pip.
 locals {
   pillow_layer_zip    = "${path.module}/lambda-layers/pillow-numpy-layer.zip"
   pillow_layer_script = "${path.module}/../ops-scripts/build_lambda_layer.sh"
 }
 
 resource "terraform_data" "pillow_layer_build" {
-  # A change to the build script (pinned versions) replaces the layer.
+  # A change to the build script (pinned versions) rebuilds the zip, even
+  # when an older one exists, and replaces the layer.
   triggers_replace = [filesha256(local.pillow_layer_script)]
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = "[ -f '${local.pillow_layer_zip}' ] || bash '${local.pillow_layer_script}'"
+    command     = "bash '${local.pillow_layer_script}'"
   }
 }
 
@@ -81,7 +82,6 @@ locals {
   # Browser origin allowed to call the API: the CloudFront frontend.
   frontend_origin = module.frontend_hosting.cloudfront_url
 
-  # Lambda configurations
   lambda_configs = {
     inference_api = {
       filename    = "lambda/inference_api.zip"
@@ -104,12 +104,15 @@ locals {
         FLOW_DEFINITION_ARN = var.enable_human_review ? module.a2i_review[0].flow_definition_arn : ""
         # Bedrock guardrail applied to the hybrid FM reasoning output (empty = none).
         BEDROCK_GUARDRAIL_ID      = var.enable_bedrock_hybrid_inference ? aws_bedrock_guardrail.hybrid[0].guardrail_id : ""
-        BEDROCK_GUARDRAIL_VERSION = var.enable_bedrock_hybrid_inference ? aws_bedrock_guardrail.hybrid[0].version : ""
+        BEDROCK_GUARDRAIL_VERSION = var.enable_bedrock_hybrid_inference ? aws_bedrock_guardrail_version.hybrid[0].version : ""
         # Opt-in per-request explanations, computed on the endpoint. The caps
         # are set here, not by the caller, because they bound endpoint compute.
         EXPLANATIONS_ENABLED   = tostring(var.enable_request_explanations)
         EXPLAIN_MAX_EVALS      = tostring(var.explanation_max_evaluations)
         EXPLAIN_TIME_BUDGET_MS = tostring(var.explanation_time_budget_ms)
+        # Border check on the Grad-CAM heatmap of an explained prediction.
+        GRADCAM_BORDER_BAND      = tostring(var.gradcam_border_band)
+        GRADCAM_BORDER_THRESHOLD = tostring(var.gradcam_border_threshold)
       }
     }
     endpoint_refresher = {
@@ -122,6 +125,10 @@ locals {
         # Same blue/green policy the auto-deploy Lambda sends (canary by
         # default), so the weekly roll is also guarded by the rollback alarms.
         DEPLOYMENT_CONFIG = module.sagemaker_endpoint.deployment_config_json
+        # Repins the endpoint to the newest patched image at each roll, so an
+        # image rebuilt during the week is live by the next refresh.
+        PATCHED_IMAGE_REPOSITORY     = "${var.project_name}-inference-patched"
+        PATCHED_IMAGE_REPOSITORY_URL = module.patched_inference_image.repository_url
       }
     }
   }
@@ -204,8 +211,8 @@ locals {
         properties = {
           metrics = [
             ["${var.project_name}/ModelPerformance", "TotalPredictions"],
-            [".", "BenignPredictions"],
-            [".", "MalignantPredictions"],
+            [".", "PositivePredictions"],
+            [".", "NegativePredictions"],
             [".", "PredictionConfidence"],
             [".", "PredictionError"]
           ]

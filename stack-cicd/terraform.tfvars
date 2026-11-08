@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 
 # General
-project_name = "medical-image-classification"
+project_name = "image-classification"
 environment  = "dev"
 aws_region   = "us-east-1"
 
@@ -19,12 +19,9 @@ github_owner  = "your-github-org"
 github_repo   = "your-repo"
 github_branch = "main"
 
-# SageMaker: the Model Package Group defaults to <project_name>-model-package-group (stack-training output
-# model_package_group_name); set it only if you changed that name.
-# model_package_group_name = "medical-image-classification-model-package-group"
+# model_package_group_name defaults to <project_name>-model-package-group;
+# set it only if you changed that name in stack-training.
 
-# Manual approval: require a human to review before the inference deploy.
-# Strongly recommended for medical ML. Set require_manual_approval = false
-# in dev/test environments where fully auto-deploy is acceptable.
+# A person approves before every inference deploy; set false only in dev/test.
 require_manual_approval      = true
 approval_notification_emails = [] # e.g., ["ml-oncall@example.com"]

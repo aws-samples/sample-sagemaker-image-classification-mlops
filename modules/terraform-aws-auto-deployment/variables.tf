@@ -146,7 +146,7 @@ variable "sns_topic_arn" {
 variable "log_retention_days" {
   description = "CloudWatch log retention in days for the auto-deployment Lambda"
   type        = number
-  default     = 14
+  default     = 365
 }
 
 variable "log_kms_key_arn" {
@@ -181,4 +181,10 @@ variable "volume_kms_key_arn" {
   description = "KMS key ARN for the ML storage volume of the endpoint configs the Lambda creates (real-time mode). Null leaves the volume on the SageMaker default key."
   type        = string
   default     = null
+}
+
+variable "enable_network_isolation" {
+  description = "Create the models it deploys with network isolation (no outbound network from the inference container). Passed to the Lambda as ENABLE_NETWORK_ISOLATION."
+  type        = bool
+  default     = true
 }

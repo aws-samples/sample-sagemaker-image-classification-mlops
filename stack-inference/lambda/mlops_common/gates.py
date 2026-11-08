@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Binary metrics, decision-threshold selection and the clinical quality gate.
+"""Binary metrics, decision-threshold selection and the quality gate.
 
 Threshold selection and gate scoring must use different data: the threshold is
 tuned on the validation split and the gate is scored on the untouched test
@@ -16,20 +16,20 @@ from collections.abc import Sequence
 
 import numpy as np
 
-# Clinical minimums the ensemble must clear on the test split. Recall has the
-# highest bar because a missed malignant case is the costly error. The pipeline
-# passes Terraform's clinical_quality_gate in CLINICAL_QUALITY_GATE, so the
-# threshold search and the Condition step use the same values; these defaults
-# apply only when the variable is absent (local runs and tests).
+# Minimums the ensemble must clear on the test split. Recall (of the positive
+# class) has the highest bar, for use cases where a missed positive is the
+# costly error. The pipeline passes Terraform's quality_gate in QUALITY_GATE, so
+# the threshold search and the Condition step use the same values; these
+# defaults apply only when the variable is absent (local runs and tests).
 _DEFAULT_THRESHOLDS = {
     "accuracy": 0.85,
     "recall": 0.95,
     "auc_roc": 0.90,
     "precision": 0.80,
 }
-CLINICAL_QUALITY_THRESHOLDS = {
+QUALITY_THRESHOLDS = {
     **_DEFAULT_THRESHOLDS,
-    **{k: float(v) for k, v in json.loads(os.environ.get("CLINICAL_QUALITY_GATE") or "{}").items()},
+    **{k: float(v) for k, v in json.loads(os.environ.get("QUALITY_GATE") or "{}").items()},
 }
 
 THRESHOLD_GRID = np.round(np.linspace(0.05, 0.95, 91), 2)
@@ -50,7 +50,7 @@ def _ratio(num: int, den: int) -> float:
 def binary_metrics(y_true: Sequence[int], scores: Sequence[float], threshold: float) -> dict:
     """Accuracy, precision, recall, F1, balanced accuracy and AUC at threshold.
 
-    A score >= threshold is a malignant call. ``auc_roc`` is None when the
+    A score >= threshold is a positive call. ``auc_roc`` is None when the
     labels hold a single class (AUC is undefined there).
     """
     y_true = np.asarray(y_true, dtype=int)
@@ -115,10 +115,10 @@ def select_threshold(
     return float(best["threshold"]), info
 
 
-def evaluate_clinical_quality(
+def evaluate_quality(
     metrics: dict[str, float | None], thresholds: dict[str, float]
 ) -> tuple[bool, dict]:
-    """Gate metrics against clinical minimums.
+    """Gate metrics against minimums.
 
     Returns (passed, results). A metric missing from ``metrics`` (or None)
     counts as 0.0 and fails rather than crashing.
@@ -139,17 +139,17 @@ def evaluate_clinical_quality(
     return passed, results
 
 
-def clinical_gate(test_metrics: dict, thresholds: dict[str, float] | None = None) -> dict:
-    """Clinical gate on TEST metrics from ``binary_metrics``.
+def quality_gate(test_metrics: dict, thresholds: dict[str, float] | None = None) -> dict:
+    """Quality gate on TEST metrics from ``binary_metrics``.
 
     AUC is dropped from the gate (and recorded as unavailable) only when it is
     undefined because the test split holds one class.
     """
-    gate_thresholds = dict(thresholds or CLINICAL_QUALITY_THRESHOLDS)
+    gate_thresholds = dict(thresholds or QUALITY_THRESHOLDS)
     auc_available = test_metrics.get("auc_roc") is not None
     if not auc_available:
         gate_thresholds.pop("auc_roc", None)
-    passed, results = evaluate_clinical_quality(test_metrics, gate_thresholds)
+    passed, results = evaluate_quality(test_metrics, gate_thresholds)
     return {
         "passed": passed,
         "scored_on": "test",

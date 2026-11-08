@@ -59,6 +59,12 @@ variable "enable_ssl_enforcement" {
   default     = true
 }
 
+variable "policy_statements" {
+  description = "Extra bucket policy statements (IAM policy statement objects) added after the TLS deny in the policy that enable_ssl_enforcement attaches, for example a service principal's write grant."
+  type        = any
+  default     = []
+}
+
 ################################################################################
 # EventBridge
 ################################################################################
@@ -117,6 +123,12 @@ variable "tags" {
 variable "logging_target_bucket" {
   description = "Name of a separate S3 bucket that receives server-access logs for this bucket. Null = no logging. The target bucket must grant PutObject to the log-delivery principal."
   type        = string
+  default     = null
+}
+
+variable "enable_access_logging" {
+  description = "Turn server access logging on or off. Null = on when logging_target_bucket is set. Set it when logging_target_bucket is a bucket created in the same apply: its name is then unknown at plan time, and the logging resource's count must be known."
+  type        = bool
   default     = null
 }
 

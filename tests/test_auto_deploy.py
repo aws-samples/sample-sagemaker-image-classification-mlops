@@ -205,3 +205,38 @@ def test_failed_update_cleans_up_model_and_config(env, stub):
     stub.add_response("delete_model", {})
     with pytest.raises(Exception, match="canary too large"):
         handler.lambda_handler(_event(), CONTEXT)
+
+
+@pytest.mark.parametrize("status", ["PendingManualApproval", "Rejected", None])
+def test_only_approved_packages_are_deployed(env, stub, status):
+    event = _event()
+    event["detail"]["ModelApprovalStatus"] = status
+    result = handler.lambda_handler(event, CONTEXT)
+    assert result["statusCode"] == 200
+    assert "not approved" in result["body"]
+
+
+@pytest.mark.parametrize(("setting", "expected"), [(None, True), ("false", False)])
+def test_model_is_created_with_network_isolation(env, stub, setting, expected):
+    if setting is None:
+        env.delenv("ENABLE_NETWORK_ISOLATION", raising=False)
+    else:
+        env.setenv("ENABLE_NETWORK_ISOLATION", setting)
+    stub.add_response(
+        "create_model",
+        {"ModelArn": f"arn:aws:sagemaker:us-east-1:{ACCOUNT}:model/m"},
+        {
+            "ModelName": ANY,
+            "Containers": [{"ModelPackageName": PACKAGE_ARN}],
+            "ExecutionRoleArn": ANY,
+            "EnableNetworkIsolation": expected,
+            "Tags": ANY,
+        },
+    )
+    stub.add_response(
+        "create_endpoint_config",
+        {"EndpointConfigArn": f"arn:aws:sagemaker:us-east-1:{ACCOUNT}:endpoint-config/c"},
+    )
+    handler._create_model_and_config(
+        PACKAGE_ARN, "example", "example-monitoring", "ml.m5.xlarge", 100
+    )

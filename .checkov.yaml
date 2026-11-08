@@ -1,21 +1,15 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 #
-# Checkov configuration for this sample.
+# Checkov configuration for this sample. Each skip is either a design decision
+# that needs something a sample cannot ship (a custom domain, a VPC for the
+# Lambdas) or a Checkov false positive where the control is implemented.
 #
-# Every skip below is a deliberate decision for a PUBLIC, single-region blog
-# demo (not a production clinical deployment), or a documented Checkov
-# false-positive where the control IS implemented but Checkov cannot resolve it
-# through a dynamic block / module boundary. Each entry states why.
-#
-# Run:  checkov -d .            (uses this file automatically)
-# The deployable code lives in modules/ and stack-*/ ; vendored provider caches
-# under **/.terraform/ are excluded.
+# Run:  checkov --config-file .checkov.yaml
 
 directory:
   - .
 
-# Do not scan vendored Terraform provider/module caches or local venvs.
 skip-path:
   - ".*/\\.terraform/.*"
 
@@ -27,91 +21,55 @@ skip-check:
   # Deliberate demo-architecture choices (documented in code)
   # ---------------------------------------------------------------------------
 
-  # The /predict + /results API defaults to authorization NONE plus an API key,
-  # usage plan and a WAF web ACL (modules/terraform-aws-api-gateway). The key
-  # meters callers but is not user authentication; set api_authorization_type
-  # to AWS_IAM or COGNITO_USER_POOLS for that. The WAF association is gated on
-  # enable_waf, which Checkov does not resolve.
-  - CKV_AWS_59     # open access to back-end resources through API
-  - CKV2_AWS_29    # public API gateway protected by WAF
+  # The CloudFront distribution serves a static page from a private bucket
+  # (origin access control); the API it calls has the regional WAF. A
+  # CloudFront web ACL must be created in us-east-1 and is billed per ACL.
   - CKV_AWS_68     # CloudFront should have WAF enabled
   - CKV2_AWS_47    # CloudFront WAFv2 WebACL with Log4j AMR
-  - CKV2_AWS_51    # API Gateway client-certificate authentication
 
-  # No VPC in this demo architecture. The inference/auto-deploy Lambdas talk to
-  # public AWS service endpoints (SageMaker, S3, Bedrock); a VPC + endpoints
-  # would add cost/complexity with no security gain for a public demo.
+  # Client certificates and a custom certificate need a custom domain name,
+  # which a sample cannot provide. (CKV_AWS_174, the TLS policy that also
+  # needs one, is skipped inline on the distribution.)
+  - CKV2_AWS_51    # API Gateway client-certificate authentication
+  - CKV2_AWS_42    # CloudFront custom SSL certificate
+
+  # The Lambdas call public AWS service endpoints; running them in a VPC
+  # needs NAT or one interface endpoint per service.
   - CKV_AWS_117    # Lambda configured inside a VPC
 
-  # Cross-region replication deliberately removed (see modules/terraform-aws-s3
-  # comment): training data is a public dataset, models are re-trainable, and
-  # CloudTrail/SBOM buckets do not need DR for a demo. Re-add for production DR.
+  # Training data is uploaded by the user and models are re-trainable; add
+  # cross-Region replication for disaster recovery in production.
   - CKV_AWS_144    # S3 cross-region replication
 
-  # CodeBuild privileged mode is required to build/patch the inference Docker
-  # image (docker-in-docker) in modules/terraform-aws-patched-inference-image.
-  - CKV_AWS_316    # CodeBuild privileged mode
-
-  # API Gateway / CloudFront caching is intentionally OFF: medical inference
-  # responses are per-image and must never be cached/served to another caller.
+  # Inference responses are per image and must never be served from a cache
+  # to another caller.
   - CKV_AWS_120    # API Gateway caching
   - CKV_AWS_225    # API Gateway method-setting caching
 
-  # CloudFront fronts a tiny static demo UI. Geo-restriction, origin failover,
-  # custom ACM cert, and a response-headers policy are production niceties not
-  # warranted for the demo (uses the default *.cloudfront.net cert).
+  # A static demo page: geo restriction and origin failover add nothing.
   - CKV_AWS_374    # CloudFront geo restriction
   - CKV_AWS_310    # CloudFront origin failover
-  - CKV2_AWS_42    # CloudFront custom SSL certificate
-  - CKV2_AWS_32    # CloudFront response-headers policy
 
-  # Training jobs run network-isolated by default (stack-training
-  # enable_network_isolation). The hosted model (aws_sagemaker_model in the
-  # endpoint module) does not set network isolation; turn it on there as a
-  # production hardening step.
-  - CKV_AWS_370    # SageMaker model network isolation
-
-  # Code-signing for Lambda is not used; functions are deployed from
-  # Terraform-built zips in a single trusted account. Adds key-management
-  # overhead with no benefit for a single-owner demo.
+  # Functions are built from this repository by Terraform in one account;
+  # code signing needs an AWS Signer profile per deployment.
   - CKV_AWS_272    # Lambda code-signing validation
 
-  # 30-day CloudWatch log retention is deliberate for a demo to control cost.
-  # HIPAA-style 1-year+ retention is achieved by shipping to a SIEM in prod;
-  # bump log_retention_days for production.
-  - CKV_AWS_338    # CloudWatch log group >= 1 year retention
-
-  # A2I human-review output uses the flow definition's default encryption; the
-  # monitoring bucket it writes to is already KMS-encrypted at the bucket level.
-  - CKV_AWS_372    # SageMaker Flow Definition KMS output config
-
-  # The SBOM bucket lifecycle does not set an abort-incomplete-multipart rule
-  # (the reusable S3 module applies one to project data buckets; the SBOM bucket
-  # is low-volume and short-lived).
-  - CKV_AWS_300    # S3 lifecycle abort failed uploads (SBOM bucket only)
-  - CKV_AWS_18     # S3 access logging (demo buckets; CloudTrail covers audit)
-  - CKV2_AWS_62    # S3 event notifications (not needed on every bucket)
+  # Only the frontend bucket has no event notifications; nothing consumes them.
+  - CKV2_AWS_62    # S3 event notifications
 
   # ---------------------------------------------------------------------------
   # Documented Checkov false-positives (control IS implemented)
   # ---------------------------------------------------------------------------
 
-  # X-Ray IS enabled: the lambda module sets a dynamic "tracing_config" block
-  # (mode=Active) gated on enable_xray_tracing, which the inference functions
-  # and the upload-quarantine function pass as true. Checkov does not resolve
-  # the dynamic block through the module.
+  # The WAF association is gated on enable_waf (default true), which Checkov
+  # does not resolve through the module.
+  - CKV2_AWS_29    # public API gateway protected by WAF
+
+  # X-Ray is on (the lambda module's dynamic tracing_config,
+  # enable_xray_tracing = true), but Checkov does not resolve it for the
+  # module instances that use count.
   - CKV_AWS_50     # Lambda X-Ray tracing
 
-  # CloudTrail IS integrated with CloudWatch Logs: cloudtrail_budgets.tf sets
-  # cloud_watch_logs_group_arn + cloud_watch_logs_role_arn. Checkov's graph
-  # check does not follow the computed ARN reference.
-  - CKV2_AWS_10    # CloudTrail integrated with CloudWatch Logs
-
-  # CloudFront viewer cert: the demo uses the default CloudFront certificate
-  # (cloudfront_default_certificate=true), which already enforces TLS 1.2+ via
-  # the managed minimum protocol version. A custom cert is a prod concern.
-  - CKV_AWS_174    # CloudFront viewer certificate TLS 1.2+
-
-  # Module sources are local paths (../modules/...), not external registry
-  # modules, so pinning a commit hash does not apply.
+  # stack-backend-setup uses Terraform Registry modules pinned by version;
+  # a commit hash applies to Git sources only.
   - CKV_TF_1       # Terraform module source commit hash

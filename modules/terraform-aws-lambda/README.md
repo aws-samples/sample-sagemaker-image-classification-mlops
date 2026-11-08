@@ -1,6 +1,6 @@
 # lambda-function
 
-Reusable Lambda function module with automatic source code packaging, configurable permissions, and layer support.
+Reusable AWS Lambda function module with automatic source code packaging, configurable permissions, and layer support.
 
 ## What It Does
 
@@ -49,7 +49,7 @@ Reusable Lambda function module with automatic source code packaging, configurab
 | environment\_variables | Environment variables for Lambda | `map(string)` | `null` | no |
 | layers | List of Lambda Layer ARNs | `list(string)` | `[]` | no |
 | log\_kms\_key\_arn | KMS key ARN to encrypt the Lambda log group (optional) | `string` | `null` | no |
-| log\_retention\_days | CloudWatch log retention in days for the Lambda log group | `number` | `14` | no |
+| log\_retention\_days | CloudWatch log retention in days for the Lambda log group | `number` | `365` | no |
 | memory\_size | Lambda memory size in MB | `number` | `512` | no |
 | permissions | Lambda permissions | <pre>map(object({<br/>    statement_id = string<br/>    action       = string<br/>    principal    = string<br/>    source_arn   = string<br/>  }))</pre> | `{}` | no |
 | reserved\_concurrent\_executions | Reserved concurrency cap for this function. -1 = use account-default unreserved concurrency. Set to a positive integer to (a) cap max concurrent executions (cost control) or (b) reserve capacity (protect critical functions). | `number` | `-1` | no |

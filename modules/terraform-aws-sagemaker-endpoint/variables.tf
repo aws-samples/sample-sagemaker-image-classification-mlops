@@ -104,7 +104,7 @@ variable "data_capture_sampling_percentage" {
 }
 
 variable "data_capture_input" {
-  description = "Also capture request payloads. Off by default: the monitoring jobs only need model output, and Input capture stores every uploaded image (potential PHI, several MB per request)."
+  description = "Also capture request payloads. Off by default: the monitoring jobs only need model output, and Input capture stores every uploaded image (possibly sensitive, several MB per request)."
   type        = bool
   default     = false
 }
@@ -115,7 +115,7 @@ variable "monitoring_bucket" {
 }
 
 variable "volume_kms_key_arn" {
-  description = "KMS key ARN used to encrypt the ML storage volume attached to real-time (instance-based) inference variants. The volume buffers the model artifact and in-flight inference data (potential PHI for a medical model), so it should use the project CMK rather than the AWS-managed default key. Ignored for serverless variants, which do not attach a volume. Null falls back to the default key."
+  description = "KMS key ARN used to encrypt the ML storage volume attached to real-time (instance-based) inference variants. The volume buffers the model artifact and in-flight inference data, so it should use the project CMK rather than the AWS-managed default key. Ignored for serverless variants, which do not attach a volume. Null falls back to the default key."
   type        = string
   default     = null
 }
@@ -248,4 +248,10 @@ variable "deployment_max_timeout" {
     condition     = var.deployment_max_timeout >= 600 && var.deployment_max_timeout <= 28800
     error_message = "deployment_max_timeout must be between 600 and 28800 seconds."
   }
+}
+
+variable "enable_network_isolation" {
+  description = "Run the inference container with network isolation. The ensemble handler only calls the local TensorFlow Serving REST API, so it needs no outbound network."
+  type        = bool
+  default     = true
 }

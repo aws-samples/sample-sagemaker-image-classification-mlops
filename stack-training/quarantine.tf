@@ -16,8 +16,9 @@ locals {
 
   # The Pillow + NumPy layer zip that stack-inference also uses, built by the
   # same script with the same pinned versions (Pillow 13.0.0 for python3.13).
-  # `make layer` builds it before `make deploy-training`; otherwise the apply
-  # builds it when missing (needs bash, zip and uv or pip).
+  # The apply builds it on the first deploy and again whenever the script
+  # changes, so a version bump always reaches the layer (needs bash, zip and
+  # uv or pip).
   quarantine_layer_zip    = "${path.module}/../stack-inference/lambda-layers/pillow-numpy-layer.zip"
   quarantine_layer_script = "${path.module}/../ops-scripts/build_lambda_layer.sh"
 
@@ -27,12 +28,13 @@ locals {
 resource "terraform_data" "quarantine_layer_build" {
   count = var.enable_upload_quarantine ? 1 : 0
 
-  # A change to the build script (pinned versions) replaces the layer.
+  # A change to the build script (pinned versions) rebuilds the zip, even
+  # when an older one exists, and replaces the layer.
   triggers_replace = [filesha256(local.quarantine_layer_script)]
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    command     = "[ -f '${local.quarantine_layer_zip}' ] || bash '${local.quarantine_layer_script}'"
+    command     = "bash '${local.quarantine_layer_script}'"
   }
 }
 
@@ -60,6 +62,23 @@ resource "aws_sqs_queue" "upload_quarantine_dlq" {
   name                      = "${local.upload_quarantine_name}-dlq"
   message_retention_seconds = 1209600 # 14 days, the SQS maximum
   kms_master_key_id         = module.kms.key_arn
+}
+
+resource "aws_sqs_queue_policy" "upload_quarantine_dlq" {
+  count = var.enable_upload_quarantine ? 1 : 0
+
+  queue_url = aws_sqs_queue.upload_quarantine_dlq[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "sqs:*"
+      Resource  = aws_sqs_queue.upload_quarantine_dlq[0].arn
+      Condition = { Bool = { "aws:SecureTransport" = "false" } }
+    }]
+  })
 }
 
 resource "aws_cloudwatch_metric_alarm" "upload_quarantine_dlq" {
@@ -116,6 +135,7 @@ module "upload_quarantine_role" {
   count  = var.enable_upload_quarantine ? 1 : 0
 
   role_name                = "${local.upload_quarantine_name}-role"
+  description              = "Execution role for the ${var.project_name} upload quarantine Lambda function"
   permissions_boundary_arn = var.permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -183,6 +203,7 @@ module "upload_quarantine_role" {
           }
         },
         {
+          # X-Ray trace writes support only "*".
           Effect   = "Allow"
           Action   = ["xray:PutTraceSegments", "xray:PutTelemetryRecords"]
           Resource = "*"
@@ -207,6 +228,7 @@ module "upload_quarantine_lambda" {
   layers              = [aws_lambda_layer_version.quarantine_pillow[0].arn]
 
   environment_variables = {
+    RAW_DATA_BUCKET   = module.s3_raw_data.bucket_id
     IMAGE_PREFIX      = var.training_data_path
     QUARANTINE_PREFIX = var.quarantine_prefix
     MARKER_KEY        = var.auto_trigger_marker_key

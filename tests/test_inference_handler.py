@@ -136,10 +136,12 @@ def test_predict_200_passes_inference_id_and_stores_result(aws, caplog):
         resp = handler.lambda_handler(_post(image), _context())
     assert resp["statusCode"] == 200
     body = json.loads(resp["body"])
-    # 0.45 >= the model's own threshold 0.4, so malignant (a fixed 0.5 would say benign).
-    assert body["prediction"] == "malignant"
+    # 0.45 >= the model's own threshold 0.4, so positive (a fixed 0.5 would say negative).
+    assert body["prediction"] == "positive"
+    assert body["probabilities"] == {"negative": pytest.approx(0.55), "positive": 0.45}
     assert body["threshold_used"] == 0.4
     assert body["request_id"] == REQUEST_ID
+    assert "image_s3_uri" not in body
 
     # No image bytes or model output in the logs.
     assert image[:40] not in caplog.text
@@ -152,7 +154,9 @@ def test_predict_200_passes_inference_id_and_stores_result(aws, caplog):
         {"httpMethod": "GET", "pathParameters": {"id": REQUEST_ID}}, _context()
     )
     assert got["statusCode"] == 200
-    assert json.loads(got["body"])["prediction"] == "malignant"
+    stored = json.loads(got["body"])
+    assert stored["prediction"] == "positive"
+    assert "image_s3_uri" not in stored
 
 
 def test_no_cors_header_without_allowed_origin(aws):
@@ -180,6 +184,7 @@ BASE_KEYS = {
     "prediction",
     "confidence",
     "probabilities",
+    "positive_class",
     "threshold_used",
     "model_info",
     "routing",
@@ -277,3 +282,186 @@ def test_explanations_are_stored_with_the_prediction(runtime, aws):
         ].read()
     )
     assert stored["explanations"] == EXPLANATIONS
+
+
+# --- Grad-CAM border check --------------------------------------------------
+
+
+def _grid(cells, size=14):
+    """A size x size Grad-CAM grid with 1.0 at the given (row, col) cells."""
+    return [[1.0 if (r, c) in cells else 0.0 for c in range(size)] for r in range(size)]
+
+
+RING = {(r, c) for r in range(14) for c in range(14) if min(r, c, 13 - r, 13 - c) == 0}
+CENTRE = {(r, c) for r in range(5, 9) for c in range(5, 9)}
+
+
+def _explained(runtime, grid):
+    runtime.answer["explanations"] = {
+        "gradcam": {"method": "grad-cam", "grid_size": len(grid), "grid": grid},
+        "explain_ms": 300,
+    }
+    resp = handler.lambda_handler(_post_json({"image": _jpeg_b64(), "explain": True}), _context())
+    assert resp["statusCode"] == 200
+    return json.loads(resp["body"])
+
+
+def test_border_attention_counts_the_outer_band():
+    # With a 14x14 grid and a 10 percent band, only the outermost ring is border.
+    assert handler.border_attention({"grid": _grid(RING)}, 0.1) == 1.0
+    assert handler.border_attention({"grid": _grid(CENTRE)}, 0.1) == 0.0
+    half = {(0, 0), (7, 7)}
+    assert handler.border_attention({"grid": _grid(half)}, 0.1) == 0.5
+
+
+@pytest.mark.parametrize(
+    "gradcam",
+    [
+        None,
+        {"status": "unavailable"},
+        {"grid": []},
+        {"grid": [[1.0, 0.0]]},
+        {"grid": [[0.0] * 14] * 14},
+        {"grid": [["x"] * 2] * 2},
+    ],
+)
+def test_border_attention_without_a_usable_grid_is_none(gradcam):
+    assert handler.border_attention(gradcam, 0.1) is None
+
+
+def test_heatmap_on_the_border_is_flagged(runtime):
+    body = _explained(runtime, _grid(RING))
+    assert body["attention_on_border"] is True
+    assert body["border_attention_fraction"] == 1.0
+    assert set(body) == BASE_KEYS | {
+        "explanations",
+        "attention_on_border",
+        "border_attention_fraction",
+    }
+
+
+def test_heatmap_on_the_subject_is_not_flagged(runtime):
+    body = _explained(runtime, _grid(CENTRE))
+    assert body["attention_on_border"] is False
+    assert body["border_attention_fraction"] == 0.0
+
+
+def test_border_band_and_threshold_come_from_the_environment(runtime, monkeypatch):
+    # Second ring in, so border only with a band wider than one cell.
+    inner_ring = {
+        (r, c) for r in range(1, 13) for c in range(1, 13) if min(r, c, 13 - r, 13 - c) == 1
+    }
+    assert _explained(runtime, _grid(inner_ring))["attention_on_border"] is False
+    monkeypatch.setenv("GRADCAM_BORDER_BAND", "0.2")
+    assert _explained(runtime, _grid(inner_ring))["attention_on_border"] is True
+    monkeypatch.setenv("GRADCAM_BORDER_THRESHOLD", "1.0")
+    assert _explained(runtime, _grid(inner_ring))["attention_on_border"] is False
+
+
+def test_no_border_flag_without_a_heatmap(runtime, monkeypatch):
+    runtime.answer["explanations"] = {"region_shapley": {"method": "x"}, "explain_ms": 300}
+    resp = handler.lambda_handler(_post_json({"image": _jpeg_b64(), "explain": True}), _context())
+    assert "attention_on_border" not in json.loads(resp["body"])
+    monkeypatch.setenv("EXPLANATIONS_ENABLED", "false")
+    resp = handler.lambda_handler(_post_json({"image": _jpeg_b64(), "explain": True}), _context())
+    assert "attention_on_border" not in json.loads(resp["body"])
+
+
+def test_border_flag_is_stored_with_the_prediction(runtime, aws):
+    _explained(runtime, _grid(RING))
+    stored = json.loads(
+        aws.s3.get_object(Bucket=BUCKET, Key=f"predictions/{REQUEST_ID}/prediction.json")[
+            "Body"
+        ].read()
+    )
+    assert stored["attention_on_border"] is True
+
+
+# --- Image checks, class names, Amazon Bedrock and stored results ---------
+
+
+def _image_b64(fmt, size=(64, 48)):
+    buf = io.BytesIO()
+    Image.new("RGB", size, (10, 20, 30)).save(buf, format=fmt)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+@pytest.mark.parametrize("fmt", ["BMP", "GIF", "TIFF"])
+def test_formats_other_than_jpeg_and_png_are_400(aws, fmt):
+    resp = handler.lambda_handler(_post(_image_b64(fmt)), _context())
+    assert resp["statusCode"] == 400
+
+
+def test_decode_rejects_bmp_before_decoding_pixels():
+    with pytest.raises(ValueError):
+        handler.decode_image(_image_b64("BMP"))
+
+
+def test_decompression_bomb_warning_is_an_error(monkeypatch):
+    monkeypatch.setattr(handler.Image, "MAX_IMAGE_PIXELS", 1000)
+    with pytest.raises(ValueError, match="oversized"):
+        handler.decode_image(_image_b64("PNG", size=(40, 40)))
+
+
+def test_class_names_come_from_the_response_then_the_environment(monkeypatch):
+    monkeypatch.delenv("CLASS_NAMES", raising=False)
+    assert handler.class_names({"class_names": ["cat", "dog"]}) == ("cat", "dog")
+    assert handler.class_names({}) == ("negative", "positive")
+    monkeypatch.setenv("CLASS_NAMES", "ok, defect")
+    assert handler.class_names({"class_names": "bad"}) == ("ok", "defect")
+
+
+def test_prediction_uses_the_class_names_and_counts_positives(runtime):
+    runtime.answer["class_names"] = ["cat", "dog"]
+    resp = handler.lambda_handler(_post_json({"image": _jpeg_b64()}), _context())
+    body = json.loads(resp["body"])
+    assert body["prediction"] == "dog"
+    assert body["positive_class"] == "dog"
+    assert set(body["probabilities"]) == {"cat", "dog"}
+    names = {m["MetricName"] for m in runtime_metrics(runtime)}
+    assert "PositivePredictions" in names
+    assert "NegativePredictions" not in names
+
+
+def runtime_metrics(runtime):
+    return handler.boto3.client("cloudwatch").list_metrics(
+        Namespace="image-classification/ModelPerformance"
+    )["Metrics"]
+
+
+def test_bedrock_is_not_called_without_a_guardrail(monkeypatch):
+    calls = []
+    monkeypatch.delenv("BEDROCK_GUARDRAIL_ID", raising=False)
+    monkeypatch.delenv("BEDROCK_GUARDRAIL_VERSION", raising=False)
+    monkeypatch.setattr(handler.boto3, "client", lambda name, **_: calls.append(name))
+    assert handler.bedrock_explain(_jpeg_b64(), "JPEG", "dog", 0.55) is None
+    assert calls == []
+
+
+def test_bedrock_call_carries_the_guardrail_and_a_neutral_prompt(monkeypatch):
+    sent = {}
+
+    def invoke_model(**kwargs):
+        sent.update(kwargs)
+        text = {"output": {"message": {"content": [{"text": "looks like a dog"}]}}}
+        return {"body": io.BytesIO(json.dumps(text).encode())}
+
+    monkeypatch.setenv("BEDROCK_GUARDRAIL_ID", "gr-123")
+    monkeypatch.setenv("BEDROCK_GUARDRAIL_VERSION", "1")
+    monkeypatch.setattr(
+        handler.boto3, "client", lambda name, **_: SimpleNamespace(invoke_model=invoke_model)
+    )
+    assert handler.bedrock_explain(_jpeg_b64(), "JPEG", "dog", 0.55) == "looks like a dog"
+    assert sent["guardrailIdentifier"] == "gr-123"
+    assert sent["guardrailVersion"] == "1"
+    prompt = json.loads(sent["body"])["messages"][0]["content"][1]["text"]
+    assert "'dog'" in prompt and "human reviewer" in prompt
+
+
+def test_stored_records_from_before_never_return_the_s3_uri(aws):
+    record = {"request_id": REQUEST_ID, "prediction": "dog", "image_s3_uri": "s3://b/k"}
+    aws.s3.put_object(Bucket=BUCKET, Key=handler.result_key(REQUEST_ID), Body=json.dumps(record))
+    got = handler.lambda_handler(
+        {"httpMethod": "GET", "pathParameters": {"id": REQUEST_ID}}, _context()
+    )
+    assert "image_s3_uri" not in json.loads(got["body"])

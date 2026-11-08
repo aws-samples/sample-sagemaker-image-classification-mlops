@@ -1,10 +1,10 @@
 # cloudwatch
 
-Dual-mode CloudWatch monitoring module supporting ML training dashboards and generic observability.
+Dual-mode Amazon CloudWatch monitoring module supporting ML training dashboards and generic observability.
 
 ## What It Does
 
-1. Creates CloudWatch log groups - SageMaker-specific (training mode) or custom with optional KMS encryption (generic mode)
+1. Creates CloudWatch log groups - Amazon SageMaker AI job log groups (training mode) or custom with optional AWS KMS encryption (generic mode), kept for the configured retention (365 days by default)
 2. Creates CloudWatch metric filters to extract metrics from logs - ML training metrics (training mode) or user-defined filters (generic mode)
 3. Creates a CloudWatch dashboard - auto-generated ML training dashboard (training mode) or custom JSON dashboard (generic mode)
 4. Training mode generates metric filters for data processing, training accuracy/loss/precision/recall, evaluation summary, ensemble performance, and model registry metrics
@@ -50,8 +50,8 @@ Dual-mode CloudWatch monitoring module supporting ML training dashboards and gen
 | enable\_training\_monitoring | Enable ML training monitoring (uses hardcoded ML metrics) | `bool` | `false` | no |
 | kms\_key\_arn | KMS key ARN for log group encryption (generic mode only) | `string` | `null` | no |
 | log\_group\_names | Log group names for metric filters (only used when enable\_training\_monitoring = true) | `map(string)` | `{}` | no |
-| log\_groups | Map of log groups to create (generic mode only) | <pre>map(object({<br/>    name              = string<br/>    retention_in_days = optional(number, 14)<br/>  }))</pre> | `{}` | no |
-| log\_retention\_days | Default CloudWatch log retention in days (generic mode only) | `number` | `14` | no |
+| log\_groups | Map of log groups to create (generic mode only) | <pre>map(object({<br/>    name              = string<br/>    retention_in_days = optional(number)<br/>  }))</pre> | `{}` | no |
+| log\_retention\_days | CloudWatch log retention in days for the log groups this module creates (a generic log group can set its own). | `number` | `365` | no |
 | metric\_filters | Map of metric filters to create (generic mode only) | <pre>map(object({<br/>    log_group_name = string<br/>    pattern        = string<br/>    metric_transformation = object({<br/>      name      = string<br/>      namespace = string<br/>      value     = string<br/>      unit      = optional(string, "None")<br/>    })<br/>  }))</pre> | `{}` | no |
 | metric\_namespaces | Metric namespaces for CloudWatch metrics (only used when enable\_training\_monitoring = true) | `map(string)` | `{}` | no |
 | tags | Resource tags | `map(string)` | `{}` | no |

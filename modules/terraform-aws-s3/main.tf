@@ -71,9 +71,10 @@ resource "aws_s3_bucket_public_access_block" "this" {
 #
 # Deny every S3 action over plaintext HTTP. Without this, data-in-transit to
 # buckets holding training data, model artifacts, CI/CD artifacts, and
-# inference results can occur unencrypted. Disabled for buckets whose full
-# policy is managed by the caller (see var.enable_ssl_enforcement) to avoid
-# two aws_s3_bucket_policy resources targeting the same bucket.
+# inference results can occur unencrypted. var.policy_statements adds the
+# caller's grants to the same policy. Disabled for buckets whose full policy
+# is managed by the caller (see var.enable_ssl_enforcement) to avoid two
+# aws_s3_bucket_policy resources targeting the same bucket.
 
 resource "aws_s3_bucket_policy" "ssl_only" {
   count  = var.enable_ssl_enforcement ? 1 : 0
@@ -83,7 +84,7 @@ resource "aws_s3_bucket_policy" "ssl_only" {
   # kics-scan ignore-line
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid       = "DenyInsecureTransport"
         Effect    = "Deny"
@@ -97,7 +98,7 @@ resource "aws_s3_bucket_policy" "ssl_only" {
           Bool = { "aws:SecureTransport" = "false" }
         }
       }
-    ]
+    ], var.policy_statements)
   })
 
   # The public-access-block (block_public_policy = true) must exist before we
@@ -129,30 +130,22 @@ resource "aws_s3_bucket_notification" "eventbridge" {
 resource "aws_s3_bucket_lifecycle_configuration" "this" {
   bucket = aws_s3_bucket.this.id
 
-  # Always-on baseline: abort stale multipart uploads.
-  rule {
-    id     = "abort-incomplete-multipart-uploads"
-    status = "Enabled"
-
-    filter {}
-
-    abort_incomplete_multipart_upload {
-      days_after_initiation = var.abort_incomplete_multipart_days
-    }
-  }
-
   dynamic "rule" {
-    for_each = var.lifecycle_rules
+    for_each = concat([{
+      id                              = "abort-incomplete-multipart-uploads"
+      status                          = "Enabled"
+      prefix                          = null
+      noncurrent_version_days         = null
+      expiration_days                 = null
+      abort_incomplete_multipart_days = var.abort_incomplete_multipart_days
+    }], var.lifecycle_rules)
     content {
       id     = rule.value.id
       status = rule.value.status
 
-      # Apply to all objects unless the caller provides a prefix filter.
-      dynamic "filter" {
-        for_each = rule.value.prefix != null ? [1] : []
-        content {
-          prefix = rule.value.prefix
-        }
+      # A null prefix applies the rule to all objects.
+      filter {
+        prefix = rule.value.prefix
       }
 
       dynamic "noncurrent_version_expiration" {
@@ -193,7 +186,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
 # where the log volume would dominate cost.
 
 resource "aws_s3_bucket_logging" "this" {
-  count = var.logging_target_bucket != null ? 1 : 0
+  count = (var.enable_access_logging != null ? var.enable_access_logging : var.logging_target_bucket != null) ? 1 : 0
 
   bucket        = aws_s3_bucket.this.id
   target_bucket = var.logging_target_bucket

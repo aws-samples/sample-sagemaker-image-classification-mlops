@@ -22,12 +22,12 @@ import numpy as np
 # The step's code directory holds mlops_common next to this file; a local
 # checkout has it one level up, in scripts/.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mlops_common.breakhis import magnification
+from mlops_common.dataset_layout import SUBGROUP_ATTRIBUTE, load_classes, read_manifest, subgroups
 from mlops_common.datasets import list_labeled_images, predict_scores
 from mlops_common.gates import (
-    CLINICAL_QUALITY_THRESHOLDS,
+    QUALITY_THRESHOLDS,
     binary_metrics,
-    clinical_gate,
+    quality_gate,
     select_threshold,
 )
 from mlops_common.preprocess import MODEL_INPUT_SIZE
@@ -82,7 +82,7 @@ def evaluate_single_model(model_name, model_path, val_items, test_items, input_s
         test_labels = [label for _, label in test_items]
 
         threshold, selection = select_threshold(
-            val_labels, val_scores, min_recall=CLINICAL_QUALITY_THRESHOLDS["recall"]
+            val_labels, val_scores, min_recall=QUALITY_THRESHOLDS["recall"]
         )
         test_metrics = binary_metrics(test_labels, test_scores, threshold)
         result = {
@@ -97,7 +97,8 @@ def evaluate_single_model(model_name, model_path, val_items, test_items, input_s
             "model_path": model_file,
         }
         return result, test_scores
-    except Exception as e:
+    except (OSError, ValueError, RuntimeError, tf.errors.OpError) as e:
+        logger.warning("Evaluating %s failed: %s", model_name, type(e).__name__)
         return _failed(sanitize_for_log(str(e))), None
 
 
@@ -125,6 +126,8 @@ def evaluate_models(models_path, data_path, validation_dir, output_path):
 
     test_labels = [label for _, label in test_items]
     test_filenames = [os.path.relpath(p, data_path) for p, _ in test_items]
+    negative, positive = load_classes(data_path)
+    test_subgroups = subgroups(test_filenames, read_manifest(data_path), SUBGROUP_ATTRIBUTE)
 
     evaluation_results = {}
     predictions_data = {}
@@ -175,7 +178,7 @@ def evaluate_models(models_path, data_path, validation_dir, output_path):
 
     # Informational only: the registration gate is scored on the ensemble in
     # scripts/ensemble/ensemble_creator.py.
-    gate = clinical_gate(
+    gate = quality_gate(
         {
             "accuracy": avg_accuracy,
             "recall": avg_recall,
@@ -183,9 +186,9 @@ def evaluate_models(models_path, data_path, validation_dir, output_path):
             "auc_roc": avg_auc,
         }
     )
-    evaluation_results["clinical_quality_gate"] = gate
+    evaluation_results["quality_gate"] = gate
     logger.info(
-        "Mean single-model clinical gate on test: %s", "PASSED" if gate["passed"] else "FAILED"
+        "Mean single-model quality gate on test: %s", "PASSED" if gate["passed"] else "FAILED"
     )
 
     try:
@@ -199,20 +202,21 @@ def evaluate_models(models_path, data_path, validation_dir, output_path):
                 "recall": avg_recall,
                 "f1_score": avg_f1,
                 "auc": avg_auc or 0.0,
-                "clinical_quality_gate": gate,
+                "quality_gate": gate,
                 "num_samples": len(test_labels),
                 "class_distribution": {
-                    "benign": int(test_labels.count(0)),
-                    "malignant": int(test_labels.count(1)),
+                    negative: int(test_labels.count(0)),
+                    positive: int(test_labels.count(1)),
                 },
+                "positive_class": positive,
             },
             predictions_data=predictions_data,
             true_labels=test_labels,
             decision_threshold=_mean(thresholds) if thresholds else None,
-            subgroup_labels=[magnification(f) or "unknown" for f in test_filenames],
+            subgroup_labels=test_subgroups,
         )
         logger.info("Generated all required reports for model registration")
-    except Exception as e:
+    except (ImportError, OSError, ValueError, KeyError, TypeError) as e:
         logger.warning("Failed to generate reports: %s", sanitize_for_log(str(e)))
 
     with open(safe_path_join(output_path, "evaluation_results.json"), "w") as f:
@@ -259,7 +263,7 @@ def evaluate_models(models_path, data_path, validation_dir, output_path):
             "failed_models": len(model_names) - len(successful_models),
         },
         "individual_model_performance": successful_models,
-        "clinical_quality_gate": gate,
+        "quality_gate": gate,
     }
     with open(safe_path_join(output_path, "metrics.json"), "w") as f:
         json.dump(registry_metrics, f, indent=2)
@@ -338,6 +342,7 @@ if __name__ == "__main__":
         ):
             sys.exit(1)
     except Exception as e:
+        # Top-level boundary of the step: record the failure, then exit non-zero.
         logger.error("Evaluation failed: %s", sanitize_for_log(e))
         os.makedirs(args.output_path, exist_ok=True)
         with open(safe_path_join(args.output_path, "evaluation_error.json"), "w") as f:

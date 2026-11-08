@@ -3,8 +3,9 @@
 
 """Upload quarantine: check each image as it lands in the raw-data bucket.
 
-EventBridge invokes this Lambda for every Object Created event under the
-training image prefix (IMAGE_PREFIX). The object is kept when it has an
+Amazon EventBridge invokes this Lambda for every Object Created event under the
+training image prefix (IMAGE_PREFIX) of the raw-data bucket (RAW_DATA_BUCKET;
+events for any other bucket are ignored). The object is kept when it has an
 allowed extension, opens with Pillow as the format that extension names, and
 both sides are at least MIN_IMAGE_SIZE_PX. Otherwise it is moved out of the
 training prefix: copied to QUARANTINE_PREFIX + <original key>, a
@@ -15,7 +16,8 @@ The pipeline's validation step checks the same things again, so a file that
 arrives while this Lambda is still behind is still caught before training.
 
 Environment variables:
-    IMAGE_PREFIX       Training image prefix, e.g. medical_image_data/
+    RAW_DATA_BUCKET    The only bucket whose events are acted on (required)
+    IMAGE_PREFIX       Training image prefix, e.g. images/
     QUARANTINE_PREFIX  Where failing files go, e.g. quarantine/ (outside IMAGE_PREFIX)
     MARKER_KEY         Batch-complete marker (key prefix) that starts the pipeline; never checked
     MIN_IMAGE_SIZE_PX  Minimum width and height in pixels (default 112)
@@ -29,6 +31,8 @@ import io
 import json
 import logging
 import os
+import struct
+import warnings
 from datetime import UTC, datetime
 
 import boto3
@@ -50,7 +54,8 @@ METRIC_NAME = "QuarantinedImages"
 
 def _settings() -> dict:
     return {
-        "image_prefix": os.environ.get("IMAGE_PREFIX", "medical_image_data/"),
+        "bucket": os.environ.get("RAW_DATA_BUCKET", ""),
+        "image_prefix": os.environ.get("IMAGE_PREFIX", "images/"),
         "quarantine_prefix": os.environ.get("QUARANTINE_PREFIX", "quarantine/"),
         "marker_key": os.environ.get("MARKER_KEY", ""),
         "min_size": int(os.environ.get("MIN_IMAGE_SIZE_PX", "112")),
@@ -67,15 +72,27 @@ def check_image(key: str, body: bytes, min_size: int) -> str | None:
         allowed = ", ".join(sorted(ALLOWED_FORMATS))
         return f"extension '{extension or '(none)'}' is not one of {allowed}"
     try:
-        with Image.open(io.BytesIO(body)) as img:
-            img.verify()
-        # verify() leaves the image unusable; reopen and decode the pixels so
-        # truncated files fail too.
-        with Image.open(io.BytesIO(body)) as img:
-            actual = img.format
-            img.load()
-            width, height = img.size
-    except Exception as exc:  # Pillow raises many types for malformed files
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(body)) as img:
+                img.verify()
+            # verify() leaves the image unusable; reopen and decode the pixels
+            # so truncated files fail too.
+            with Image.open(io.BytesIO(body)) as img:
+                actual = img.format
+                img.load()
+                width, height = img.size
+    # The errors Pillow's decoders raise for malformed, truncated or oversized files.
+    except (
+        OSError,
+        SyntaxError,
+        ValueError,
+        TypeError,
+        IndexError,
+        struct.error,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ) as exc:
         return f"does not open as an image: {type(exc).__name__}: {exc}"
     if actual != expected:
         return f"content is {actual}, but extension '{extension}' expects {expected}"
@@ -142,6 +159,12 @@ def lambda_handler(event, _context):
     if not bucket or not key:
         logger.error("Event has no bucket or object key")
         return {"status": "ignored", "reason": "no bucket or key"}
+    if not settings["bucket"]:
+        logger.error("RAW_DATA_BUCKET is not set; ignoring the event")
+        return {"status": "ignored", "reason": "RAW_DATA_BUCKET not set"}
+    if bucket != settings["bucket"]:
+        logger.error("Ignoring an event for bucket %s (expected %s)", bucket, settings["bucket"])
+        return {"status": "ignored", "reason": "unexpected bucket"}
     if (
         not key.startswith(settings["image_prefix"])
         or key.startswith(settings["quarantine_prefix"])

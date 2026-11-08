@@ -28,8 +28,8 @@ def test_psi_known_two_bin_value():
 
 def test_psi_detects_a_large_shift():
     rng = np.random.default_rng(0)
-    baseline = rng.beta(2, 5, 5000).tolist()  # mostly benign scores
-    live = rng.beta(5, 2, 5000).tolist()  # mostly malignant scores
+    baseline = rng.beta(2, 5, 5000).tolist()  # mostly low (negative) scores
+    live = rng.beta(5, 2, 5000).tolist()  # mostly high (positive) scores
     assert drift.population_stability_index(live, baseline, 10) > 0.2
 
 

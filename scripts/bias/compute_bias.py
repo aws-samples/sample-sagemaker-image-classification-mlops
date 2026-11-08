@@ -2,7 +2,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Fairness gate on the deployed ensemble (Part 4), with Fairlearn.
+"""Fairness gate on the deployed ensemble, with Fairlearn.
 
 Reads ``predictions.json`` written by the ensemble step: the ensemble's test
 scores, labels, the validation-tuned decision threshold and one sensitive
@@ -10,24 +10,31 @@ attribute value per image. Predictions are made at that threshold, so the gate
 scores exactly the model that would be registered and deployed.
 
 Writes ``bias_metrics.json``; the pipeline Condition step compares its
-``max_disparity`` with the fairness_gate.max_disparity bar.
+``max_disparity`` (the larger of the demographic-parity and equalized-odds
+differences) with the fairness_gate.max_disparity bar. The equal-opportunity
+difference (true-positive-rate gap, from a Fairlearn MetricFrame) is reported
+next to them.
 
-With fewer than two subgroups nothing can be compared and the result is
-"not_evaluable". That fails the gate (max_disparity is written as 1.0) unless
-``--allow-not-evaluable`` is passed, in which case it is written as 0.0 and
-the report says the disparity was not measured.
+When no image carries the sensitive attribute (it comes from the file names
+or the dataset manifest, see mlops_common.dataset_layout) the gate is
+"skipped": max_disparity is written as 0.0 and the step logs why. With the
+attribute but fewer than two subgroups nothing can be compared and the result
+is "not_evaluable". That fails the gate (max_disparity is written as 1.0)
+unless ``--allow-not-evaluable`` is passed, in which case it is written as 0.0
+and the report says the disparity was not measured.
 
 Output (abridged):
 
     {
-      "status": "evaluated" | "not_evaluable",
+      "status": "evaluated" | "not_evaluable" | "skipped",
       "disparity_measured": true,
       "demographic_parity_difference": 0.03,
       "equalized_odds_difference": 0.04,
+      "equal_opportunity_difference": 0.02,
       "max_disparity": 0.04,
       "decision_threshold": 0.41,
-      "per_group": {"40X": {"n": 120, "selection_rate": 0.51, ...}},
-      "sensitive_feature": "magnification",
+      "per_group": {"site_a": {"n": 120, "selection_rate": 0.51, ...}},
+      "sensitive_feature": "subgroup",
       "threshold": 0.10,
       "passed": true
     }
@@ -49,6 +56,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mlops_common.fairness import STATUS_NOT_EVALUABLE, compute_group_fairness
 
 DEFAULT_THRESHOLD = 0.10
+DEFAULT_SENSITIVE_FEATURE = "subgroup"
+STATUS_SKIPPED = "skipped"
 DEFAULT_ENSEMBLE_PATH = Path("/opt/ml/processing/input/ensemble")
 # Written as max_disparity when fairness could not be measured and that is not
 # allowed: above any sensible bar, so the Condition step fails.
@@ -111,6 +120,24 @@ def evaluate(
     return metrics
 
 
+def skipped(y_true, decision_threshold: float, sensitive_feature: str, bar: float) -> dict:
+    """Gate result when no image carries the sensitive attribute: passes, nothing measured."""
+    y_true = np.asarray(y_true, dtype=int)
+    return {
+        "status": STATUS_SKIPPED,
+        "reason": f"no image carries the '{sensitive_feature}' attribute",
+        "disparity_measured": False,
+        "max_disparity": 0.0,
+        "passed": True,
+        "per_group": {},
+        "n_samples": len(y_true),
+        "n_groups": 0,
+        "threshold": bar,
+        "decision_threshold": decision_threshold,
+        "class_imbalance": round(class_imbalance(y_true), 4),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fairlearn fairness gate on the ensemble")
     parser.add_argument(
@@ -125,7 +152,7 @@ def main() -> int:
     parser.add_argument("--output-path", type=Path, default=Path("/opt/ml/processing/output"))
     parser.add_argument(
         "--sensitive-feature",
-        default="magnification",
+        default=DEFAULT_SENSITIVE_FEATURE,
         help="Key under predictions.json sensitive_features to group by",
     )
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
@@ -143,10 +170,15 @@ def main() -> int:
 
     y_true, scores, decision_threshold, groups = load_predictions(source, args.sensitive_feature)
     if groups is None:
-        print(f"no '{args.sensitive_feature}' attribute in predictions.json", file=sys.stderr)
-    metrics = evaluate(
-        y_true, scores, decision_threshold, groups, args.threshold, args.allow_not_evaluable
-    )
+        print(
+            f"fairness gate skipped: no image carries the '{args.sensitive_feature}' attribute "
+            "(file name or dataset manifest)"
+        )
+        metrics = skipped(y_true, decision_threshold, args.sensitive_feature, args.threshold)
+    else:
+        metrics = evaluate(
+            y_true, scores, decision_threshold, groups, args.threshold, args.allow_not_evaluable
+        )
     metrics["sensitive_feature"] = args.sensitive_feature
 
     args.output_path.mkdir(parents=True, exist_ok=True)

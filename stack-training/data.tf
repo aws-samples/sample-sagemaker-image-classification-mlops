@@ -18,17 +18,21 @@ data "aws_sagemaker_prebuilt_ecr_image" "tensorflow_inference" {
   image_tag       = var.sagemaker_images.tensorflow_inference_tag
 }
 
+# Registry of the scikit-learn image that the scheduled drift and fairness
+# jobs of stack-inference run with the execution role.
+data "aws_sagemaker_prebuilt_ecr_image" "monitoring_jobs" {
+  repository_name = "sagemaker-scikit-learn"
+}
+
 # Common tags come from default_tags in providers.tf; resources in child
 # modules inherit them too, so they are not passed again here.
 locals {
-  # Container paths
   container_paths = {
     code   = "/opt/ml/processing/input/code"
     data   = "/opt/ml/processing/input/data"
     output = "/opt/ml/processing/output"
   }
 
-  # Base bucket mappings
   base_buckets = {
     scripts         = module.s3_scripts.bucket_id
     raw_data        = module.s3_raw_data.bucket_id
@@ -42,7 +46,6 @@ locals {
   # Dynamic model names from model keys
   model_names = join(",", keys(var.models))
 
-  # Script paths for pipeline steps
   script_paths = {
     preprocessing_script       = "${local.container_paths.code}/${var.pipeline_steps.preprocessing.script_name}"
     preprocessing_requirements = "${local.container_paths.code}/requirements.txt"
@@ -52,7 +55,6 @@ locals {
     registry_script            = "${local.container_paths.code}/${var.pipeline_steps.registry.script_name}"
   }
 
-  # Common processing paths
   processing_paths = {
     input_data       = "/opt/ml/processing/input/data"
     input_models     = "/opt/ml/processing/input/models"
@@ -61,6 +63,7 @@ locals {
     input_eval       = "/opt/ml/processing/input/evaluation"
     input_ensemble   = "/opt/ml/processing/input/ensemble"
     input_registry   = "/opt/ml/processing/input/registry"
+    input_report     = "/opt/ml/processing/input/validation-report"
     output           = "/opt/ml/processing/output"
   }
 }

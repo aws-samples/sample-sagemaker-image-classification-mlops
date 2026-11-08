@@ -31,7 +31,7 @@ resource "aws_cloudwatch_event_target" "pipeline_trigger" {
 
   rule      = aws_cloudwatch_event_rule.new_data_uploaded[0].name
   target_id = "SageMakerPipelineTargetFixed"
-  arn       = aws_sagemaker_pipeline.medical_image_pipeline.arn
+  arn       = aws_sagemaker_pipeline.image_pipeline.arn
   role_arn  = aws_iam_role.eventbridge_sagemaker_role[0].arn
 
   sagemaker_pipeline_target {
@@ -42,11 +42,11 @@ resource "aws_cloudwatch_event_target" "pipeline_trigger" {
   }
 }
 
-# IAM role for EventBridge to invoke SageMaker Pipeline
 resource "aws_iam_role" "eventbridge_sagemaker_role" {
   count = var.enable_auto_trigger ? 1 : 0
 
   name                 = "${var.project_name}-eventbridge-sagemaker-role"
+  description          = "Lets the ${var.project_name} EventBridge upload rule start the SageMaker pipeline"
   permissions_boundary = var.permissions_boundary_arn
 
   assume_role_policy = jsonencode({
@@ -57,6 +57,10 @@ resource "aws_iam_role" "eventbridge_sagemaker_role" {
         Effect = "Allow"
         Principal = {
           Service = "events.amazonaws.com"
+        }
+        Condition = {
+          StringEqualsIfExists = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+          ArnLikeIfExists      = { "aws:SourceArn" = "arn:aws:events:${var.aws_region}:${data.aws_caller_identity.current.account_id}:rule/${var.project_name}-*" }
         }
       }
     ]
@@ -77,7 +81,7 @@ resource "aws_iam_role_policy" "eventbridge_sagemaker_policy" {
         Action = [
           "sagemaker:StartPipelineExecution"
         ]
-        Resource = aws_sagemaker_pipeline.medical_image_pipeline.arn
+        Resource = aws_sagemaker_pipeline.image_pipeline.arn
       }
     ]
   })

@@ -28,7 +28,8 @@ class ModelReportGenerator:
 
         decision_threshold is the validation-tuned threshold applied to the
         averaged score (0.5 only when none was tuned); subgroup_labels is one
-        subgroup per test image (magnification for BreakHis).
+        subgroup per test image (the ``subgroup`` attribute from the file names
+        or the manifest), or None.
 
         This includes the bias and explainability reports. The training
         pipeline's RegisterModel step points at evaluation/bias_report.json,
@@ -81,10 +82,9 @@ class ModelReportGenerator:
                 "num_features": 224 * 224 * 3,
                 "class_distribution": evaluation_results.get("class_distribution", {}),
             },
-            # Clinical quality gate (accuracy/recall/auc_roc/precision pass/fail
-            # + gap), passed through from the evaluator so the registration
-            # statistics report carries the same gate result.
-            "clinical_quality_gate": evaluation_results.get("clinical_quality_gate", {}),
+            # Passed through from the evaluator so the registration statistics
+            # report carries the same gate result.
+            "quality_gate": evaluation_results.get("quality_gate", {}),
         }
 
         file_path = os.path.join(self.output_path, "model_quality_statistics.json")
@@ -126,8 +126,8 @@ class ModelReportGenerator:
                 "completeness": 1.0,
                 "num_observations": len(true_labels),
                 "class_balance": {
-                    "benign": int(np.sum(np.array(true_labels) == 0)),
-                    "malignant": int(np.sum(np.array(true_labels) == 1)),
+                    "negative": int(np.sum(np.array(true_labels) == 0)),
+                    "positive": int(np.sum(np.array(true_labels) == 1)),
                 },
                 "data_type_distribution": {
                     "image_format": "JPEG/PNG",
@@ -197,11 +197,10 @@ class ModelReportGenerator:
         (post-training). All metrics are computed from the labels and
         predictions actually available - nothing is fabricated.
 
-        The breast histopathology dataset has no demographic metadata (no
-        patient sex, age, or similar facets), so when no subgroup labels are
-        supplied the post-training metrics are computed across an honest proxy
-        split derived from ensemble prediction confidence. The "note" fields in
-        the output make this explicit.
+        When no subgroup labels are supplied (no ``subgroup`` attribute in the
+        file names or manifest), the post-training metrics are computed across
+        a proxy split derived from ensemble prediction confidence. The "note"
+        fields in the output make this explicit.
         """
         labels = np.asarray(true_labels, dtype=float).flatten()
         scores = self._ensemble_scores(predictions_data)
@@ -226,8 +225,8 @@ class ModelReportGenerator:
         """Compute pre-training bias metrics (Class Imbalance, optionally DPL)."""
         facet = "none"
         notes = [
-            "Pre-training bias computed over the benign vs malignant label "
-            "distribution. Label 1 (malignant) is treated as the positive class.",
+            "Pre-training bias computed over the label distribution. "
+            "Label 1 is the positive class.",
         ]
         metrics = []
 
@@ -238,10 +237,10 @@ class ModelReportGenerator:
             )
         else:
             n_total = int(labels.size)
-            n_malignant = int(np.sum(labels == 1))
-            n_benign = int(np.sum(labels == 0))
-            n_majority = max(n_benign, n_malignant)
-            n_minority = min(n_benign, n_malignant)
+            n_positive = int(np.sum(labels == 1))
+            n_negative = int(np.sum(labels == 0))
+            n_majority = max(n_negative, n_positive)
+            n_minority = min(n_negative, n_positive)
             class_imbalance = (n_majority - n_minority) / n_total
             metrics.append(
                 {
@@ -249,7 +248,7 @@ class ModelReportGenerator:
                     "value": float(class_imbalance),
                     "description": (
                         "Class Imbalance (n_majority - n_minority) / n_total over "
-                        f"benign ({n_benign}) vs malignant ({n_malignant}) labels. "
+                        f"negative ({n_negative}) vs positive ({n_positive}) labels. "
                         "0 means a perfectly balanced dataset; 1 means a single class."
                     ),
                 }
@@ -258,8 +257,8 @@ class ModelReportGenerator:
         if subgroup_labels is None:
             notes.append(
                 "Difference in Proportions of Labels (DPL) is not reported "
-                "because it needs a subgroup/facet, and this dataset has no "
-                "demographic facets."
+                "because it needs a subgroup, and no image carries a subgroup "
+                "attribute."
             )
         else:
             facet = "provided_subgroup"
@@ -276,8 +275,8 @@ class ModelReportGenerator:
             "version": "1.0",
             "report_type": "pre_training_bias",
             "facet": facet,
-            "label": "malignant",
-            "pre_training_bias_metrics": {"label": "malignant", "metrics": metrics},
+            "label": "positive",
+            "pre_training_bias_metrics": {"label": "positive", "metrics": metrics},
             "note": " ".join(notes),
         }
 
@@ -294,7 +293,7 @@ class ModelReportGenerator:
             "description": (
                 "Difference in Proportions of Labels: positive-label rate in the "
                 "first subgroup minus the second. 0 means both subgroups have the "
-                "same malignant rate."
+                "same positive rate."
             ),
         }
 
@@ -302,7 +301,7 @@ class ModelReportGenerator:
         """Compute post-training bias metrics across real or proxy subgroups."""
         notes = [
             "Post-training bias compares model behaviour across subgroups. "
-            "Label 1 (malignant) is the positive class; predictions use a "
+            "Label 1 is the positive class; predictions use a "
             f"{threshold:.2f} decision threshold on the averaged model score.",
         ]
         metrics = []
@@ -317,8 +316,8 @@ class ModelReportGenerator:
                 "version": "1.0",
                 "report_type": "post_training_bias",
                 "facet": "none",
-                "label": "malignant",
-                "post_training_bias_metrics": {"label": "malignant", "metrics": []},
+                "label": "positive",
+                "post_training_bias_metrics": {"label": "positive", "metrics": []},
                 "note": " ".join(notes),
             }
 
@@ -338,13 +337,12 @@ class ModelReportGenerator:
             subgroups = self._proxy_subgroups(scores, threshold)
             facet = "proxy_confidence_terciles"
             notes.append(
-                "This dataset has no demographic facets (no patient sex, age, "
-                "or similar), so no real protected attribute exists. The "
-                "subgroups here are a PROXY built from ensemble prediction "
-                "confidence terciles (lowest-confidence vs highest-confidence "
-                "tiles). These metrics flag whether the model behaves "
-                "consistently across easy and hard examples; they are not a "
-                "substitute for demographic fairness analysis."
+                "No image carries a subgroup attribute, so the subgroups here "
+                "are a PROXY built from ensemble prediction confidence terciles "
+                "(lowest-confidence vs highest-confidence images). These "
+                "metrics flag whether the model behaves consistently across "
+                "easy and hard examples; they are not a substitute for a "
+                "fairness analysis on a real attribute."
             )
 
         group_ids = np.unique(subgroups)
@@ -359,8 +357,8 @@ class ModelReportGenerator:
             "version": "1.0",
             "report_type": "post_training_bias",
             "facet": facet,
-            "label": "malignant",
-            "post_training_bias_metrics": {"label": "malignant", "metrics": metrics},
+            "label": "positive",
+            "post_training_bias_metrics": {"label": "positive", "metrics": metrics},
             "note": " ".join(notes),
         }
 
@@ -395,7 +393,7 @@ class ModelReportGenerator:
             "name": "DI",
             "value": float(disparate_impact),
             "description": (
-                "Disparate Impact: ratio of the positive (malignant) prediction "
+                "Disparate Impact: ratio of the positive prediction "
                 "rate in the first subgroup to the last. 1.0 means parity; the "
                 "common fairness rule of thumb flags values below 0.8 or above 1.25."
             ),
@@ -424,13 +422,13 @@ class ModelReportGenerator:
             "value": recall_a - recall_d,
             "description": (
                 "Recall Difference (equal opportunity): true-positive rate on "
-                "malignant cases in the first subgroup minus the last. 0 means "
-                "the model catches malignant cases equally well in both subgroups."
+                "positive cases in the first subgroup minus the last. 0 means "
+                "the model catches positive cases equally well in both subgroups."
             ),
         }
 
     def _recall_for_group(self, labels, predictions, group_mask):
-        """True-positive rate (recall) for malignant cases within a subgroup."""
+        """True-positive rate (recall) for positive cases within a subgroup."""
         positives = group_mask & (labels == 1)
         if not np.any(positives):
             return 0.0
@@ -458,17 +456,17 @@ class ModelReportGenerator:
                 },
                 "region_shapley": {
                     "method": "region Shapley values estimated by antithetic permutation sampling",
-                    "target": "ensemble malignant probability",
+                    "target": "ensemble positive-class probability",
                     "players": "4x4 grid of image regions",
-                    "baseline": "ImageNet mean colour (0 after normalisation)",
+                    "baseline": "per-channel mean colour (0 after normalisation)",
                     "property": "values sum to f(image) - f(baseline)",
                 },
             },
             "note": (
                 "No global attribution is computed for this model version. Use the "
                 "per-request explanations to see which image regions drove a "
-                "prediction. They are decision support for a reviewer, not evidence "
-                "of clinical validity."
+                "prediction. They help a reviewer judge a prediction; they do not "
+                "show that the model is right."
             ),
         }
 

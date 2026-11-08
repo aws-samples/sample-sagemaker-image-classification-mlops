@@ -3,7 +3,7 @@
 
 """Scheduled drift detection over endpoint data-capture output (Part 3).
 
-Runs as a scheduled Amazon SageMaker Processing job. Reads the malignant
+Runs as a scheduled Amazon SageMaker Processing job. Reads the positive-class
 probabilities the endpoint returned (data capture, endpointOutput) for the
 last --lookback-hours, compares their distribution with the baseline score
 distribution, and publishes a Population Stability Index (PSI) to CloudWatch.
@@ -33,6 +33,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 # The job's code directory holds mlops_common next to this file; a local
 # checkout has it one level up, in scripts/.
@@ -95,7 +96,7 @@ def population_stability_index(live, baseline, bins: int = 10) -> float | None:
 
 
 def scores_from_capture(body: str) -> list[float]:
-    """Malignant probabilities from one data-capture JSON Lines file."""
+    """Positive-class probabilities from one data-capture JSON Lines file."""
     return [record["score"] for record in iter_capture_records(body)]
 
 
@@ -110,8 +111,8 @@ def _load_baseline(s3, bucket: str, key: str) -> list[float]:
         return []
     try:
         body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf8")
-    except Exception as exc:
-        logger.warning("baseline %s unavailable (%s); skipping this run", key, exc)
+    except (ClientError, BotoCoreError, UnicodeDecodeError) as exc:
+        logger.warning("baseline %s unavailable (%s); skipping this run", key, type(exc).__name__)
         return []
 
     doc = json.loads(body)
@@ -168,8 +169,8 @@ def run(
     for key in iter_capture_keys(s3, monitoring_bucket, capture_prefix, endpoint_name, since):
         try:
             body = s3.get_object(Bucket=monitoring_bucket, Key=key)["Body"].read().decode("utf8")
-        except Exception as exc:
-            logger.warning("skipping %s (%s)", key, exc)
+        except (ClientError, BotoCoreError, UnicodeDecodeError) as exc:
+            logger.warning("skipping %s (%s)", key, type(exc).__name__)
             continue
         live.extend(scores_from_capture(body))
         keys_read += 1

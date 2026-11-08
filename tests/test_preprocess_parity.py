@@ -17,7 +17,7 @@ handler = load_module("stack-inference/lambda/inference_handler.py", "inference_
 
 
 def _raw_tile(fmt: str) -> bytes:
-    # BreakHis tiles are 700x460 RGB; a noisy gradient exercises the resampling.
+    # A 700x460 RGB image; a noisy gradient exercises the resampling.
     rng = np.random.default_rng(3)
     base = np.linspace(0, 255, 700, dtype=np.float32)[None, :, None]
     arr = np.clip(base + rng.normal(0, 25, (460, 700, 3)), 0, 255).astype(np.uint8)
@@ -77,5 +77,5 @@ def test_old_single_resize_path_differs():
 def test_normalisation_constants():
     white = pp.imagenet_normalize(np.full((1, 1, 3), 255.0))
     np.testing.assert_allclose(
-        white[0, 0], (1 - np.array(pp.IMAGENET_MEAN)) / np.array(pp.IMAGENET_STD), rtol=1e-6
+        white[0, 0], (1 - np.array(pp.CHANNEL_MEAN)) / np.array(pp.CHANNEL_STD), rtol=1e-6
     )

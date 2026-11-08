@@ -4,6 +4,11 @@
 
 # Build Lambda layer with Pillow and numpy for Python 3.13
 # This script creates a Lambda-compatible layer using Amazon Linux 2023 environment
+#
+# Usage: build_lambda_layer.sh          build the zip
+#        build_lambda_layer.sh --check  exit 0 when the zip holds the pinned
+#                                       versions, 1 when it holds others, 2
+#                                       when there is no zip
 
 set -e
 
@@ -17,6 +22,23 @@ BUILD_DIR="/tmp/lambda-layer-build"
 PYTHON_VERSION="3.13"
 PILLOW_VERSION="13.0.0"
 NUMPY_VERSION="2.4.4"
+UV_VERSION="0.9.9"
+
+if [ "${1:-}" = "--check" ]; then
+    if [ ! -f "$LAYER_ZIP" ]; then
+        echo "No Lambda layer zip at $LAYER_ZIP" >&2
+        exit 2
+    fi
+    CONTENTS="$(unzip -Z1 "$LAYER_ZIP")"
+    for PIN in "pillow-${PILLOW_VERSION}" "numpy-${NUMPY_VERSION}"; do
+        if ! grep -qiE "(^|/)${PIN//./\\.}\.dist-info/" <<<"$CONTENTS"; then
+            echo "Lambda layer zip does not hold ${PIN} (the version pinned in $0)" >&2
+            exit 1
+        fi
+    done
+    echo "Lambda layer zip holds pillow ${PILLOW_VERSION} and numpy ${NUMPY_VERSION}"
+    exit 0
+fi
 
 echo "=========================================="
 echo "Building Lambda Layer: Pillow + NumPy"
@@ -34,7 +56,7 @@ echo "Installing packages for Python ${PYTHON_VERSION} Lambda runtime..."
 PIP_CMD="$(command -v uv || command -v pip3 || command -v pip)"
 if [ -z "$PIP_CMD" ]; then
     echo "ERROR: neither uv nor pip found on PATH" >&2
-    echo "Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
+    echo "Install uv from PyPI at the pinned version: pip3 install uv==${UV_VERSION}" >&2
     exit 1
 fi
 
@@ -47,7 +69,7 @@ if [[ "$PIP_CMD" == *"uv" ]]; then
     # uv uses --python-platform instead of --platform + --implementation
     PLATFORM_ARGS=(--python-platform x86_64-manylinux_2_28 --python-version "$PYTHON_VERSION" --only-binary=:all:)
 else
-    echo "Using pip (install uv for ~10x speedup: https://astral.sh/uv)"
+    echo "Using pip (for a faster build: pip3 install uv==${UV_VERSION})"
     INSTALL_CMD=("$PIP_CMD" install)
     PLATFORM_ARGS=(--platform manylinux_2_28_x86_64 --implementation cp --python-version "$PYTHON_VERSION" --only-binary=:all:)
 fi
